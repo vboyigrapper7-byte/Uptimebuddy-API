@@ -1,0 +1,32 @@
+{
+  "name": "uptimebuddy-backend",
+  "version": "1.0.0",
+  "description": "UptimeBuddy SaaS Platform Backend API",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "start:render": "node src/server.js & node src/workers/checkWorker.js & node src/workers/alertWorker.js",
+    "dev": "node --watch src/server.js",
+    "workers": "node --watch src/workers/checkWorker.js & node --watch src/workers/alertWorker.js",
+    "workers:prod": "node src/workers/checkWorker.js & node src/workers/alertWorker.js",
+    "workers:check": "node src/workers/checkWorker.js",
+    "workers:alert": "node src/workers/alertWorker.js"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^9.4.0",
+    "@fastify/cors": "^8.0.0",
+    "@fastify/jwt": "^7.0.0",
+    "@fastify/rate-limit": "^9.0.0",
+    "axios": "^1.14.0",
+    "bcrypt": "^5.0.1",
+    "bullmq": "^5.73.0",
+    "dotenv": "^16.0.0",
+    "fastify": "^4.0.0",
+    "firebase-admin": "^13.7.0",
+    "ioredis": "^5.10.1",
+    "pg": "^8.0.0",
+    "pino-pretty": "^10.0.0",
+    "tcp-ping": "^0.1.1",
+    "zod": "^3.23.0"
+  }
+}

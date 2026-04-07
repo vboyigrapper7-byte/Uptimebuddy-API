@@ -1,0 +1,199 @@
+require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env') });
+const { Worker }          = require('bullmq');
+const axios               = require('axios');
+const tcpp                = require('tcp-ping');
+const pool                = require('../core/db/pool');
+const { workerRedisConnection, alertQueue } = require('../core/queue/setup');
+
+// ── TCP Ping wrapper ──────────────────────────────────────────────────────
+const pingPromise = (target, port) =>
+    new Promise((resolve) => {
+        tcpp.ping({ address: target, port, attempts: 1, timeout: 5000 }, (err, data) => {
+            if (err) return resolve({ up: false, error: err.message, time: 0 });
+            const result = data.results[0];
+            if (result.err) return resolve({ up: false, error: result.err.message, time: 0 });
+            resolve({ up: true, time: Math.round(result.time) });
+        });
+    });
+
+// ── Alert cooldown via DB (avoids alert storms on flapping monitors) ──────
+const ALERT_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+
+async function shouldSendAlert(monitorId) {
+    const res = await pool.query(
+        `SELECT id FROM incidents
+         WHERE monitor_id = $1
+           AND started_at >= NOW() - INTERVAL '5 minutes'
+         LIMIT 1`,
+        [monitorId]
+    );
+    return res.rows.length === 0;
+}
+
+// ── Main job processor ────────────────────────────────────────────────────
+const checkWorker = new Worker('monitor-checks', async (job) => {
+    const { monitorId } = job.data;
+
+    // Fetch fresh config (target may have changed since job was enqueued)
+    const monitorRes = await pool.query(
+        'SELECT id, type, target, keyword, status AS prev_status, user_id FROM monitors WHERE id = $1',
+        [monitorId]
+    );
+    if (monitorRes.rows.length === 0) {
+        console.log(`[CheckWorker] Monitor ${monitorId} not found — skipping (likely deleted)`);
+        return;
+    }
+
+    const { target, type, keyword, prev_status, user_id } = monitorRes.rows[0];
+    const startTime = Date.now();
+    let status       = 'down';
+    let errorMessage = null;
+    let responseTime = 0;
+
+    try {
+        // ── HTTP / HTTPS ────────────────────────────────────────────────
+        if (type === 'http' || type === 'https') {
+            const res = await axios.get(target, {
+                timeout: 10000,
+                validateStatus: null, // don't throw on 4xx/5xx — we handle those
+                maxRedirects: 5,
+                maxContentLength: 5 * 1024 * 1024, // 5 MB limit
+                headers: { 'User-Agent': 'UptimeBuddy-Monitor/2.0' },
+            });
+            responseTime = Date.now() - startTime;
+            if (res.status >= 200 && res.status < 400) {
+                status = 'up';
+            } else {
+                errorMessage = `HTTP ${res.status}`;
+            }
+        }
+        // ── Keyword check ───────────────────────────────────────────────
+        else if (type === 'keyword') {
+            const res = await axios.get(target, {
+                timeout: 10000,
+                maxContentLength: 2 * 1024 * 1024, // 2 MB — enough for any reasonable page
+                headers: { 'User-Agent': 'UptimeBuddy-Monitor/2.0' },
+            });
+            responseTime = Date.now() - startTime;
+            const bodyText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+            if (res.status >= 200 && keyword && bodyText.includes(keyword)) {
+                status = 'up';
+            } else {
+                errorMessage = res.status >= 400
+                    ? `HTTP ${res.status}`
+                    : `Keyword "${keyword}" not found in response`;
+            }
+        }
+        // ── TCP Port / Ping ─────────────────────────────────────────────
+        else if (type === 'port' || type === 'ping') {
+            let host = target;
+            let port = 80;
+            if (target.includes(':')) {
+                [host, port] = target.split(':');
+                port = parseInt(port, 10);
+            }
+            const pingRes = await pingPromise(host, port);
+            responseTime  = pingRes.time;
+            if (pingRes.up) {
+                status = 'up';
+            } else {
+                errorMessage = pingRes.error || 'Connection refused';
+            }
+        }
+    } catch (err) {
+        responseTime  = Date.now() - startTime;
+        errorMessage  = err.message;
+        status        = 'down';
+    }
+
+    console.log(`[CheckWorker] Monitor ${monitorId} → ${status} (${responseTime}ms)`);
+
+    // ── Insert metric ────────────────────────────────────────────────────
+    const recordedAt = new Date();
+    await pool.query(
+        'INSERT INTO monitor_metrics (monitor_id, recorded_at, response_time_ms, status) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+        [monitorId, recordedAt, responseTime, status]
+    );
+
+    // ── Update monitor current status ────────────────────────────────────
+    await pool.query('UPDATE monitors SET status = $1 WHERE id = $2', [status, monitorId]);
+
+    // ── Edge detection — only alert on status CHANGE, with confirmation ──────
+    if (prev_status && prev_status !== 'pending' && prev_status !== status) {
+        console.log(`[CheckWorker] Status change: ${prev_status} → ${status} for monitor ${monitorId}`);
+
+        // If status went down, verify it at least 2 more times to confirm a "Real Outage"
+        let finalStatus = status;
+        if (status === 'down') {
+            console.log(`[CheckWorker] Down detected — initiating verification pass for monitor ${monitorId}`);
+            let failures = 1;
+            for (let i = 0; i < 2; i++) {
+                // Wait 2 seconds between verification checks
+                await new Promise(r => setTimeout(r, 2000));
+                const verifyRes = await performCheck(type, target, keyword);
+                if (verifyRes.status === 'down') {
+                    failures++;
+                } else {
+                    finalStatus = 'up'; // Recovered during verification
+                    break;
+                }
+            }
+            if (failures < 3 && finalStatus === 'down') {
+                finalStatus = 'up'; // Not persistent enough
+            }
+        }
+
+        if (prev_status !== finalStatus) {
+            const canAlert = await shouldSendAlert(monitorId);
+            if (canAlert) {
+                await alertQueue.add(
+                    `alert-${monitorId}-${Date.now()}`,
+                    { monitorId, target, previousStatus: prev_status, newStatus: finalStatus, errorMessage, timestamp: recordedAt.toISOString() },
+                    { removeOnComplete: { count: 100 }, removeOnFail: { count: 50 } }
+                );
+            }
+            // Update final status in DB
+            await pool.query('UPDATE monitors SET status = $1 WHERE id = $2', [finalStatus, monitorId]);
+        }
+    }
+}, {
+    connection: workerRedisConnection,
+    concurrency: parseInt(process.env.CHECK_WORKER_CONCURRENCY || '20', 10),
+    limiter: { max: 100, duration: 1000 },
+});
+
+// Helper for check logic decomposition
+async function performCheck(type, target, keyword) {
+    const startTime = Date.now();
+    try {
+        if (type === 'http' || type === 'https') {
+            const res = await axios.get(target, { timeout: 8000, validateStatus: null });
+            return { status: (res.status >= 200 && res.status < 400) ? 'up' : 'down', time: Date.now() - startTime };
+        }
+        if (type === 'keyword') {
+            const res = await axios.get(target, { timeout: 8000 });
+            const bodyText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+            return { status: (res.status >= 200 && keyword && bodyText.includes(keyword)) ? 'up' : 'down', time: Date.now() - startTime };
+        }
+        if (type === 'port' || type === 'ping') {
+            let [host, port] = target.includes(':') ? target.split(':') : [target, 80];
+            const pingRes = await pingPromise(host, parseInt(port, 10));
+            return { status: pingRes.up ? 'up' : 'down', time: pingRes.time };
+        }
+    } catch {
+        return { status: 'down', time: Date.now() - startTime };
+    }
+    return { status: 'down', time: 0 };
+}
+
+checkWorker.on('completed', (job) => {
+    console.log(`[CheckWorker] Job ${job.id} completed`);
+});
+checkWorker.on('failed', (job, err) => {
+    console.error(`[CheckWorker] Job ${job?.id} failed:`, err.message);
+});
+checkWorker.on('error', (err) => {
+    console.error('[CheckWorker] Worker error:', err.message);
+});
+
+console.log('[CheckWorker] Listening for monitor-checks...');
