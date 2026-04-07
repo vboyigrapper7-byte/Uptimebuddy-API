@@ -83,9 +83,13 @@ CREATE TABLE IF NOT EXISTS agent_metrics (
     recorded_at  TIMESTAMP        NOT NULL,
     cpu_percent  NUMERIC(5,2),
     ram_mb       INT,
+    ram_total_mb INT,
     disk_percent NUMERIC(5,2),
     PRIMARY KEY (agent_id, recorded_at)
 );
+
+-- Add ram_total_mb to existing installs (safe — IF NOT EXISTS avoids error on fresh installs)
+ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS ram_total_mb INT;
 
 CREATE INDEX IF NOT EXISTS idx_agent_metrics_time ON agent_metrics(agent_id, recorded_at DESC);
 

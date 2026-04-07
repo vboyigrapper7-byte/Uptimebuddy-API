@@ -138,8 +138,10 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
                     break;
                 }
             }
-            if (failures < 3 && finalStatus === 'down') {
-                finalStatus = 'up'; // Not persistent enough
+            // Only confirm outage if ALL checks (initial + 2 verifications) failed
+            if (failures < 3) {
+                console.log(`[CheckWorker] Monitor ${monitorId} recovered during verification (${failures}/3 failures) — not alerting`);
+                finalStatus = 'up';
             }
         }
 
@@ -151,6 +153,23 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
                     { monitorId, target, previousStatus: prev_status, newStatus: finalStatus, errorMessage, timestamp: recordedAt.toISOString() },
                     { removeOnComplete: { count: 100 }, removeOnFail: { count: 50 } }
                 );
+
+                // Record incident in DB for history view
+                if (finalStatus === 'down') {
+                    await pool.query(
+                        'INSERT INTO incidents (monitor_id, started_at, error_message) VALUES ($1, $2, $3)',
+                        [monitorId, recordedAt, errorMessage]
+                    );
+                } else if (finalStatus === 'up') {
+                    // Resolve the most recent open incident for this monitor
+                    await pool.query(
+                        `UPDATE incidents SET resolved_at = $1
+                         WHERE monitor_id = $2 AND resolved_at IS NULL
+                         ORDER BY started_at DESC
+                         LIMIT 1`,
+                        [recordedAt, monitorId]
+                    );
+                }
             }
             // Update final status in DB
             await pool.query('UPDATE monitors SET status = $1 WHERE id = $2', [finalStatus, monitorId]);

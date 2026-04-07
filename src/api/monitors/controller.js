@@ -183,4 +183,25 @@ const getMonitorMetrics = async (request, reply) => {
     }
 };
 
-module.exports = { createMonitor, getMonitors, updateMonitor, deleteMonitor, getMonitorMetrics };
+// ── Incidents ─────────────────────────────────────────────────────────────
+const getIncidents = async (request, reply) => {
+    const userId = request.user.id;
+    try {
+        const res = await request.server.db.query(
+            `SELECT i.id, i.monitor_id, m.name AS monitor_name, m.target,
+                    i.started_at, i.resolved_at, i.error_message
+             FROM incidents i
+             JOIN monitors m ON m.id = i.monitor_id
+             WHERE m.user_id = $1
+             ORDER BY i.started_at DESC
+             LIMIT 50`,
+            [userId]
+        );
+        return reply.send(res.rows);
+    } catch (error) {
+        request.log.error(error, 'getIncidents error');
+        return reply.code(500).send({ error: 'Failed to fetch incidents' });
+    }
+};
+
+module.exports = { createMonitor, getMonitors, updateMonitor, deleteMonitor, getMonitorMetrics, getIncidents };

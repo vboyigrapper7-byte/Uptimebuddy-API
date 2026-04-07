@@ -1,4 +1,4 @@
-const { createMonitor, getMonitors, updateMonitor, deleteMonitor, getMonitorMetrics } = require('./controller');
+const { createMonitor, getMonitors, updateMonitor, deleteMonitor, getMonitorMetrics, getIncidents } = require('./controller');
 
 async function monitorRoutes(fastify, options) {
     const { requireAuth } = require('../auth/middleware');
@@ -11,6 +11,7 @@ async function monitorRoutes(fastify, options) {
     fastify.put('/:id',          updateMonitor);
     fastify.delete('/:id',       deleteMonitor);
     fastify.get('/:id/metrics',  getMonitorMetrics);
+    fastify.get('/incidents',    getIncidents);
 }
 
 module.exports = monitorRoutes;

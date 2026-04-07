@@ -11,6 +11,8 @@ function validateMetrics(metrics) {
     if (typeof cpu_percent   !== 'number' || cpu_percent   < 0 || cpu_percent   > 100) return false;
     if (typeof disk_percent  !== 'number' || disk_percent  < 0 || disk_percent  > 100) return false;
     if (typeof ram_mb        !== 'number' || ram_mb        < 0 || ram_mb        > 4194304) return false; // 4 TB max
+    // ram_total_mb is optional (added in agent v2.3+)
+    if (metrics.ram_total_mb !== undefined && (typeof metrics.ram_total_mb !== 'number' || metrics.ram_total_mb < 0)) return false;
     return true;
 }
 
@@ -56,10 +58,10 @@ async function agentRoutes(fastify, options) {
             const recordedAt  = new Date(); // Always use server time — never trust client timestamp
 
             await fastify.db.query(
-                `INSERT INTO agent_metrics (agent_id, recorded_at, cpu_percent, ram_mb, disk_percent)
-                 VALUES ($1, $2, $3, $4, $5)
+                `INSERT INTO agent_metrics (agent_id, recorded_at, cpu_percent, ram_mb, ram_total_mb, disk_percent)
+                 VALUES ($1, $2, $3, $4, $5, $6)
                  ON CONFLICT DO NOTHING`,
-                [agentId, recordedAt, metrics.cpu_percent, metrics.ram_mb, metrics.disk_percent]
+                [agentId, recordedAt, metrics.cpu_percent, metrics.ram_mb, metrics.ram_total_mb ?? null, metrics.disk_percent]
             );
 
             await fastify.db.query(
@@ -78,7 +80,11 @@ async function agentRoutes(fastify, options) {
     // PUBLIC — Agent script download
     // ────────────────────────────────────────────────────────────────────
     fastify.get('/script', async (request, reply) => {
-        const scriptPath = path.resolve(__dirname, '../../../../uptimebuddy-agent/agent.js');
+        // Primary: agent.js bundled inside the backend src directory (works on Render)
+        const primaryPath  = path.resolve(__dirname, '../../agent.js');
+        // Fallback: monorepo sibling path (works locally)
+        const fallbackPath = path.resolve(__dirname, '../../../../uptimebuddy-agent/agent.js');
+        const scriptPath   = fs.existsSync(primaryPath) ? primaryPath : fallbackPath;
         try {
             const content = await fs.promises.readFile(scriptPath, 'utf-8');
             return reply.type('application/javascript').send(content);
@@ -247,6 +253,7 @@ echo "========================================="`;
                         SELECT TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'HH24:MI') AS time,
                                AVG(cpu_percent)::numeric(5,2) AS cpu,
                                AVG(ram_mb)::int               AS memory,
+                               MAX(ram_total_mb)::int         AS memory_total,
                                AVG(disk_percent)::numeric(5,2) AS disk
                         FROM agent_metrics WHERE agent_id = $1
                         AND recorded_at >= NOW() - INTERVAL '24 hours'
@@ -257,6 +264,7 @@ echo "========================================="`;
                         SELECT TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'HH24:MI') AS time,
                                AVG(cpu_percent)::numeric(5,2) AS cpu,
                                AVG(ram_mb)::int               AS memory,
+                               MAX(ram_total_mb)::int         AS memory_total,
                                AVG(disk_percent)::numeric(5,2) AS disk
                         FROM agent_metrics WHERE agent_id = $1
                         AND recorded_at >= NOW() - INTERVAL '12 hours'
@@ -266,7 +274,7 @@ echo "========================================="`;
                     // Default: last 60 raw data points (~10 min at 10s intervals)
                     queryText = `
                         SELECT TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'HH24:MI:SS') AS time,
-                               cpu_percent AS cpu, ram_mb AS memory, disk_percent AS disk
+                               cpu_percent AS cpu, ram_mb AS memory, ram_total_mb AS memory_total, disk_percent AS disk
                         FROM agent_metrics WHERE agent_id = $1
                         ORDER BY recorded_at DESC LIMIT 60`;
                 }

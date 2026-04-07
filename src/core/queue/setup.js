@@ -1,4 +1,4 @@
-require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env') });
+// Note: dotenv is loaded by the calling entry point (server.js / workers) before this module is imported.
 const { Queue } = require('bullmq');
 const Redis = require('ioredis');
 
