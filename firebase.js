@@ -3,40 +3,45 @@ const path = require('path');
 
 let serviceAccount;
 
-// 1. Try to load from environment variable (Best for Render/Production)
+// 1. Load from ENV (Render / Production)
 if (process.env.FIREBASE_SERVICE_ACCOUNT) {
     try {
         serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-        console.log('[Firebase Admin] Loaded credentials from FIREBASE_SERVICE_ACCOUNT env var.');
+
+        // 🔥 FIX: Handle private key formatting
+        if (serviceAccount.private_key) {
+            serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+        }
+
+        console.log('[Firebase Admin] Loaded from ENV');
     } catch (err) {
-        console.error('[Firebase Admin] Error parsing FIREBASE_SERVICE_ACCOUNT env var:', err.message);
+        console.error('[Firebase Admin] ENV parse error:', err.message);
     }
 }
 
-// 2. Fallback to local file (For Local Development)
+// 2. Fallback (Local)
 if (!serviceAccount) {
     try {
         const keyPath = path.resolve(__dirname, '../../../serviceAccountKey.json');
         serviceAccount = require(keyPath);
-        console.log('[Firebase Admin] Loaded credentials from local serviceAccountKey.json.');
+        console.log('[Firebase Admin] Loaded from local file');
     } catch (err) {
-        console.warn('[Firebase Admin] Local serviceAccountKey.json not found.');
+        console.warn('[Firebase Admin] No local service account found');
     }
 }
 
-if (serviceAccount) {
-    if (!admin.apps.length) {
-        try {
-            admin.initializeApp({
-                credential: admin.credential.cert(serviceAccount)
-            });
-            console.log('[Firebase Admin] Initialized successfully.');
-        } catch (err) {
-            console.error('[Firebase Admin] Initialization error:', err.message);
-        }
+// 3. Initialize
+if (serviceAccount && !admin.apps.length) {
+    try {
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount)
+        });
+        console.log('[Firebase Admin] Initialized');
+    } catch (err) {
+        console.error('[Firebase Admin] Init error:', err.message);
     }
-} else {
-    console.error('[Firebase Admin] CRITICAL: No service account credentials found. Auth will fail.');
+} else if (!serviceAccount) {
+    console.error('[Firebase Admin] CRITICAL: No credentials');
 }
 
 module.exports = admin;
