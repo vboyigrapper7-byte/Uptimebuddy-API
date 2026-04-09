@@ -171,6 +171,13 @@ process.on('unhandledRejection', (reason) => {
 buildServer()
     .then(async (server) => {
         serverInstance = server;
+
+        // ── Database Initialization ──────────────────────────────────────────
+        // Ensure tables exist BEFORE listening for requests
+        const { initializeDatabase } = require('./core/db/init');
+        const { pool } = getRoutesAndServices();
+        await initializeDatabase(pool);
+
         const port = parseInt(process.env.PORT || '3001', 10);
         await server.listen({ port, host: '0.0.0.0' });
         logger.info(`[Server] API process listening on port ${port}`);
