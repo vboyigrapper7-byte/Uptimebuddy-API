@@ -28,7 +28,7 @@ async function requireAuth(request, reply) {
             );
         } catch (dbErr) {
             request.log.error('Database query failed during auth:', dbErr.message);
-            return reply.status(500).send({ error: 'Internal database error during authentication' });
+            return reply.status(500).send({ error: `Internal database error during authentication: ${dbErr.message}` });
         }
 
         // Auto-provision PostgreSQL DB user if they authenticated via Firebase but don't exist locally
@@ -42,7 +42,7 @@ async function requireAuth(request, reply) {
                 );
             } catch (insertErr) {
                 request.log.error('Failed to auto-provision user:', insertErr.message);
-                return reply.status(500).send({ error: 'Failed to create user account locally' });
+                return reply.status(500).send({ error: `Failed to create user account locally: ${insertErr.message}` });
             }
         }
 

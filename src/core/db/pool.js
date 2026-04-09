@@ -16,7 +16,7 @@ const pool = new Pool({
     max: 20,                  // max connections in the pool
     idleTimeoutMillis: 30000, // close idle connections after 30s
     connectionTimeoutMillis: 5000, // throw if can't get connection in 5s
-    ssl: process.env.DATABASE_URL.includes('render.com') || process.env.NODE_ENV === 'production' 
+    ssl: !process.env.DATABASE_URL.includes('localhost') && !process.env.DATABASE_URL.includes('127.0.0.1')
         ? { rejectUnauthorized: false } 
         : false
 });
