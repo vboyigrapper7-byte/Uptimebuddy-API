@@ -37,6 +37,10 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:3000';
 
 // -------------------------------------------------------------------------
 const buildServer = async () => {
+    // ── Pre-boot Initialization ───────────────────────────────────────────
+    // Must happen FIRST so variables like 'pool' are available to decorators
+    const { authRoutes, agentRoutes, monitorRoutes, webhookRoutes, pool } = getRoutesAndServices();
+
     const server = Fastify({
         logger: {
             level: process.env.LOG_LEVEL || 'info',
@@ -53,11 +57,15 @@ const buildServer = async () => {
     });
 
     server.setErrorHandler((error, request, reply) => {
-        logger.error(`[Error] ${request.method} ${request.url}`, { error: error.message, stack: error.stack });
+        logger.error(`[Fatal Server Error] ${request.method} ${request.url}`, { 
+            message: error.message, 
+            stack: error.stack,
+            code: error.code
+        });
         const statusCode = error.statusCode || 500;
         reply.status(statusCode).send({
             error: true,
-            message: statusCode === 500 ? 'Internal Server Error' : error.message
+            message: statusCode === 500 ? `Internal Server Error: ${error.message}` : error.message
         });
     });
 
@@ -96,13 +104,11 @@ const buildServer = async () => {
             await pool.query('SELECT 1');
             return reply.send({ status: 'ok', service: 'uptimebuddy-api', db: 'connected' });
         } catch (err) {
-            return reply.code(503).send({ status: 'error', db: 'disconnected' });
+            return reply.code(503).send({ status: 'error', db: 'disconnected', reason: err.message });
         }
     });
 
     server.get('/', async () => ({ status: 'ok', service: 'uptimebuddy-api' }));
-
-    const { authRoutes, agentRoutes, monitorRoutes, webhookRoutes, pool } = getRoutesAndServices();
 
     // ── Routes ────────────────────────────────────────────────────────────
     server.register(authRoutes,    { prefix: '/api/v1/auth' });
