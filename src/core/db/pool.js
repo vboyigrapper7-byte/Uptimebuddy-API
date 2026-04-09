@@ -7,7 +7,8 @@ require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env'
 const { Pool } = require('pg');
 
 if (!process.env.DATABASE_URL) {
-    throw new Error('DATABASE_URL environment variable is required');
+    console.error('[DB Pool] CRITICAL ERROR: DATABASE_URL environment variable is MISSING.');
+    console.error('[DB Pool] Ensure you have added DATABASE_URL to your Render Environment settings.');
 }
 
 const pool = new Pool({

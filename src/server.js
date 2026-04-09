@@ -21,11 +21,17 @@ const logger = winston.createLogger({
     ]
 });
 
-const authRoutes    = require('./api/auth/routes');
-const agentRoutes   = require('./api/agents/routes');
-const monitorRoutes = require('./api/monitors/routes');
-const webhookRoutes = require('./api/webhooks/routes');
-const pool          = require('./core/db/pool');
+// ── Start ─────────────────────────────────────────────────────────────────
+// Define routes and services inside buildServer to catch errors during initialization
+const getRoutesAndServices = () => {
+    return {
+        authRoutes: require('./api/auth/routes'),
+        agentRoutes: require('./api/agents/routes'),
+        monitorRoutes: require('./api/monitors/routes'),
+        webhookRoutes: require('./api/webhooks/routes'),
+        pool: require('./core/db/pool')
+    };
+};
 
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:3000';
 
@@ -96,6 +102,8 @@ const buildServer = async () => {
 
     server.get('/', async () => ({ status: 'ok', service: 'uptimebuddy-api' }));
 
+    const { authRoutes, agentRoutes, monitorRoutes, webhookRoutes, pool } = getRoutesAndServices();
+
     // ── Routes ────────────────────────────────────────────────────────────
     server.register(authRoutes,    { prefix: '/api/v1/auth' });
     server.register(agentRoutes,   { prefix: '/api/v1/agents' });
@@ -111,6 +119,7 @@ const shutdown = async (signal) => {
     logger.info(`[Server] Received ${signal}. Shutting down gracefully...`);
     try {
         if (serverInstance) await serverInstance.close();
+        const { pool } = getRoutesAndServices();
         await pool.end();
         logger.info('[Server] Shutdown complete.');
         process.exit(0);
@@ -122,8 +131,16 @@ const shutdown = async (signal) => {
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
+
+process.on('uncaughtException', (err) => {
+    console.error('------- CRITICAL UNCAUGHT EXCEPTION -------');
+    console.error(err.stack || err);
+    process.exit(1);
+});
+
 process.on('unhandledRejection', (reason) => {
-    logger.error('[Server] Unhandled Promise Rejection:', reason);
+    console.error('------- CRITICAL UNHANDLED REJECTION -------');
+    console.error(reason);
 });
 
 buildServer()
