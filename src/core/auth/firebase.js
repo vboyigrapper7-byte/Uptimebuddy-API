@@ -15,20 +15,24 @@ if (!admin.apps.length) {
         admin.initializeApp({
             credential: admin.credential.cert(serviceAccount)
         });
+        console.log('[Firebase Admin] Initialized successfully using local serviceAccountKey.json.');
     } else {
-        // Render or other environments can inject FIREBASE_SERVICE_ACCOUNT as a JSON string
-        // or just use application default credentials via GOOGLE_APPLICATION_CREDENTIALS
         if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-            const cert = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-            admin.initializeApp({
-                credential: admin.credential.cert(cert)
-            });
+            try {
+                const cert = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+                admin.initializeApp({
+                    credential: admin.credential.cert(cert)
+                });
+                console.log('[Firebase Admin] Initialized successfully using FIREBASE_SERVICE_ACCOUNT env var.');
+            } catch (err) {
+                console.error('[Firebase Admin] Error parsing FIREBASE_SERVICE_ACCOUNT env var:', err.message);
+                admin.initializeApp(); // Fallback to default
+            }
         } else {
-            // Uses standard ENV vars: process.env.GOOGLE_APPLICATION_CREDENTIALS
+            console.error('[Firebase Admin] CRITICAL: No credentials found. Initializing without credentials (auth will fail).');
             admin.initializeApp();
         }
     }
-    console.log('[Firebase Admin] Initialized successfully.');
 }
 
 module.exports = admin;

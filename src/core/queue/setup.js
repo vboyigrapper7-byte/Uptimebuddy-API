@@ -23,8 +23,15 @@ const redisConnection = makeRedisConnection();
 // Separate connection used by Workers (checkWorker, alertWorker)
 const workerRedisConnection = makeRedisConnection();
 
-const monitorQueue   = new Queue('monitor-checks',  { connection: redisConnection });
-const alertQueue     = new Queue('alert-webhooks',  { connection: redisConnection });
-const retentionQueue = new Queue('retention-tasks', { connection: redisConnection });
+const jobOptions = {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 2000 },
+    removeOnComplete: true,
+    removeOnFail: 100
+};
+
+const monitorQueue   = new Queue('monitor-checks',  { connection: redisConnection, defaultJobOptions: jobOptions });
+const alertQueue     = new Queue('alert-webhooks',  { connection: redisConnection, defaultJobOptions: jobOptions });
+const retentionQueue = new Queue('retention-tasks', { connection: redisConnection, defaultJobOptions: jobOptions });
 
 module.exports = { redisConnection, workerRedisConnection, monitorQueue, alertQueue, retentionQueue };

@@ -20,24 +20,35 @@ async function requireAuth(request, reply) {
     try {
         const decodedToken = await admin.auth().verifyIdToken(idToken);
         
-        let res = await request.server.db.query(
-            'SELECT id, email, role, tier FROM users WHERE email = $1',
-            [decodedToken.email]
-        );
+        let res;
+        try {
+            res = await request.server.db.query(
+                'SELECT id, email, role, tier FROM users WHERE email = $1',
+                [decodedToken.email]
+            );
+        } catch (dbErr) {
+            request.log.error('Database query failed during auth:', dbErr.message);
+            return reply.status(500).send({ error: 'Internal database error during authentication' });
+        }
 
         // Auto-provision PostgreSQL DB user if they authenticated via Firebase but don't exist locally
         if (res.rows.length === 0) {
-            const crypto = require('crypto');
-            const placeholderHash = crypto.randomBytes(32).toString('hex');
-            res = await request.server.db.query(
-                'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, role, tier',
-                [decodedToken.email, placeholderHash, 'customer']
-            );
+            try {
+                const crypto = require('crypto');
+                const placeholderHash = crypto.randomBytes(32).toString('hex');
+                res = await request.server.db.query(
+                    'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, role, tier',
+                    [decodedToken.email, placeholderHash, 'customer']
+                );
+            } catch (insertErr) {
+                request.log.error('Failed to auto-provision user:', insertErr.message);
+                return reply.status(500).send({ error: 'Failed to create user account locally' });
+            }
         }
 
         request.user = res.rows[0];
     } catch (err) {
-        request.log.error('Firebase token verification failed:', err);
+        request.log.error(`Auth failed: ${err.message}`);
         return reply.status(401).send({ error: 'Session expired or invalid token' });
     }
 }
