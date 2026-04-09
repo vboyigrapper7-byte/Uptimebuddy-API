@@ -55,10 +55,20 @@ const buildServer = async () => {
         });
     });
 
-    const origins = ALLOWED_ORIGIN.split(',').map(o => o.trim());
+    const origins = [
+        'http://localhost:3000',
+        'https://uptimebuddy-dashboard.pages.dev',
+        ...(ALLOWED_ORIGIN.split(',').map(o => o.trim()).filter(o => o && o !== '*'))
+    ];
     
     await server.register(cors, {
-        origin: origins.length > 1 ? origins : (origins[0] === '*' ? true : origins[0]),
+        origin: (origin, cb) => {
+            if (!origin || origins.includes(origin)) {
+                cb(null, true);
+                return;
+            }
+            cb(new Error('Not allowed by CORS'), false);
+        },
         methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
         credentials: true,
     });
@@ -121,8 +131,13 @@ buildServer()
         serverInstance = server;
         const port = parseInt(process.env.PORT || '3001', 10);
         await server.listen({ port, host: '0.0.0.0' });
+        logger.info(`[Server] API process listening on port ${port}`);
     })
     .catch((err) => {
-        logger.error('[Server] Fatal startup error:', err);
+        logger.error('[Server] Fatal startup error:', { 
+            message: err.message, 
+            stack: err.stack,
+            code: err.code 
+        });
         process.exit(1);
     });
