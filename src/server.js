@@ -98,13 +98,32 @@ const buildServer = async () => {
         query: (text, params) => pool.query(text, params),
     });
 
-    // ── Health check ─────────────────────────────────────────────────────
+    // ── Health check (Diagnostic Tool) ──────────────────────────────────
     server.get('/health', async (request, reply) => {
+        const diagnostics = {
+            status: 'ok',
+            service: 'uptimebuddy-api',
+            database: 'unknown',
+            table_check: 'unknown',
+            error: null
+        };
+
         try {
+            // Check connection
             await pool.query('SELECT 1');
-            return reply.send({ status: 'ok', service: 'uptimebuddy-api', db: 'connected' });
+            diagnostics.database = 'connected';
+            
+            // Check for users table
+            await pool.query('SELECT id FROM users LIMIT 1');
+            diagnostics.table_check = 'users table exists';
+            
+            return reply.send(diagnostics);
         } catch (err) {
-            return reply.code(503).send({ status: 'error', db: 'disconnected', reason: err.message });
+            diagnostics.status = 'error';
+            diagnostics.database = 'disconnected';
+            diagnostics.error = err.message;
+            diagnostics.hint = "Check if DATABASE_URL is correct and schema.sql has been run.";
+            return reply.code(503).send(diagnostics);
         }
     });
 

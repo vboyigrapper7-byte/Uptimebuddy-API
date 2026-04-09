@@ -13,7 +13,7 @@ if (!process.env.DATABASE_URL) {
 
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    max: 20,                  // max connections in the pool
+    max: 5,                   // reduced to 5 for Render Free/Starter tier limits
     idleTimeoutMillis: 30000, // close idle connections after 30s
     connectionTimeoutMillis: 5000, // throw if can't get connection in 5s
     ssl: !process.env.DATABASE_URL.includes('localhost') && !process.env.DATABASE_URL.includes('127.0.0.1')
