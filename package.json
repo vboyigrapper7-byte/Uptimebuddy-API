@@ -7,15 +7,17 @@
     "node": ">=18.0.0"
   },
   "scripts": {
-    "start": "concurrently --kill-others-on-fail -n API,CHECK,ALERT -c cyan,green,yellow \"node src/server.js\" \"node src/workers/checkWorker.js\" \"node src/workers/alertWorker.js\"",
+    "migrate": "node-pg-migrate",
+    "start": "concurrently --kill-others-on-fail -n API,CHECK,ALERT -c cyan,green,yellow \"npm run migrate up && node src/server.js\" \"node src/workers/checkWorker.js\" \"node src/workers/alertWorker.js\"",
     "start:render": "npm run start",
-    "start:api": "node src/server.js",
+    "start:api": "npm run migrate up && node src/server.js",
     "dev": "node --watch src/server.js",
-    "dev:all": "concurrently --kill-others-on-fail -n API,CHECK,ALERT -c cyan,green,yellow \"node --watch src/server.js\" \"node --watch src/workers/checkWorker.js\" \"node --watch src/workers/alertWorker.js\"",
+    "dev:all": "concurrently --kill-others-on-fail -n API,CHECK,ALERT -c cyan,green,yellow \"npm run migrate up && node --watch src/server.js\" \"node --watch src/workers/checkWorker.js\" \"node --watch src/workers/alertWorker.js\"",
     "workers": "concurrently -n CHECK,ALERT -c green,yellow \"node --watch src/workers/checkWorker.js\" \"node --watch src/workers/alertWorker.js\"",
     "workers:prod": "concurrently -n CHECK,ALERT -c green,yellow \"node src/workers/checkWorker.js\" \"node src/workers/alertWorker.js\"",
     "workers:check": "node src/workers/checkWorker.js",
-    "workers:alert": "node src/workers/alertWorker.js"
+    "workers:alert": "node src/workers/alertWorker.js",
+    "test": "node --test \"tests/**/*.js\""
   },
   "dependencies": {
     "@fastify/cookie": "^9.4.0",
@@ -31,10 +33,15 @@
     "fastify": "^4.0.0",
     "firebase-admin": "^13.7.0",
     "ioredis": "^5.10.1",
+    "node-pg-migrate": "^8.0.4",
     "pg": "^8.0.0",
     "pino-pretty": "^10.0.0",
     "tcp-ping": "^0.1.1",
     "winston": "^3.19.0",
     "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "supertest": "^7.2.2",
+    "vitest": "^4.1.4"
   }
 }
