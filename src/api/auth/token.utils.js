@@ -1,5 +1,5 @@
 /**
- * UptimeBuddy Authentication Tokens Utility
+ * Monitor Hub Authentication Tokens Utility
  */
 
 /**

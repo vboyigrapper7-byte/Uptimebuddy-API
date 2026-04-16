@@ -58,7 +58,7 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
                 validateStatus: null, // don't throw on 4xx/5xx — we handle those
                 maxRedirects: 5,
                 maxContentLength: 5 * 1024 * 1024, // 5 MB limit
-                headers: { 'User-Agent': 'UptimeBuddy-Monitor/2.0' },
+                headers: { 'User-Agent': 'MonitorHub-Monitor/2.0' },
             });
             responseTime = Date.now() - startTime;
             if (res.status >= 200 && res.status < 400) {
@@ -72,7 +72,7 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
             const res = await axios.get(target, {
                 timeout: 10000,
                 maxContentLength: 2 * 1024 * 1024, // 2 MB — enough for any reasonable page
-                headers: { 'User-Agent': 'UptimeBuddy-Monitor/2.0' },
+                headers: { 'User-Agent': 'MonitorHub-Monitor/2.0' },
             });
             responseTime = Date.now() - startTime;
             const bodyText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);

@@ -18,7 +18,7 @@ if (!INGEST_URL) {
 
 // ── Startup banner (token is intentionally NOT logged) ────────────────────
 console.log('==========================================');
-console.log(' UptimeBuddy Node Agent v2.1');
+console.log(' Monitor Hub Node Agent v2.1');
 console.log(` Ingest URL     : ${INGEST_URL}`);
 console.log(` Report Interval: ${REPORT_INTERVAL / 1000}s`);
 console.log('==========================================\n');
@@ -55,7 +55,7 @@ async function sendMetrics() {
 
         const headers = { 
             'Content-Type': 'application/json', 
-            'User-Agent': 'UptimeBuddy-Agent/2.2' 
+            'User-Agent': 'MonitorHub-Agent/2.2' 
         };
 
         // Priority 1: Specific Agent Token
@@ -83,7 +83,7 @@ async function sendMetrics() {
             }
         } else if (err.request) {
             console.error(`[${ts}] ✗ NETWORK ERROR: Platform at ${INGEST_URL} is unreachable.`);
-            console.warn('[TROUBLESHOOT] Ensure the UptimeBuddy platform is running and port 3001 is open in your firewall.');
+            console.warn('[TROUBLESHOOT] Ensure the Monitor Hub platform is running and port 3001 is open in your firewall.');
         } else {
             console.error(`[${ts}] ✗ UNEXPECTED ERROR: ${err.message}`);
         }

@@ -83,7 +83,7 @@ async function agentRoutes(fastify, options) {
         // Primary: agent.js bundled inside the backend src directory (works on Render)
         const primaryPath  = path.resolve(__dirname, '../../agent.js');
         // Fallback: monorepo sibling path (works locally)
-        const fallbackPath = path.resolve(__dirname, '../../../../uptimebuddy-agent/agent.js');
+        const fallbackPath = path.resolve(__dirname, '../../../../monitorhub-agent/agent.js');
         const scriptPath   = fs.existsSync(primaryPath) ? primaryPath : fallbackPath;
         try {
             const content = await fs.promises.readFile(scriptPath, 'utf-8');
@@ -116,12 +116,27 @@ if %errorLevel% neq 0 (
     exit /b 1
 )
 
-echo Starting UptimeBuddy Agent Setup...
+echo Starting Monitor Hub Agent Setup...
 echo.
 
 :: ── Directory Setup ────────────────────────────────────────────────────────
-mkdir "%USERPROFILE%\\uptimebuddy-agent" 2>nul
-cd /d "%USERPROFILE%\\uptimebuddy-agent"
+mkdir "%USERPROFILE%\\monitorhub-agent" 2>nul
+cd /d "%USERPROFILE%\\monitorhub-agent"
+
+:: ── Verify Node.js ─────────────────────────────────────────────────────────
+node -v >nul 2>&1
+if %errorLevel% neq 0 (
+    echo [INFO] Node.js not found. Installing Node.js automatically via winget...
+    winget install -e --id OpenJS.NodeJS --accept-package-agreements --accept-source-agreements --silent
+    if %errorLevel% neq 0 (
+        echo [ERROR] Failed to install Node.js automatically.
+        echo Please install Node.js manually from https://nodejs.org/
+        pause
+        exit /b 1
+    )
+    set "PATH=%PATH%;C:\Program Files\nodejs"
+    echo [INFO] Node.js installed successfully.
+)
 
 :: ── Dependency Installation ────────────────────────────────────────────────
 call npm init -y >nul
@@ -133,7 +148,7 @@ echo Connecting to platform: ${hostUrl}
 curl.exe -f -s -o agent.js "${hostUrl}/api/v1/agents/script"
 if %errorLevel% neq 0 (
     echo.
-    echo [ERROR] Could not connect to UptimeBuddy Platform!
+    echo [ERROR] Could not connect to Monitor Hub Platform!
     echo Ensure this server can reach ${hostUrl}
     echo.
     pause
@@ -148,7 +163,7 @@ echo REPORT_INTERVAL_MS=30000>> .env
 :: ── PM2 Process Management (Windows Optimized) ─────────────────────────────
 echo Restarting monitoring engine...
 call pm2 kill >nul 2>&1
-call pm2 start agent.js --name "uptimebuddy-agent" --restart-delay 5000
+call pm2 start agent.js --name "monitorhub-agent" --restart-delay 5000
 
 echo.
 echo =========================================
@@ -157,12 +172,12 @@ echo  Telemetry: Running via Service (PM2)
 echo  Auth Mode: Secure Headers
 echo =========================================
 echo.
-echo To view real-time logs, run: pm2 logs uptimebuddy-agent
+echo To view real-time logs, run: pm2 logs monitorhub-agent
 echo.
 pause`;
         return reply
             .type('application/octet-stream')
-            .header('Content-Disposition', 'attachment; filename="setup_uptimebuddy_windows.bat"')
+            .header('Content-Disposition', 'attachment; filename="setup_monitorhub_windows.bat"')
             .send(script);
     });
 
@@ -173,9 +188,20 @@ pause`;
         const hostUrl = host || process.env.PUBLIC_API_URL || 'http://localhost:3001';
         const script = `#!/bin/bash
 set -e
-echo "Starting UptimeBuddy Agent Setup..."
-mkdir -p ~/uptimebuddy-agent
-cd ~/uptimebuddy-agent
+echo "Starting Monitor Hub Agent Setup..."
+
+if ! command -v node &> /dev/null; then
+    echo "[INFO] Node.js not found. Installing Node.js v20..."
+    curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+    sudo apt-get install -y nodejs
+    if ! command -v node &> /dev/null; then
+        echo "[ERROR] Failed to install Node.js. Please install manually."
+        exit 1
+    fi
+fi
+
+mkdir -p ~/monitorhub-agent
+cd ~/monitorhub-agent
 npm init -y
 npm install axios dotenv systeminformation
 npm install -g pm2
@@ -183,8 +209,8 @@ curl -fsSL -o agent.js "${hostUrl}/api/v1/agents/script"
 echo "AGENT_TOKEN=${token}" > .env
 echo "INGEST_URL=${hostUrl}/api/v1/agents/ingest" >> .env
 echo "REPORT_INTERVAL_MS=30000" >> .env
-pm2 delete uptimebuddy-agent 2>/dev/null || true
-pm2 start agent.js --name uptimebuddy-agent
+pm2 delete monitorhub-agent 2>/dev/null || true
+pm2 start agent.js --name monitorhub-agent
 pm2 save
 pm2 startup | tail -n 1 | bash
 echo ""
@@ -194,7 +220,7 @@ echo " Using secure Header-based Auth."
 echo "========================================="`;
         return reply
             .type('application/octet-stream')
-            .header('Content-Disposition', 'attachment; filename="setup_uptimebuddy_linux.sh"')
+            .header('Content-Disposition', 'attachment; filename="setup_monitorhub_linux.sh"')
             .send(script);
     });
 

@@ -102,7 +102,7 @@ const buildServer = async () => {
     server.get('/health', async (request, reply) => {
         const diagnostics = {
             status: 'ok',
-            service: 'uptimebuddy-api',
+            service: 'monitorhub-api',
             database: 'unknown',
             table_check: 'unknown',
             error: null
@@ -127,7 +127,7 @@ const buildServer = async () => {
         }
     });
 
-    server.get('/', async () => ({ status: 'ok', service: 'uptimebuddy-api' }));
+    server.get('/', async () => ({ status: 'ok', service: 'monitorhub-api' }));
 
     // ── Routes ────────────────────────────────────────────────────────────
     server.register(authRoutes,    { prefix: '/api/v1/auth' });

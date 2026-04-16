@@ -1,5 +1,5 @@
 /**
- * UptimeBuddy Unified Alert Service
+ * Monitor Hub Unified Alert Service
  * ─────────────────────────────────────────────────────────────────────────────
  * Responsibilities:
  * - Localize and format messages for each provider.
@@ -91,7 +91,7 @@ class AlertService {
                     { name: 'Time (UTC)', value: timestamp,    inline: true },
                     ...(errorMessage ? [{ name: 'Error', value: errorMessage, inline: false }] : []),
                 ],
-                footer: { text: 'UptimeBuddy Monitoring' }
+                footer: { text: 'Monitor Hub Monitoring' }
             }]
         };
     }

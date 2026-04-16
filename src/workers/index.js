@@ -1,10 +1,10 @@
 /**
- * UptimeBuddy Worker Entry Point
+ * Monitor Hub Worker Entry Point
  * Loads all backend background workers.
  */
 require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env') });
 
-console.log('--- Starting UptimeBuddy Workers ---');
+console.log('--- Starting Monitor Hub Workers ---');
 
 require('./checkWorker');
 require('./alertWorker');

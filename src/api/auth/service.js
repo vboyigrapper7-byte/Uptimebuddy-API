@@ -1,5 +1,5 @@
 /**
- * UptimeBuddy Authentication Service Layer
+ * Monitor Hub Authentication Service Layer
  * Direct interaction with the database for all auth-related tasks.
  */
 

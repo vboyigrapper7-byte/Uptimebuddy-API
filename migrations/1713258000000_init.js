@@ -3,7 +3,7 @@ exports.shorthands = undefined;
 exports.up = (pgm) => {
     pgm.sql(`
 -- =============================================================================
--- UptimeBuddy — Production Database Schema
+-- Monitor Hub — Production Database Schema
 -- Run once on a fresh database. Safe to re-run (uses IF NOT EXISTS).
 -- =============================================================================
 

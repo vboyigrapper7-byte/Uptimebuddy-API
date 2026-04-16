@@ -1,5 +1,5 @@
 /**
- * UptimeBuddy Authentication Routes
+ * Monitor Hub Authentication Routes
  */
 
 const controller = require('./controller');
@@ -27,6 +27,8 @@ async function authRoutes(fastify, options) {
             // Using request.user directly because it's populated by requireAuth
             return reply.send(request.user);
         });
+
+        protectedScope.put('/me', controller.updateProfile);
 
         // API Key Management
         protectedScope.post('/api-key', controller.createApiKey);

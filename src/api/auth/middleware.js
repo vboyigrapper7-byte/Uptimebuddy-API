@@ -1,5 +1,5 @@
 /**
- * UptimeBuddy Authentication Middleware
+ * Monitor Hub Authentication Middleware
  * Enforces Access Token validation via Firebase Admin.
  */
 

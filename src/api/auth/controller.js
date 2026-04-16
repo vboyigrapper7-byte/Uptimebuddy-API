@@ -1,5 +1,5 @@
 /**
- * UptimeBuddy Authentication Controller
+ * Monitor Hub Authentication Controller
  * Refactored for Firebase Auth Integration.
  */
 
@@ -61,4 +61,28 @@ const createApiKey = async (request, reply) => {
     }
 };
 
-module.exports = { register, createApiKey };
+const updateProfile = async (request, reply) => {
+    const { name } = request.body || {};
+    
+    if (name === undefined) {
+        return reply.status(400).send({ error: 'Name is required' });
+    }
+
+    try {
+        const res = await request.server.db.query(
+            'UPDATE users SET name = $1 WHERE id = $2 RETURNING id, email, name, tier, role, created_at',
+            [name.trim(), request.user.id]
+        );
+
+        if (res.rows.length === 0) {
+            return reply.status(404).send({ error: 'User not found' });
+        }
+
+        return reply.send({ message: 'Profile updated successfully', user: res.rows[0] });
+    } catch (err) {
+        request.log.error(err, 'Failed to update profile');
+        return reply.status(500).send({ error: 'Internal server error while updating profile' });
+    }
+};
+
+module.exports = { register, createApiKey, updateProfile };

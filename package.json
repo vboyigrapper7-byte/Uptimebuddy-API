@@ -1,7 +1,7 @@
 {
-  "name": "uptimebuddy-backend",
+  "name": "monitorhub-backend",
   "version": "1.0.0",
-  "description": "UptimeBuddy SaaS Platform Backend API",
+  "description": "Monitor Hub SaaS Platform Backend API",
   "main": "src/server.js",
   "engines": {
     "node": ">=18.0.0"
