@@ -128,14 +128,30 @@ node -v >nul 2>&1
 if %errorLevel% neq 0 (
     echo [INFO] Node.js not found. Installing Node.js automatically via winget...
     winget install -e --id OpenJS.NodeJS --accept-package-agreements --accept-source-agreements --silent
-    if %errorLevel% neq 0 (
-        echo [ERROR] Failed to install Node.js automatically.
-        echo Please install Node.js manually from https://nodejs.org/
+    :: NOTE: winget can return non-zero exit codes for informational prompts
+    :: (e.g. MSStore terms), so we DO NOT check errorLevel here.
+    :: Instead, we refresh PATH from the registry and retest node.
+    echo [INFO] Refreshing environment PATH...
+    for /f "skip=2 tokens=3*" %%A in ('reg query "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment" /v "Path" 2^>nul') do set "MACHINE_PATH=%%A %%B"
+    for /f "skip=2 tokens=3*" %%A in ('reg query "HKCU\Environment" /v "Path" 2^>nul') do set "USER_PATH=%%A %%B"
+    if defined MACHINE_PATH (
+        if defined USER_PATH (
+            set "PATH=!MACHINE_PATH!;!USER_PATH!"
+        ) else (
+            set "PATH=!MACHINE_PATH!"
+        )
+    ) else (
+        set "PATH=%PATH%;C:\Program Files\nodejs"
+    )
+    :: Verify node is now available
+    node -v >nul 2>&1
+    if !errorLevel! neq 0 (
+        echo [ERROR] Node.js could not be detected after install.
+        echo Please restart this script, or install Node.js manually from https://nodejs.org/
         pause
         exit /b 1
     )
-    set "PATH=%PATH%;C:\Program Files\nodejs"
-    echo [INFO] Node.js installed successfully.
+    echo [INFO] Node.js installed and detected successfully.
 )
 
 :: ── Dependency Installation ────────────────────────────────────────────────
@@ -145,11 +161,14 @@ call npm install axios dotenv systeminformation pm2 -g --quiet
 
 :: ── Fetch Agent Script ─────────────────────────────────────────────────────
 echo Connecting to platform: ${hostUrl}
-curl.exe -f -s -o agent.js "${hostUrl}/api/v1/agents/script"
+echo (This may take up to 60 seconds if the server is waking from sleep...)
+curl.exe --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 30 --max-time 120 -o agent.js "${hostUrl}/api/v1/agents/script"
 if %errorLevel% neq 0 (
     echo.
-    echo [ERROR] Could not connect to Monitor Hub Platform!
+    echo [ERROR] Could not download agent from Monitor Hub Platform!
     echo Ensure this server can reach ${hostUrl}
+    echo If using Render free tier, the backend may still be waking up.
+    echo Wait 60 seconds and re-run this script.
     echo.
     pause
     exit /b 1
@@ -205,7 +224,15 @@ cd ~/monitorhub-agent
 npm init -y
 npm install axios dotenv systeminformation
 npm install -g pm2
-curl -fsSL -o agent.js "${hostUrl}/api/v1/agents/script"
+echo "Connecting to platform: ${hostUrl}"
+echo "(This may take up to 60 seconds if the server is waking from sleep...)"
+curl --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 30 --max-time 120 -o agent.js "${hostUrl}/api/v1/agents/script"
+if [ $? -ne 0 ]; then
+    echo "[ERROR] Could not download agent from Monitor Hub Platform!"
+    echo "Ensure this server can reach ${hostUrl}"
+    echo "If using Render free tier, wait 60s and re-run."
+    exit 1
+fi
 echo "AGENT_TOKEN=${token}" > .env
 echo "INGEST_URL=${hostUrl}/api/v1/agents/ingest" >> .env
 echo "REPORT_INTERVAL_MS=30000" >> .env
