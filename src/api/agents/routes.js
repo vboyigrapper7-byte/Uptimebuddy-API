@@ -168,8 +168,18 @@ cd /d "%USERPROFILE%\\monitorhub-agent"
 :: ── Verify Node.js ─────────────────────────────────────────────────────────
 node -v >nul 2>&1
 if %errorLevel% neq 0 (
-    echo [INFO] Node.js not found. Installing Node.js automatically via winget...
-    winget install -e --id OpenJS.NodeJS --accept-package-agreements --accept-source-agreements --silent
+    echo [INFO] Node.js not found. Installing Node.js automatically...
+    winget -v >nul 2>&1
+    if !errorLevel! equ 0 (
+        echo [INFO] Using winget...
+        winget install -e --id OpenJS.NodeJS --accept-package-agreements --accept-source-agreements --silent
+    ) else (
+        echo [INFO] Winget not found. Downloading standalone MSI installer...
+        powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri 'https://nodejs.org/dist/v20.12.2/node-v20.12.2-x64.msi' -OutFile '%temp%\\nodejs.msi'"
+        echo [INFO] Installing Node.js ^(this may take 1-2 minutes^)...
+        msiexec.exe /i "%temp%\\nodejs.msi" /qn /norestart
+        del "%temp%\\nodejs.msi"
+    )
     :: NOTE: winget can return non-zero exit codes for informational prompts
     :: (e.g. MSStore terms^), so we DO NOT check errorLevel here.
     :: Instead, we refresh PATH from the registry and retest node.
