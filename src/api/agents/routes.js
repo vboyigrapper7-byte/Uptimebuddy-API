@@ -151,10 +151,10 @@ setlocal enabledelayedexpansion
 net session >nul 2>&1
 if %errorLevel% neq 0 (
     echo Requesting Administrative Privileges...
-    echo Set UAC = CreateObject^("Shell.Application"^) > "%temp%\getadmin.vbs"
-    echo UAC.ShellExecute "%~s0", "", "", "runas", 1 >> "%temp%\getadmin.vbs"
-    "%temp%\getadmin.vbs"
-    del "%temp%\getadmin.vbs"
+    echo Set UAC = CreateObject^("Shell.Application"^) > "%temp%\\getadmin.vbs"
+    echo UAC.ShellExecute "%~s0", "", "", "runas", 1 >> "%temp%\\getadmin.vbs"
+    cscript //nologo "%temp%\\getadmin.vbs"
+    del "%temp%\\getadmin.vbs"
     exit /b
 )
 
@@ -171,11 +171,11 @@ if %errorLevel% neq 0 (
     echo [INFO] Node.js not found. Installing Node.js automatically via winget...
     winget install -e --id OpenJS.NodeJS --accept-package-agreements --accept-source-agreements --silent
     :: NOTE: winget can return non-zero exit codes for informational prompts
-    :: (e.g. MSStore terms), so we DO NOT check errorLevel here.
+    :: (e.g. MSStore terms^), so we DO NOT check errorLevel here.
     :: Instead, we refresh PATH from the registry and retest node.
     echo [INFO] Refreshing environment PATH...
-    for /f "skip=2 tokens=3*" %%A in ('reg query "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment" /v "Path" 2^>nul') do set "MACHINE_PATH=%%A %%B"
-    for /f "skip=2 tokens=3*" %%A in ('reg query "HKCU\Environment" /v "Path" 2^>nul') do set "USER_PATH=%%A %%B"
+    for /f "skip=2 tokens=3*" %%A in ('reg query "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment" /v "Path" 2^>nul') do set "MACHINE_PATH=%%A %%B"
+    for /f "skip=2 tokens=3*" %%A in ('reg query "HKCU\\Environment" /v "Path" 2^>nul') do set "USER_PATH=%%A %%B"
     if defined MACHINE_PATH (
         if defined USER_PATH (
             set "PATH=!MACHINE_PATH!;!USER_PATH!"
@@ -183,7 +183,7 @@ if %errorLevel% neq 0 (
             set "PATH=!MACHINE_PATH!"
         )
     ) else (
-        set "PATH=%PATH%;C:\Program Files\nodejs"
+        set "PATH=%PATH%;C:\\Program Files\\nodejs"
     )
     :: Verify node is now available
     node -v >nul 2>&1
