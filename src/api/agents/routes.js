@@ -10,9 +10,12 @@ function validateMetrics(metrics) {
     const { cpu_percent, ram_mb, disk_percent } = metrics;
     if (typeof cpu_percent   !== 'number' || cpu_percent   < 0 || cpu_percent   > 100) return false;
     if (typeof disk_percent  !== 'number' || disk_percent  < 0 || disk_percent  > 100) return false;
-    if (typeof ram_mb        !== 'number' || ram_mb        < 0 || ram_mb        > 4194304) return false; // 4 TB max
-    // ram_total_mb is optional (added in agent v2.3+)
-    if (metrics.ram_total_mb !== undefined && (typeof metrics.ram_total_mb !== 'number' || metrics.ram_total_mb < 0)) return false;
+    if (typeof ram_mb        !== 'number' || ram_mb        < 0 || ram_mb        > 4194304) return false;
+    if (metrics.ram_total_mb  !== undefined && (typeof metrics.ram_total_mb  !== 'number' || metrics.ram_total_mb  < 0)) return false;
+    if (metrics.net_rx_mb     !== undefined && (typeof metrics.net_rx_mb     !== 'number' || metrics.net_rx_mb    < 0)) return false;
+    if (metrics.net_tx_mb     !== undefined && (typeof metrics.net_tx_mb     !== 'number' || metrics.net_tx_mb    < 0)) return false;
+    if (metrics.uptime_seconds !== undefined && (typeof metrics.uptime_seconds !== 'number' || metrics.uptime_seconds < 0)) return false;
+    if (metrics.process_count  !== undefined && (typeof metrics.process_count  !== 'number' || metrics.process_count  < 0)) return false;
     return true;
 }
 
@@ -58,10 +61,17 @@ async function agentRoutes(fastify, options) {
             const recordedAt  = new Date(); // Always use server time — never trust client timestamp
 
             await fastify.db.query(
-                `INSERT INTO agent_metrics (agent_id, recorded_at, cpu_percent, ram_mb, ram_total_mb, disk_percent)
-                 VALUES ($1, $2, $3, $4, $5, $6)
+                `INSERT INTO agent_metrics
+                 (agent_id, recorded_at, cpu_percent, ram_mb, ram_total_mb, disk_percent, net_rx_mb, net_tx_mb, uptime_seconds, process_count)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                  ON CONFLICT DO NOTHING`,
-                [agentId, recordedAt, metrics.cpu_percent, metrics.ram_mb, metrics.ram_total_mb ?? null, metrics.disk_percent]
+                [
+                    agentId, recordedAt,
+                    metrics.cpu_percent, metrics.ram_mb, metrics.ram_total_mb ?? null,
+                    metrics.disk_percent,
+                    metrics.net_rx_mb ?? null, metrics.net_tx_mb ?? null,
+                    metrics.uptime_seconds ?? null, metrics.process_count ?? null
+                ]
             );
 
             await fastify.db.query(
@@ -95,6 +105,38 @@ async function agentRoutes(fastify, options) {
     });
 
     // ────────────────────────────────────────────────────────────────────
+    // PUBLIC — Windows Native Service Installer Script
+    // ────────────────────────────────────────────────────────────────────
+    fastify.get('/windows-service.js', async (request, reply) => {
+        const script = `
+const { Service } = require('node-windows');
+const path = require('path');
+
+const svc = new Service({
+  name: 'MonitorHubAgent',
+  description: 'Monitor Hub hardware telemetry agent',
+  script: path.join(__dirname, 'agent.js')
+});
+
+svc.on('install', () => {
+  console.log('[Service] Installed successfully into Windows SCM.');
+  svc.start();
+});
+
+svc.on('alreadyinstalled', () => {
+  console.log('[Service] Service already exists. Restarting...');
+  svc.restart();
+});
+
+svc.on('start', () => {
+  console.log('[Service] Monitor Hub Agent is now running in the background!');
+});
+
+svc.install();`;
+        return reply.type('application/javascript').send(script);
+    });
+
+    // ────────────────────────────────────────────────────────────────────
     // PUBLIC — Installer script generators (token needed to download)
     // ────────────────────────────────────────────────────────────────────
     fastify.get('/install_windows.bat', async (request, reply) => {
@@ -105,15 +147,12 @@ async function agentRoutes(fastify, options) {
         const script = `@echo off
 setlocal enabledelayedexpansion
 
-:: ── Elevation Check ────────────────────────────────────────────────────────
+:: ── Elevation Check & Auto-Elevate ───────────────────────────────────────────
 net session >nul 2>&1
 if %errorLevel% neq 0 (
-    echo.
-    echo [ERROR] Must run this installer as ADMINISTRATOR.
-    echo Right-click the .bat file and select 'Run as Administrator'.
-    echo.
-    pause
-    exit /b 1
+    echo Requesting Administrative Privileges...
+    powershell -Command "Start-Process cmd -ArgumentList '/c, \"%~dpnx0\"' -Verb RunAs"
+    exit /b
 )
 
 echo Starting Monitor Hub Agent Setup...
@@ -156,13 +195,14 @@ if %errorLevel% neq 0 (
 
 :: ── Dependency Installation ────────────────────────────────────────────────
 call npm init -y >nul
-echo Installing dependencies (axios, systeminformation, pm2)...
-call npm install axios dotenv systeminformation pm2 -g --quiet
+echo Installing local dependencies (axios, dotenv, systeminformation, node-windows)...
+call npm install axios dotenv systeminformation node-windows --quiet
 
-:: ── Fetch Agent Script ─────────────────────────────────────────────────────
+:: ── Fetch Agent Script & Service Installer ─────────────────────────────────
 echo Connecting to platform: ${hostUrl}
 echo (This may take up to 60 seconds if the server is waking from sleep...)
 curl.exe --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 30 --max-time 120 -o agent.js "${hostUrl}/api/v1/agents/script"
+curl.exe --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 30 --max-time 120 -o service.js "${hostUrl}/api/v1/agents/windows-service.js"
 if %errorLevel% neq 0 (
     echo.
     echo [ERROR] Could not download agent from Monitor Hub Platform!
@@ -179,19 +219,18 @@ echo AGENT_TOKEN=${token}> .env
 echo INGEST_URL=${hostUrl}/api/v1/agents/ingest>> .env
 echo REPORT_INTERVAL_MS=30000>> .env
 
-:: ── PM2 Process Management (Windows Optimized) ─────────────────────────────
-echo Restarting monitoring engine...
-call pm2 kill >nul 2>&1
-call pm2 start agent.js --name "monitorhub-agent" --restart-delay 5000
+:: ── Windows Service Management (node-windows) ──────────────────────────────
+echo Installing and starting Native Windows Service...
+node service.js
 
 echo.
-echo =========================================
+echo ========================================================
 echo  Agent Configuration Upgraded!
-echo  Telemetry: Running via Service (PM2)
+echo  Telemetry: Running natively as a Windows System Service
 echo  Auth Mode: Secure Headers
-echo =========================================
+echo ========================================================
 echo.
-echo To view real-time logs, run: pm2 logs monitorhub-agent
+echo View service status in Windows "Services.msc" (MonitorHubAgent)
 echo.
 pause`;
         return reply
@@ -222,7 +261,9 @@ fi
 mkdir -p ~/monitorhub-agent
 cd ~/monitorhub-agent
 npm init -y
+echo "Installing local dependencies..."
 npm install axios dotenv systeminformation
+echo "Installing PM2 globally..."
 npm install -g pm2
 echo "Connecting to platform: ${hostUrl}"
 echo "(This may take up to 60 seconds if the server is waking from sleep...)"
@@ -304,10 +345,14 @@ echo "========================================="`;
                 if (duration === '24H') {
                     queryText = `
                         SELECT TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'HH24:MI') AS time,
-                               AVG(cpu_percent)::numeric(5,2) AS cpu,
-                               AVG(ram_mb)::int               AS memory,
-                               MAX(ram_total_mb)::int         AS memory_total,
-                               AVG(disk_percent)::numeric(5,2) AS disk
+                               AVG(cpu_percent)::numeric(5,2)  AS cpu,
+                               AVG(ram_mb)::int                AS memory,
+                               MAX(ram_total_mb)::int          AS memory_total,
+                               AVG(disk_percent)::numeric(5,2) AS disk,
+                               AVG(net_rx_mb)::numeric(8,3)    AS net_rx,
+                               AVG(net_tx_mb)::numeric(8,3)    AS net_tx,
+                               MAX(uptime_seconds)::bigint     AS uptime_seconds,
+                               AVG(process_count)::int         AS process_count
                         FROM agent_metrics WHERE agent_id = $1
                         AND recorded_at >= NOW() - INTERVAL '24 hours'
                         GROUP BY TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'HH24:MI')
@@ -315,10 +360,14 @@ echo "========================================="`;
                 } else if (duration === '12H') {
                     queryText = `
                         SELECT TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'HH24:MI') AS time,
-                               AVG(cpu_percent)::numeric(5,2) AS cpu,
-                               AVG(ram_mb)::int               AS memory,
-                               MAX(ram_total_mb)::int         AS memory_total,
-                               AVG(disk_percent)::numeric(5,2) AS disk
+                               AVG(cpu_percent)::numeric(5,2)  AS cpu,
+                               AVG(ram_mb)::int                AS memory,
+                               MAX(ram_total_mb)::int          AS memory_total,
+                               AVG(disk_percent)::numeric(5,2) AS disk,
+                               AVG(net_rx_mb)::numeric(8,3)    AS net_rx,
+                               AVG(net_tx_mb)::numeric(8,3)    AS net_tx,
+                               MAX(uptime_seconds)::bigint     AS uptime_seconds,
+                               AVG(process_count)::int         AS process_count
                         FROM agent_metrics WHERE agent_id = $1
                         AND recorded_at >= NOW() - INTERVAL '12 hours'
                         GROUP BY TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'HH24:MI')
@@ -327,7 +376,9 @@ echo "========================================="`;
                     // Default: last 60 raw data points (~10 min at 10s intervals)
                     queryText = `
                         SELECT TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'HH24:MI:SS') AS time,
-                               cpu_percent AS cpu, ram_mb AS memory, ram_total_mb AS memory_total, disk_percent AS disk
+                               cpu_percent AS cpu, ram_mb AS memory, ram_total_mb AS memory_total,
+                               disk_percent AS disk, net_rx_mb AS net_rx, net_tx_mb AS net_tx,
+                               uptime_seconds, process_count
                         FROM agent_metrics WHERE agent_id = $1
                         ORDER BY recorded_at DESC LIMIT 60`;
                 }

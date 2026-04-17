@@ -1,6 +1,7 @@
 require('dotenv').config();
 const si    = require('systeminformation');
 const axios = require('axios');
+const os    = require('os');
 
 // ── Config validation ─────────────────────────────────────────────────────
 const AGENT_TOKEN    = process.env.AGENT_TOKEN;
@@ -18,29 +19,63 @@ if (!INGEST_URL) {
 
 // ── Startup banner (token is intentionally NOT logged) ────────────────────
 console.log('==========================================');
-console.log(' Monitor Hub Node Agent v2.1');
+console.log(' Monitor Hub Node Agent v3.0');
 console.log(` Ingest URL     : ${INGEST_URL}`);
 console.log(` Report Interval: ${REPORT_INTERVAL / 1000}s`);
 console.log('==========================================\n');
 
+// ── Network baseline (for delta calculation) ──────────────────────────────
+let prevNetStats = null;
+let prevNetTime  = null;
+
 // ── Metrics collection ────────────────────────────────────────────────────
 async function collectMetrics() {
-    const [memory, load, fsData] = await Promise.all([
+    const [memory, load, fsData, netStats, processes] = await Promise.all([
         si.mem(),
         si.currentLoad(),
         si.fsSize(),
+        si.networkStats(),
+        si.processes(),
     ]);
 
     // Pick primary disk — prefer / on Linux, first drive on Windows
     const primaryDisk = fsData.find(d => d.mount === '/') || fsData.find(d => d.mount.match(/^[A-Z]:\\/)) || fsData[0];
     const diskPercent = primaryDisk ? parseFloat(primaryDisk.use.toFixed(2)) : 0;
 
+    // RAM
+    const ramMb      = Math.floor(memory.active / (1024 * 1024));
+    const ramTotalMb = Math.floor(memory.total  / (1024 * 1024));
+
+    // Network I/O delta (MB transferred since last reading)
+    const now        = Date.now();
+    let netRxMb = 0;
+    let netTxMb = 0;
+
+    if (prevNetStats && prevNetTime) {
+        const elapsedMs = now - prevNetTime;
+        const totalRxBytes = netStats.reduce((s, i) => s + (i.rx_bytes || 0), 0);
+        const totalTxBytes = netStats.reduce((s, i) => s + (i.tx_bytes || 0), 0);
+        const prevRxBytes  = prevNetStats.reduce((s, i) => s + (i.rx_bytes || 0), 0);
+        const prevTxBytes  = prevNetStats.reduce((s, i) => s + (i.tx_bytes || 0), 0);
+        // Convert bytes/interval → MB/s
+        netRxMb = parseFloat(((totalRxBytes - prevRxBytes) / (1024 * 1024)).toFixed(3));
+        netTxMb = parseFloat(((totalTxBytes - prevTxBytes) / (1024 * 1024)).toFixed(3));
+        if (netRxMb < 0) netRxMb = 0;
+        if (netTxMb < 0) netTxMb = 0;
+    }
+    prevNetStats = netStats;
+    prevNetTime  = now;
+
     return {
         metrics: {
-            cpu_percent:  parseFloat(load.currentLoad.toFixed(2)),
-            ram_mb:       Math.floor(memory.active / (1024 * 1024)),
-            ram_total_mb: Math.floor(memory.total / (1024 * 1024)),
-            disk_percent: diskPercent,
+            cpu_percent:    parseFloat(load.currentLoad.toFixed(2)),
+            ram_mb:         ramMb,
+            ram_total_mb:   ramTotalMb,
+            disk_percent:   diskPercent,
+            net_rx_mb:      netRxMb,
+            net_tx_mb:      netTxMb,
+            uptime_seconds: Math.floor(os.uptime()),
+            process_count:  processes.all || 0,
         },
     };
 }
@@ -51,27 +86,19 @@ let failedAttempts = 0;
 async function sendMetrics() {
     try {
         const data = await collectMetrics();
-        const { cpu_percent, ram_mb, disk_percent } = data.metrics;
+        const { cpu_percent, ram_mb, disk_percent, net_rx_mb, net_tx_mb, uptime_seconds } = data.metrics;
 
         const headers = { 
             'Content-Type': 'application/json', 
-            'User-Agent': 'MonitorHub-Agent/2.2' 
+            'User-Agent':   'MonitorHub-Agent/3.0',
+            'X-Agent-Token': AGENT_TOKEN,
         };
 
-        // Priority 1: Specific Agent Token
-        if (AGENT_TOKEN) headers['X-Agent-Token'] = AGENT_TOKEN;
-        
-        // Priority 2: Master API Key (if configured)
-        if (process.env.API_KEY) headers['X-API-KEY'] = process.env.API_KEY;
-
-        await axios.post(INGEST_URL, data, {
-            timeout: 8000,
-            headers
-        });
+        await axios.post(INGEST_URL, data, { timeout: 8000, headers });
 
         const ts = new Date().toISOString();
-        console.log(`[${ts}] ✓ CPU: ${cpu_percent}% | RAM: ${ram_mb}MB | Disk: ${disk_percent}%`);
-        failedAttempts = 0; // Reset on success
+        console.log(`[${ts}] ✓ CPU: ${cpu_percent}% | RAM: ${ram_mb}MB | Disk: ${disk_percent}% | Net↓${net_rx_mb}MB ↑${net_tx_mb}MB | Up: ${Math.floor(uptime_seconds/3600)}h`);
+        failedAttempts = 0;
     } catch (err) {
         failedAttempts++;
         const ts = new Date().toISOString();
