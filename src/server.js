@@ -34,7 +34,7 @@ const getRoutesAndServices = () => {
     };
 };
 
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:3000';
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://monitorhubs.com';
 
 // -------------------------------------------------------------------------
 const buildServer = async () => {
@@ -72,6 +72,8 @@ const buildServer = async () => {
 
     const origins = [
         'http://localhost:3000',
+        'https://monitorhubs.com',
+        'https://api.monitorhubs.com',
         'https://uptimebuddy-dashboard.pages.dev',
         ...(ALLOWED_ORIGIN.split(',').map(o => o.trim()).filter(o => o && o !== '*'))
     ];

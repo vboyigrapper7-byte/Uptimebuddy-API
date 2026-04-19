@@ -85,15 +85,23 @@ CREATE INDEX IF NOT EXISTS idx_agents_token       ON agents(agent_token);
 CREATE TABLE IF NOT EXISTS agent_metrics (
     agent_id     INT              REFERENCES agents(id) ON DELETE CASCADE,
     recorded_at  TIMESTAMP        NOT NULL,
-    cpu_percent  NUMERIC(5,2),
-    ram_mb       INT,
-    ram_total_mb INT,
-    disk_percent NUMERIC(5,2),
+    cpu_percent    NUMERIC(5,2),
+    ram_mb         INT,
+    ram_total_mb   INT,
+    disk_percent   NUMERIC(5,2),
+    net_rx_mb      NUMERIC(10,3),
+    net_tx_mb      NUMERIC(10,3),
+    uptime_seconds BIGINT,
+    process_count  INT,
     PRIMARY KEY (agent_id, recorded_at)
 );
 
--- Add ram_total_mb to existing installs (safe — IF NOT EXISTS avoids error on fresh installs)
-ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS ram_total_mb INT;
+-- Ensure all columns exist on existing installs
+ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS ram_total_mb   INT;
+ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS net_rx_mb      NUMERIC(10,3);
+ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS net_tx_mb      NUMERIC(10,3);
+ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS uptime_seconds BIGINT;
+ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS process_count  INT;
 
 CREATE INDEX IF NOT EXISTS idx_agent_metrics_time ON agent_metrics(agent_id, recorded_at DESC);
 

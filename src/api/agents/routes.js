@@ -19,6 +19,14 @@ function validateMetrics(metrics) {
     return true;
 }
 
+// ── Agent dynamic status helper ───────────────────────────────────────────
+function getDynamicAgentStatus(agent) {
+    if (!agent.last_seen || agent.status === 'pending') return agent.status;
+    const now = Date.now();
+    const secondsSinceSeen = (now - new Date(agent.last_seen).getTime()) / 1000;
+    return secondsSinceSeen < 90 ? 'up' : 'down';
+}
+
 const { requireApiKey } = require('../auth/middleware');
 
 async function agentRoutes(fastify, options) {
@@ -143,7 +151,7 @@ svc.install();`;
         const { token, host } = request.query;
         if (!token) return reply.status(400).send('Agent token is required');
 
-        const hostUrl = host || process.env.PUBLIC_API_URL || 'http://localhost:3001';
+        const hostUrl = host || process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
         const script = `@echo off
 setlocal enabledelayedexpansion
 
@@ -262,7 +270,7 @@ pause`;
         const { token, host } = request.query;
         if (!token) return reply.status(400).send('Agent token is required');
 
-        const hostUrl = host || process.env.PUBLIC_API_URL || 'http://localhost:3001';
+        const hostUrl = host || process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
         const script = `#!/bin/bash
 set -e
 echo "Starting Monitor Hub Agent Setup..."
@@ -329,14 +337,10 @@ echo "========================================="`;
                 );
 
                 const now = Date.now();
-                const mapped = res.rows.map(agent => {
-                    let agentStatus = agent.status;
-                    if (agent.last_seen && agent.status !== 'pending') {
-                        const secondsSinceSeen = (now - new Date(agent.last_seen).getTime()) / 1000;
-                        agentStatus = secondsSinceSeen < 90 ? 'up' : 'down';
-                    }
-                    return { ...agent, status: agentStatus };
-                });
+                const mapped = res.rows.map(agent => ({
+                    ...agent,
+                    status: getDynamicAgentStatus(agent)
+                }));
 
                 return reply.send(mapped);
             } catch (err) {
@@ -405,7 +409,10 @@ echo "========================================="`;
                 const res          = await fastify.db.query(queryText, queryParams);
                 const finalMetrics = duration ? res.rows : res.rows.reverse();
 
-                return reply.send({ server: verify.rows[0], metrics: finalMetrics });
+                return reply.send({ 
+                    server: { ...verify.rows[0], status: getDynamicAgentStatus(verify.rows[0]) }, 
+                    metrics: finalMetrics 
+                });
             } catch (err) {
                 fastify.log.error(err, 'getAgentMetrics error');
                 return reply.status(500).send({ error: 'Failed to fetch metrics' });
