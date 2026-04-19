@@ -11,14 +11,14 @@ if (!process.env.DATABASE_URL) {
     console.error('[DB Pool] Ensure you have added DATABASE_URL to your Render Environment settings.');
 }
 
+const isLocalhost = process.env.DATABASE_URL && (process.env.DATABASE_URL.includes('localhost') || process.env.DATABASE_URL.includes('127.0.0.1'));
+
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     max: 5,                   // reduced to 5 for Render Free/Starter tier limits
     idleTimeoutMillis: 30000, // close idle connections after 30s
     connectionTimeoutMillis: 5000, // throw if can't get connection in 5s
-    ssl: !process.env.DATABASE_URL.includes('localhost') && !process.env.DATABASE_URL.includes('127.0.0.1')
-        ? { rejectUnauthorized: false } 
-        : false
+    ssl: !isLocalhost ? { rejectUnauthorized: false } : false
 });
 
 pool.on('error', (err) => {
