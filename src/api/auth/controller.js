@@ -62,16 +62,24 @@ const createApiKey = async (request, reply) => {
 };
 
 const updateProfile = async (request, reply) => {
-    const { name } = request.body || {};
+    const { name, status_slug } = request.body || {};
     
-    if (name === undefined) {
-        return reply.status(400).send({ error: 'Name is required' });
+    if (name === undefined && status_slug === undefined) {
+        return reply.status(400).send({ error: 'Nothing to update' });
+    }
+
+    // Basic slug validation
+    if (status_slug && !/^[a-z0-9-]+$/.test(status_slug)) {
+        return reply.status(400).send({ error: 'Status slug must be alphanumeric with hyphens only' });
     }
 
     try {
         const res = await request.server.db.query(
-            'UPDATE users SET name = $1 WHERE id = $2 RETURNING id, email, name, tier, role, created_at',
-            [name.trim(), request.user.id]
+            `UPDATE users SET 
+               name = COALESCE($1, name),
+               status_slug = COALESCE($2, status_slug)
+             WHERE id = $3 RETURNING id, email, name, status_slug, tier, role, created_at`,
+            [name?.trim() || null, status_slug?.toLowerCase() || null, request.user.id]
         );
 
         if (res.rows.length === 0) {

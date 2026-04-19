@@ -1,5 +1,6 @@
 const { monitorQueue } = require('../../core/queue/setup');
 const { z } = require('zod');
+const axios = require('axios');
 
 // ── SSRF blocklist — private/loopback IP ranges ───────────────────────────
 const PRIVATE_IP_RE = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|::1|0\.0\.0\.0)/i;
@@ -28,6 +29,11 @@ const CreateMonitorSchema = z.object({
     target:           z.string().min(1).max(500),
     keyword:          z.string().max(255).optional().nullable(),
     interval_seconds: z.number().int().min(30).max(86400).default(300),
+    method:           z.string().max(10).optional().default('GET'),
+    headers:          z.any().optional(), // Can be string or object
+    body:             z.string().optional(),
+    threshold_ms:     z.number().int().min(0).max(60000).optional().default(0),
+    region:           z.string().max(50).optional().default('Global')
 });
 
 // ── Create ────────────────────────────────────────────────────────────────
@@ -37,7 +43,7 @@ const createMonitor = async (request, reply) => {
         return reply.code(400).send({ error: parsed.error.issues[0].message });
     }
 
-    const { name, type, target, keyword, interval_seconds } = parsed.data;
+    const { name, type, target, keyword, interval_seconds, method, headers, body, threshold_ms, region } = parsed.data;
     const userId = request.user.id;
 
     // SSRF check
@@ -46,9 +52,9 @@ const createMonitor = async (request, reply) => {
 
     try {
         const result = await request.server.db.query(
-            `INSERT INTO monitors (user_id, name, type, target, keyword, interval_seconds)
-             VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, name, type, target, keyword, interval_seconds, status, created_at`,
-            [userId, name, type, target, keyword ?? null, interval_seconds]
+            `INSERT INTO monitors (user_id, name, type, target, keyword, interval_seconds, method, headers, body, threshold_ms, region)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id, name, type, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status, created_at`,
+            [userId, name, type, target, keyword ?? null, interval_seconds, method || 'GET', typeof headers === 'object' ? JSON.stringify(headers) : headers, body || null, threshold_ms || 0, region || 'Global']
         );
         const monitor = result.rows[0];
 
@@ -80,7 +86,7 @@ const getMonitors = async (request, reply) => {
 
     try {
         const result = await request.server.db.query(
-            `SELECT id, name, type, target, keyword, interval_seconds, status, created_at
+            `SELECT id, name, type, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status, created_at
              FROM monitors WHERE user_id = $1
              ORDER BY created_at DESC
              LIMIT $2 OFFSET $3`,
@@ -97,9 +103,9 @@ const getMonitors = async (request, reply) => {
 const updateMonitor = async (request, reply) => {
     const { id } = request.params;
     const userId = request.user.id;
-    const { name, interval_seconds } = request.body || {};
+    const { name, interval_seconds, method, headers, body, threshold_ms, region } = request.body || {};
 
-    if (!name && !interval_seconds) {
+    if (!name && !interval_seconds && !method && !headers && !body && !threshold_ms && !region) {
         return reply.code(400).send({ error: 'Nothing to update' });
     }
     if (interval_seconds && (interval_seconds < 30 || interval_seconds > 86400)) {
@@ -110,10 +116,15 @@ const updateMonitor = async (request, reply) => {
         const result = await request.server.db.query(
             `UPDATE monitors SET
                name             = COALESCE($1, name),
-               interval_seconds = COALESCE($2, interval_seconds)
-             WHERE id = $3 AND user_id = $4
-             RETURNING id, name, type, target, keyword, interval_seconds, status`,
-            [name || null, interval_seconds || null, id, userId]
+               interval_seconds = COALESCE($2, interval_seconds),
+               method           = COALESCE($3, method),
+               headers          = COALESCE($4, headers),
+               body             = COALESCE($5, body),
+               threshold_ms     = COALESCE($6, threshold_ms),
+               region           = COALESCE($7, region)
+             WHERE id = $8 AND user_id = $9
+             RETURNING id, name, type, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status`,
+            [name || null, interval_seconds || null, method || null, typeof headers === 'object' ? JSON.stringify(headers) : headers || null, body || null, threshold_ms || null, region || null, id, userId]
         );
         if (result.rowCount === 0) return reply.code(404).send({ error: 'Monitor not found' });
         return reply.send(result.rows[0]);
@@ -161,7 +172,7 @@ const getMonitorMetrics = async (request, reply) => {
     try {
         // Ownership check (cheap — only select id)
         const verify = await request.server.db.query(
-            'SELECT id, name, type, target, keyword, interval_seconds, status FROM monitors WHERE id = $1 AND user_id = $2',
+            'SELECT id, name, type, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status FROM monitors WHERE id = $1 AND user_id = $2',
             [id, userId]
         );
         if (verify.rows.length === 0) return reply.code(404).send({ error: 'Monitor not found' });
@@ -204,4 +215,53 @@ const getIncidents = async (request, reply) => {
     }
 };
 
-module.exports = { createMonitor, getMonitors, updateMonitor, deleteMonitor, getMonitorMetrics, getIncidents };
+// ── Manual Tester ─────────────────────────────────────────────────────────
+const testMonitor = async (request, reply) => {
+    const { target, type, method, headers, body } = request.body;
+
+    if (!target) return reply.code(400).send({ error: 'Target URL is required' });
+
+    const ssrfError = validateTarget(type || 'http', target);
+    if (ssrfError) return reply.code(400).send({ error: ssrfError });
+
+    const startTime = Date.now();
+    try {
+        let parsedHeaders = {};
+        if (headers) {
+            try {
+                parsedHeaders = typeof headers === 'string' ? JSON.parse(headers) : headers;
+            } catch (e) {
+                // Ignore parse error, use as is if it's already an object
+            }
+        }
+
+        const res = await axios({
+            url: target,
+            method: method || 'GET',
+            headers: { ...parsedHeaders, 'User-Agent': 'MonitorHub-Tester/1.0' },
+            data: body,
+            timeout: 10000,
+            validateStatus: null,
+            maxRedirects: 4,
+            maxContentLength: 2 * 1024 * 1024 // 2 MB
+        });
+
+        return reply.send({
+            success: true,
+            status: res.status,
+            time: Date.now() - startTime,
+            headers: res.headers,
+            data: typeof res.data === 'string' ? res.data : JSON.stringify(res.data)
+        });
+    } catch (err) {
+        return reply.send({ 
+            success: false, 
+            status: 0, 
+            time: Date.now() - startTime, 
+            error: err.message,
+            data: null
+        });
+    }
+};
+
+module.exports = { createMonitor, getMonitors, updateMonitor, deleteMonitor, getMonitorMetrics, getIncidents, testMonitor };

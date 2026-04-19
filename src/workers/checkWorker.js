@@ -36,7 +36,7 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
 
     // Fetch fresh config (target may have changed since job was enqueued)
     const monitorRes = await pool.query(
-        'SELECT id, type, target, keyword, status AS prev_status, user_id FROM monitors WHERE id = $1',
+        'SELECT id, type, target, keyword, status AS prev_status, user_id, method, headers, body, threshold_ms, region FROM monitors WHERE id = $1',
         [monitorId]
     );
     if (monitorRes.rows.length === 0) {
@@ -44,7 +44,7 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
         return;
     }
 
-    const { target, type, keyword, prev_status, user_id } = monitorRes.rows[0];
+    const { target, type, keyword, prev_status, user_id, method, headers, body, threshold_ms, region } = monitorRes.rows[0];
     const startTime = Date.now();
     let status       = 'down';
     let errorMessage = null;
@@ -53,12 +53,19 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
     try {
         // ── HTTP / HTTPS ────────────────────────────────────────────────
         if (type === 'http' || type === 'https') {
-            const res = await axios.get(target, {
+            let parsedHeaders = {};
+            if (headers) {
+                try { parsedHeaders = typeof headers === 'string' ? JSON.parse(headers) : headers; } catch(e){}
+            }
+            const res = await axios({
+                url: target,
+                method: method || 'GET',
+                headers: { ...parsedHeaders, 'User-Agent': 'MonitorHub-Monitor/2.0' },
+                data: body,
                 timeout: 10000,
                 validateStatus: null, // don't throw on 4xx/5xx — we handle those
                 maxRedirects: 5,
                 maxContentLength: 5 * 1024 * 1024, // 5 MB limit
-                headers: { 'User-Agent': 'MonitorHub-Monitor/2.0' },
             });
             responseTime = Date.now() - startTime;
             if (res.status >= 200 && res.status < 400) {
@@ -100,13 +107,19 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
                 errorMessage = pingRes.error || 'Connection refused';
             }
         }
+
+        // ── Threshold check (Smart Alerts) ─────────────────────────────
+        if (status === 'up' && threshold_ms > 0 && responseTime > threshold_ms) {
+            console.log(`[CheckWorker] Monitor ${monitorId} exceeded threshold: ${responseTime}ms > ${threshold_ms}ms`);
+            // We still consider it 'up' but we can flag it or alert on performance degradation
+            // For now, let's treat "Threshold exceeded" as a secondary alert trigger if the user wants
+        }
     } catch (err) {
         responseTime  = Date.now() - startTime;
         errorMessage  = err.message;
-        status        = 'down';
     }
 
-    console.log(`[CheckWorker] Monitor ${monitorId} → ${status} (${responseTime}ms)`);
+    console.log(`[CheckWorker][${region}] Monitor ${monitorId} → ${status} (${responseTime}ms)`);
 
     // ── Insert metric ────────────────────────────────────────────────────
     const recordedAt = new Date();
@@ -130,7 +143,7 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
             for (let i = 0; i < 2; i++) {
                 // Wait 2 seconds between verification checks
                 await new Promise(r => setTimeout(r, 2000));
-                const verifyRes = await performCheck(type, target, keyword);
+                const verifyRes = await performCheck(type, target, keyword, method, headers, body);
                 if (verifyRes.status === 'down') {
                     failures++;
                 } else {
@@ -150,7 +163,17 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
             if (canAlert) {
                 await alertQueue.add(
                     `alert-${monitorId}-${Date.now()}`,
-                    { monitorId, target, previousStatus: prev_status, newStatus: finalStatus, errorMessage, timestamp: recordedAt.toISOString() },
+                    { 
+                        monitorId, 
+                        target, 
+                        previousStatus: prev_status, 
+                        newStatus: finalStatus, 
+                        errorMessage, 
+                        responseTime,
+                        threshold_ms,
+                        region,
+                        timestamp: recordedAt.toISOString() 
+                    },
                     { removeOnComplete: { count: 100 }, removeOnFail: { count: 50 } }
                 );
 
@@ -182,11 +205,22 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
 });
 
 // Helper for check logic decomposition
-async function performCheck(type, target, keyword) {
+async function performCheck(type, target, keyword, method, headers, body) {
     const startTime = Date.now();
     try {
         if (type === 'http' || type === 'https') {
-            const res = await axios.get(target, { timeout: 8000, validateStatus: null });
+            let parsedHeaders = {};
+            if (headers) {
+                try { parsedHeaders = typeof headers === 'string' ? JSON.parse(headers) : headers; } catch(e){}
+            }
+            const res = await axios({
+                url: target,
+                method: method || 'GET',
+                headers: { ...parsedHeaders, 'User-Agent': 'MonitorHub-Monitor/2.0' },
+                data: body,
+                timeout: 8000,
+                validateStatus: null
+            });
             return { status: (res.status >= 200 && res.status < 400) ? 'up' : 'down', time: Date.now() - startTime };
         }
         if (type === 'keyword') {
