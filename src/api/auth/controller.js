@@ -135,8 +135,11 @@ const sendOTP = async (request, reply) => {
 
         return reply.send({ message: 'Verification code sent to your email.' });
     } catch (err) {
-        request.log.error(err);
-        return reply.status(500).send({ error: 'Internal server error' });
+        request.log.error({ err, email, stack: err.stack }, 'Signup OTP send failure');
+        return reply.status(500).send({ 
+            error: 'Internal server error',
+            message: process.env.NODE_ENV === 'development' ? err.message : undefined 
+        });
     }
 };
 
@@ -173,7 +176,7 @@ const verifyOTP = async (request, reply) => {
             refreshToken
         });
     } catch (err) {
-        request.log.error(err);
+        request.log.error({ err, email, stack: err.stack }, 'Signup OTP verification failure');
         return reply.status(500).send({ error: 'Verification failed' });
     }
 };
