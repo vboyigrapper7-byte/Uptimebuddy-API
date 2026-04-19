@@ -18,6 +18,10 @@ async function authRoutes(fastify, options) {
     };
 
     fastify.post('/register', authRateLimit, controller.register);
+    fastify.post('/send-otp', authRateLimit, controller.sendOTP);
+    fastify.post('/verify-otp', authRateLimit, controller.verifyOTP);
+    fastify.post('/resend-otp', authRateLimit, controller.resendOTP);
+
 
     // ── Protected Routes ──────────────────────────────────────────────────
     fastify.register(async (protectedScope) => {

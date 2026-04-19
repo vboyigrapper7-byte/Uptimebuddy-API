@@ -10,11 +10,13 @@ const crypto = require('crypto');
  * Register User
  * Hashes password and user defaults.
  */
-async function createUser(db, { email, password, role = 'customer' }) {
-    const passwordHash = await bcrypt.hash(password, 12);
+async function createUser(db, { email, password, passwordHash, role = 'customer' }) {
+    // If passwordHash is provided (e.g. from OTP flow), use it directly. Otherwise hash it.
+    const finalHash = passwordHash || await bcrypt.hash(password, 12);
+    
     const result = await db.query(
         'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, role, tier',
-        [email, passwordHash, role]
+        [email, finalHash, role]
     );
     return result.rows[0];
 }

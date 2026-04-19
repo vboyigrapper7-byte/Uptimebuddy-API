@@ -104,3 +104,18 @@ CREATE TABLE IF NOT EXISTS webhooks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_webhooks_user_id ON webhooks(user_id);
+
+-- ── OTPs (Temporary signup verification) ───────────────────────────────────
+CREATE TABLE IF NOT EXISTS otps (
+    id              SERIAL PRIMARY KEY,
+    email           TEXT UNIQUE NOT NULL,
+    otp             TEXT NOT NULL,
+    hashed_password TEXT NOT NULL,
+    expires_at      TIMESTAMP NOT NULL,
+    attempts        INT DEFAULT 0,
+    last_sent_at    TIMESTAMP DEFAULT NOW(),
+    created_at      TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_otps_email ON otps(email);
+

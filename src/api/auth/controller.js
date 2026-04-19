@@ -7,6 +7,10 @@ const { z } = require('zod');
 const { createUser, generateApiKey } = require('./service');
 const admin = require('../../core/auth/firebase');
 const crypto = require('crypto');
+const bcrypt = require('bcrypt');
+const otpService = require('./services/otpService');
+const emailService = require('./services/emailService');
+const { generateAccessToken, generateRefreshToken } = require('./token.utils');
 
 const RegisterSchema = z.object({
     email: z.string().email(),
@@ -93,4 +97,117 @@ const updateProfile = async (request, reply) => {
     }
 };
 
-module.exports = { register, createApiKey, updateProfile };
+const sendOTP = async (request, reply) => {
+    const { email, password } = request.body;
+    if (!email || !password) {
+        return reply.status(400).send({ error: 'Email and password are required' });
+    }
+
+    try {
+        // 1. Check if user already exists
+        const existing = await request.server.db.query('SELECT id FROM users WHERE email = $1', [email]);
+        if (existing.rows.length > 0) {
+            return reply.status(400).send({ error: 'Account already exists. Please login.' });
+        }
+
+        // 2. Check cooldown
+        const canSend = await otpService.checkCooldown(request.server.db, email);
+        if (!canSend) {
+            return reply.status(429).send({ error: 'Please wait 60 seconds before requesting a new code.' });
+        }
+
+        // 3. Hash password IMMEDIATELY
+        const hashedPassword = await bcrypt.hash(password, 12);
+
+        // 4. Generate & Store OTP
+        const otp = otpService.generateOTP();
+        await otpService.storeOTP(request.server.db, {
+            email,
+            otp,
+            hashed_password: hashedPassword
+        });
+
+        // 5. Send Email via Resend
+        const sent = await emailService.sendOTPEmail(email, otp);
+        if (!sent.success) {
+            return reply.status(500).send({ error: 'Failed to send verification email' });
+        }
+
+        return reply.send({ message: 'Verification code sent to your email.' });
+    } catch (err) {
+        request.log.error(err);
+        return reply.status(500).send({ error: 'Internal server error' });
+    }
+};
+
+const verifyOTP = async (request, reply) => {
+    const { email, otp } = request.body;
+    if (!email || !otp) {
+        return reply.status(400).send({ error: 'Email and verification code are required' });
+    }
+
+    try {
+        const verification = await otpService.verifyOTP(request.server.db, { email, otp });
+        
+        if (!verification.valid) {
+            return reply.status(400).send({ error: verification.error });
+        }
+
+        // OTP is valid -> Create user using existing logic
+        const user = await createUser(request.server.db, {
+            email,
+            passwordHash: verification.hashed_password
+        });
+
+        // Cleanup
+        await otpService.deleteOTP(request.server.db, email);
+
+        // Generate JWT Tokens
+        const accessToken = generateAccessToken(request.server, user);
+        const refreshToken = generateRefreshToken(request.server, user);
+
+        return reply.status(201).send({
+            message: 'Email verified and account created successfully!',
+            user,
+            accessToken,
+            refreshToken
+        });
+    } catch (err) {
+        request.log.error(err);
+        return reply.status(500).send({ error: 'Verification failed' });
+    }
+};
+
+const resendOTP = async (request, reply) => {
+    const { email } = request.body;
+    if (!email) return reply.status(400).send({ error: 'Email is required' });
+
+    try {
+        const canSend = await otpService.checkCooldown(request.server.db, email);
+        if (!canSend) {
+            return reply.status(429).send({ error: 'Please wait 60 seconds before resending.' });
+        }
+
+        const res = await request.server.db.query('SELECT hashed_password FROM otps WHERE email = $1', [email]);
+        if (res.rows.length === 0) {
+            return reply.status(400).send({ error: 'No signup in progress for this email.' });
+        }
+
+        const otp = otpService.generateOTP();
+        await otpService.storeOTP(request.server.db, {
+            email,
+            otp,
+            hashed_password: res.rows[0].hashed_password
+        });
+
+        await emailService.sendOTPEmail(email, otp);
+        
+        return reply.send({ message: 'New verification code sent.' });
+    } catch (err) {
+        request.log.error(err);
+        return reply.status(500).send({ error: 'Failed to resend code' });
+    }
+};
+
+module.exports = { register, createApiKey, updateProfile, sendOTP, verifyOTP, resendOTP };
+
