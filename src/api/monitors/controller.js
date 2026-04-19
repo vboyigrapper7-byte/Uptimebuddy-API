@@ -251,15 +251,16 @@ const testMonitor = async (request, reply) => {
             status: res.status,
             time: Date.now() - startTime,
             headers: res.headers,
-            data: typeof res.data === 'string' ? res.data : JSON.stringify(res.data)
+            data: res.data // Return raw data (axios already parsed it if JSON)
         });
     } catch (err) {
+        const isTimeout = err.code === 'ECONNABORTED';
         return reply.send({ 
             success: false, 
-            status: 0, 
+            status: err.response ? err.response.status : 0, 
             time: Date.now() - startTime, 
-            error: err.message,
-            data: null
+            error: isTimeout ? 'Request timeout (10s exceeded)' : err.message,
+            data: err.response ? err.response.data : null
         });
     }
 };
