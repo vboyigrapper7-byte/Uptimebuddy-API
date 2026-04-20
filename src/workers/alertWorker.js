@@ -54,6 +54,9 @@ const alertWorker = new Worker('alert-webhooks', async (job) => {
                     await alertService.sendTelegram(job.data, botToken, chatId);
                 }
                 continue; // telegram doesn't need the axios.post below
+            } else if (wh.provider === 'email') {
+                await alertService.sendEmail(job.data, wh.url);
+                continue;
             }
 
             if (payload) {

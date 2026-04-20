@@ -7,6 +7,7 @@
  * - Centralize credentials and channel configuration.
  */
 const axios = require('axios');
+const emailService = require('../email/emailService');
 
 class AlertService {
     constructor() {
@@ -42,6 +43,14 @@ class AlertService {
         } catch (err) {
             console.error(`[AlertService] Telegram delivery failed: ${err.message}`);
         }
+    }
+
+    /**
+     * Dispatch a status update to a specific Email address.
+     */
+    async sendEmail(payload, email) {
+        if (!email) return;
+        await emailService.sendAlert(email, payload);
     }
 
     /**

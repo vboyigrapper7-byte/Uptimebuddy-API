@@ -19,11 +19,19 @@ const pingPromise = (target, port) =>
 // ── Alert cooldown via DB (avoids alert storms on flapping monitors) ──────
 const ALERT_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
 
-async function shouldSendAlert(monitorId) {
+/**
+ * Smart Alert Cooldown
+ * - Always allow recovery (UP) alerts to ensure users know when problems are solved.
+ * - Prevents "Alert Storms" by suppressing DOWN alerts if any alert (UP or DOWN) 
+ *   was sent in the last 2 minutes for this monitor.
+ */
+async function shouldSendAlert(monitorId, newStatus) {
+    if (newStatus === 'up') return true;
+
     const res = await pool.query(
         `SELECT id FROM incidents
          WHERE monitor_id = $1
-           AND started_at >= NOW() - INTERVAL '5 minutes'
+           AND (started_at >= NOW() - INTERVAL '2 minutes' OR resolved_at >= NOW() - INTERVAL '2 minutes')
          LIMIT 1`,
         [monitorId]
     );
@@ -159,7 +167,7 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
         }
 
         if (prev_status !== finalStatus) {
-            const canAlert = await shouldSendAlert(monitorId);
+            const canAlert = await shouldSendAlert(monitorId, finalStatus);
             if (canAlert) {
                 await alertQueue.add(
                     `alert-${monitorId}-${Date.now()}`,

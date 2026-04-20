@@ -14,7 +14,7 @@ const FROM_EMAIL = process.env.EMAIL_FROM || 'noreply@monitorhubs.com';
 async function sendOTPEmail(email, otp) {
     try {
         const { data, error } = await resend.emails.send({
-            from: `Monitor Hub <${FROM_EMAIL}>`,
+            from: `Monitor Hub <${process.env.EMAIL_FROM}>`,
             to: [email],
             subject: 'Verify your email - Monitor Hub',
             html: `
