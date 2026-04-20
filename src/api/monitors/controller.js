@@ -133,6 +133,16 @@ const updateMonitor = async (request, reply) => {
     }
 
     try {
+        let dbHeaders = headers;
+        if (headers) {
+            try {
+                dbHeaders = typeof headers === 'object' ? JSON.stringify(headers) : headers;
+                if (typeof dbHeaders === 'string') JSON.parse(dbHeaders);
+            } catch (e) {
+                dbHeaders = null;
+            }
+        }
+
         const result = await request.server.db.query(
             `UPDATE monitors SET
                name             = COALESCE($1, name),
@@ -144,10 +154,35 @@ const updateMonitor = async (request, reply) => {
                region           = COALESCE($7, region)
              WHERE id = $8 AND user_id = $9
              RETURNING id, name, type, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status`,
-            [name || null, interval_seconds || null, method || null, typeof headers === 'object' ? JSON.stringify(headers) : headers || null, body || null, threshold_ms || null, region || null, id, userId]
+            [name || null, interval_seconds || null, method || null, dbHeaders, body || null, threshold_ms || null, region || null, id, userId]
         );
         if (result.rowCount === 0) return reply.code(404).send({ error: 'Monitor not found' });
-        return reply.send(result.rows[0]);
+        
+        const monitor = result.rows[0];
+
+        // Reschedule if interval changed
+        if (interval_seconds) {
+            try {
+                const repeatableJobs = await monitorQueue.getRepeatableJobs();
+                const oldJob = repeatableJobs.find(j => j.id === `monitor-${id}`);
+                if (oldJob) await monitorQueue.removeRepeatableByKey(oldJob.key);
+
+                await monitorQueue.add(
+                    `check-${monitor.id}`,
+                    { monitorId: monitor.id, type: monitor.type, target: monitor.target },
+                    {
+                        repeat:           { every: monitor.interval_seconds * 1000 },
+                        jobId:            `monitor-${monitor.id}`,
+                        removeOnComplete: { count: 10 },
+                        removeOnFail:     { count: 50 },
+                    }
+                );
+            } catch (qErr) {
+                request.log.warn(qErr, `Failed to reschedule monitor ${id}`);
+            }
+        }
+
+        return reply.send(monitor);
     } catch (error) {
         request.log.error(error, 'updateMonitor error');
         return reply.code(500).send({ error: 'Failed to update monitor' });

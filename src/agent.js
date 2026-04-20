@@ -24,9 +24,36 @@ console.log(` Ingest URL     : ${INGEST_URL}`);
 console.log(` Report Interval: ${REPORT_INTERVAL / 1000}s`);
 console.log('==========================================\n');
 
-// ── Network baseline (for delta calculation) ──────────────────────────────
-let prevNetStats = null;
-let prevNetTime  = null;
+// ── Network & IP Cache ───────────────────────────────────────────────────
+let prevNetStats    = null;
+let prevNetTime     = null;
+let cachedPublicIP  = null;
+let cachedPrivateIP = null;
+let lastFullReport  = 0;
+const SYNC_INTERVAL_MS = 5 * 60 * 1000; // Sync metadata every 5 mins
+
+async function getPublicIP() {
+    try {
+        const response = await axios.get('https://api.ipify.org?format=json', { timeout: 3000 });
+        cachedPublicIP = response.data.ip;
+        return cachedPublicIP;
+    } catch (err) {
+        return cachedPublicIP; // Return previous known IP if fetch fails
+    }
+}
+
+function getPrivateIP() {
+    const interfaces = os.networkInterfaces();
+    for (const name of Object.keys(interfaces)) {
+        for (const iface of interfaces[name]) {
+            if (iface.family === 'IPv4' && !iface.internal) {
+                cachedPrivateIP = iface.address;
+                return iface.address;
+            }
+        }
+    }
+    return cachedPrivateIP;
+}
 
 // ── Metrics collection ────────────────────────────────────────────────────
 async function collectMetrics() {
@@ -46,18 +73,20 @@ async function collectMetrics() {
     const ramMb      = Math.floor(memory.active / (1024 * 1024));
     const ramTotalMb = Math.floor(memory.total  / (1024 * 1024));
 
-    // Network I/O delta (MB transferred since last reading)
+    // Disk detailed
+    const totalDiskGb = primaryDisk ? parseFloat((primaryDisk.size / (1024**3)).toFixed(2)) : 0;
+    const freeDiskGb  = primaryDisk ? parseFloat(((primaryDisk.size - primaryDisk.used) / (1024**3)).toFixed(2)) : 0;
+
+    // Network I/O delta
     const now        = Date.now();
     let netRxMb = 0;
     let netTxMb = 0;
 
     if (prevNetStats && prevNetTime) {
-        const elapsedMs = now - prevNetTime;
         const totalRxBytes = netStats.reduce((s, i) => s + (i.rx_bytes || 0), 0);
         const totalTxBytes = netStats.reduce((s, i) => s + (i.tx_bytes || 0), 0);
         const prevRxBytes  = prevNetStats.reduce((s, i) => s + (i.rx_bytes || 0), 0);
         const prevTxBytes  = prevNetStats.reduce((s, i) => s + (i.tx_bytes || 0), 0);
-        // Convert bytes/interval → MB/s
         netRxMb = parseFloat(((totalRxBytes - prevRxBytes) / (1024 * 1024)).toFixed(3));
         netTxMb = parseFloat(((totalTxBytes - prevTxBytes) / (1024 * 1024)).toFixed(3));
         if (netRxMb < 0) netRxMb = 0;
@@ -66,18 +95,33 @@ async function collectMetrics() {
     prevNetStats = netStats;
     prevNetTime  = now;
 
-    return {
+    const payload = {
         metrics: {
             cpu_percent:    parseFloat(load.currentLoad.toFixed(2)),
             ram_mb:         ramMb,
             ram_total_mb:   ramTotalMb,
             disk_percent:   diskPercent,
+            disk_total_gb:  totalDiskGb,
+            disk_free_gb:   freeDiskGb,
             net_rx_mb:      netRxMb,
             net_tx_mb:      netTxMb,
             uptime_seconds: Math.floor(os.uptime()),
             process_count:  processes.all || 0,
-        },
+        }
     };
+
+    // Periodically sync metadata (IPs, Hostname, etc) or if first report
+    if (now - lastFullReport > SYNC_INTERVAL_MS) {
+        const [pubIp, privIp] = await Promise.all([getPublicIP(), getPrivateIP()]);
+        payload.public_ip  = pubIp;
+        payload.private_ip = privIp;
+        payload.hostname   = os.hostname();
+        payload.os_type    = `${os.type()} ${os.release()}`;
+        lastFullReport     = now;
+    }
+
+    return payload;
+}
 }
 
 // ── Send metrics with retry ───────────────────────────────────────────────
