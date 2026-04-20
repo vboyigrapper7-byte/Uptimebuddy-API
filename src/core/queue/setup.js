@@ -19,13 +19,25 @@ const makeRedisConnection = () => new Redis(process.env.REDIS_URL || 'redis://lo
 
 // Connection used by Queue producers (server.js, controllers)
 const redisConnection = makeRedisConnection();
-redisConnection.on('error', (err) => console.error('[Queue Redis] Producer Connection Error:', err.message));
-redisConnection.on('connect', () => console.log('[Queue Redis] Producer Connected'));
+
+redisConnection.on('error', (err) => {
+    console.error(`[Queue Redis] Producer Connection Error: ${err.message}`);
+});
+
+redisConnection.on('connect', () => {
+    console.log('[Queue Redis] Producer connected successfully');
+});
 
 // Separate connection used by Workers (checkWorker, alertWorker)
 const workerRedisConnection = makeRedisConnection();
-workerRedisConnection.on('error', (err) => console.error('[Queue Redis] Worker Connection Error:', err.message));
-workerRedisConnection.on('connect', () => console.log('[Queue Redis] Worker Connected'));
+
+workerRedisConnection.on('error', (err) => {
+    console.error(`[Queue Redis] Worker Connection Error: ${err.message}`);
+});
+
+workerRedisConnection.on('connect', () => {
+    console.log('[Queue Redis] Worker connected successfully');
+});
 
 const jobOptions = {
     attempts: 3,

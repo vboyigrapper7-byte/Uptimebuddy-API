@@ -58,22 +58,31 @@ const createMonitor = async (request, reply) => {
         );
         const monitor = result.rows[0];
 
-        // Add repeatable BullMQ job
-        await monitorQueue.add(
-            `check-${monitor.id}`,
-            { monitorId: monitor.id, type: monitor.type, target: monitor.target },
-            {
-                repeat:  { every: interval_seconds * 1000 },
-                jobId:   `monitor-${monitor.id}`,
-                removeOnComplete: { count: 10 },
-                removeOnFail:     { count: 50 },
-            }
-        );
-
+        // Add repeatable BullMQ job with timeout detection
+        try {
+            await Promise.race([
+                monitorQueue.add(
+                    `check-${monitor.id}`,
+                    { monitorId: monitor.id, type: monitor.type, target: monitor.target },
+                    {
+                        repeat:           { every: interval_seconds * 1000 },
+                        jobId:            `monitor-${monitor.id}`,
+                        removeOnComplete: { count: 10 },
+                        removeOnFail:     { count: 50 },
+                    }
+                ),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('Queue timeout (Redis unresponsive)')), 5000))
+            ]);
+        } catch (queueError) {
+            request.log.error(queueError, `Queue failed for monitor ${monitor.id}`);
+            // We don't fail the whole request because the monitor IS in the DB, 
+            // but we should warn the user or log it heavily.
+        }
+        
         return reply.code(201).send(monitor);
     } catch (error) {
         request.log.error(error, 'createMonitor error');
-        return reply.code(500).send({ error: 'Failed to create monitor' });
+        return reply.code(500).send({ error: 'Failed to create monitor. Database or Queue may be unavailable.' });
     }
 };
 
