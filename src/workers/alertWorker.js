@@ -55,7 +55,11 @@ const alertWorker = new Worker('alert-webhooks', async (job) => {
                 }
                 continue; // telegram doesn't need the axios.post below
             } else if (wh.provider === 'email') {
-                await alertService.sendEmail(job.data, wh.url);
+                const emails = wh.url.split(',').map(e => e.trim()).filter(e => e.length > 0);
+                for (const email of emails) {
+                    await alertService.sendEmail(job.data, email);
+                }
+                console.log(`[AlertWorker] ✓ Email alerts dispatched to ${emails.length} recipients for user ${userId}`);
                 continue;
             }
 
