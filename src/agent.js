@@ -33,13 +33,37 @@ let lastFullReport  = 0;
 const SYNC_INTERVAL_MS = 5 * 60 * 1000; // Sync metadata every 5 mins
 
 async function getPublicIP() {
-    try {
-        const response = await axios.get('https://api.ipify.org?format=json', { timeout: 3000 });
-        cachedPublicIP = response.data.ip;
-        return cachedPublicIP;
-    } catch (err) {
-        return cachedPublicIP; // Return previous known IP if fetch fails
+    const providers = [
+        'https://api.ipify.org?format=json',
+        'https://icanhazip.com',
+        'https://api.seeip.org/jsonip',
+        'https://ifconfig.me/all.json'
+    ];
+
+    for (const url of providers) {
+        try {
+            const response = await axios.get(url, { timeout: 3000 });
+            let ip = null;
+
+            // Handle different response formats
+            if (typeof response.data === 'string') {
+                ip = response.data.trim();
+            } else if (response.data && response.data.ip) {
+                ip = response.data.ip;
+            }
+
+            // Simple IPv4/IPv6 validation regex
+            if (ip && (ip.includes('.') || ip.includes(':'))) {
+                cachedPublicIP = ip;
+                return ip;
+            }
+        } catch (err) {
+            // Silently try next provider
+            continue;
+        }
     }
+
+    return cachedPublicIP; // Return previous known IP if all providers fail
 }
 
 function getPrivateIP() {

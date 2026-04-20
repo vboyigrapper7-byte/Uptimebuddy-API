@@ -11,8 +11,9 @@ class EmailService {
      */
     async sendOTP(email, otp) {
         try {
+            const sender = process.env.EMAIL_FROM || 'onboarding@resend.dev';
             await resend.emails.send({
-                from: `Monitor Hub <${process.env.EMAIL_FROM}>`,
+                from: `Monitor Hub <${sender}>`,
                 to: email,
                 subject: 'Your Monitor Hub Verification Code',
                 html: `
@@ -47,8 +48,9 @@ class EmailService {
         const subject = `${isDown ? '🚨 ALERT' : '✅ RECOVERY'}: ${target} is ${newStatus.toUpperCase()}`;
 
         try {
+            const sender = process.env.EMAIL_FROM || 'onboarding@resend.dev';
             await resend.emails.send({
-                from: `Monitor Hub Alerts <${process.env.EMAIL_FROM}>`,
+                from: `Monitor Hub Alerts <${sender}>`,
                 to: email,
                 subject: subject,
                 html: `
