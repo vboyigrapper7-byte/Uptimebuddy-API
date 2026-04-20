@@ -35,8 +35,8 @@ async function webhookRoutes(fastify, options) {
             return reply.status(400).send({ error: `Unsupported provider. Use: ${ALLOWED_PROVIDERS.join(', ')}` });
         }
 
-        // URL validation + SSRF guard (Exempt Telegram as it uses token|id format)
-        if (provider !== 'telegram') {
+        // URL validation + SSRF guard (Exempt Telegram/Email as they use non-URL formats)
+        if (provider !== 'telegram' && provider !== 'email') {
             try {
                 const parsed = new URL(url);
                 if (!['http:', 'https:'].includes(parsed.protocol)) {
