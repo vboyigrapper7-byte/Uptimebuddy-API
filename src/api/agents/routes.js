@@ -60,51 +60,64 @@ async function agentRoutes(fastify, options) {
         }
 
         try {
-            const agentResult = await fastify.db.query(
-                'SELECT id, public_ip, private_ip FROM agents WHERE agent_token = $1',
-                [agent_token]
-            );
-            if (agentResult.rows.length === 0) {
-                return reply.status(401).send({ error: 'Invalid agent token' });
+            // 1. Initial Lookup (Resilient to missing IP columns)
+            let agentId, existing;
+            try {
+                const res = await fastify.db.query('SELECT id, public_ip, private_ip FROM agents WHERE agent_token = $1', [agent_token]);
+                if (res.rows.length === 0) return reply.status(401).send({ error: 'Invalid agent token' });
+                agentId  = res.rows[0].id;
+                existing = res.rows[0];
+            } catch (err) {
+                // FALLBACK: If columns don't exist yet
+                const res = await fastify.db.query('SELECT id FROM agents WHERE agent_token = $1', [agent_token]);
+                if (res.rows.length === 0) return reply.status(401).send({ error: 'Invalid agent token' });
+                agentId  = res.rows[0].id;
+                existing = { id: agentId }; // No IP history available
             }
 
-            const agentId     = agentResult.rows[0].id;
-            const existing    = agentResult.rows[0];
-            const recordedAt  = new Date();
+            const recordedAt = new Date();
 
-            // 1. Log metrics
-            await fastify.db.query(
-                `INSERT INTO agent_metrics
-                 (agent_id, recorded_at, cpu_percent, ram_mb, ram_total_mb, disk_percent, net_rx_mb, net_tx_mb, uptime_seconds, process_count, disk_total_gb, disk_free_gb)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                 ON CONFLICT DO NOTHING`,
-                [
-                    agentId, recordedAt,
-                    metrics.cpu_percent, metrics.ram_mb, metrics.ram_total_mb ?? null,
-                    metrics.disk_percent,
-                    metrics.net_rx_mb ?? null, metrics.net_tx_mb ?? null,
-                    metrics.uptime_seconds ?? null, metrics.process_count ?? null,
-                    metrics.disk_total_gb ?? null, metrics.disk_free_gb ?? null
-                ]
-            );
-
-            // 2. Detect IP Changes and Update Agent Meta
-            const { public_ip, private_ip, hostname, os_type } = request.body || {};
-            
+            // 2. Log Metrics (Resilient to missing columns)
             try {
-                const publicIpChanged  = public_ip && public_ip !== existing.public_ip;
-                const privateIpChanged = private_ip && private_ip !== existing.private_ip;
+                await fastify.db.query(
+                    `INSERT INTO agent_metrics
+                     (agent_id, recorded_at, cpu_percent, ram_mb, ram_total_mb, disk_percent, net_rx_mb, net_tx_mb, uptime_seconds, process_count, disk_total_gb, disk_free_gb)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                     ON CONFLICT DO NOTHING`,
+                    [
+                        agentId, recordedAt,
+                        metrics.cpu_percent, metrics.ram_mb, metrics.ram_total_mb ?? null,
+                        metrics.disk_percent,
+                        metrics.net_rx_mb ?? null, metrics.net_tx_mb ?? null,
+                        metrics.uptime_seconds ?? null, metrics.process_count ?? null,
+                        metrics.disk_total_gb ?? null, metrics.disk_free_gb ?? null
+                    ]
+                );
+            } catch (err) {
+                // FALLBACK: Basic metrics only
+                await fastify.db.query(
+                    `INSERT INTO agent_metrics (agent_id, recorded_at, cpu_percent, ram_mb, disk_percent) VALUES ($1, $2, $3, $4, $5)`,
+                    [agentId, recordedAt, metrics.cpu_percent, metrics.ram_mb, metrics.disk_percent]
+                );
+            }
 
-                if (publicIpChanged || privateIpChanged || hostname || os_type) {
+            // 3. Update Status (Resilient to missing SaaS columns)
+            const { public_ip, private_ip, hostname, os_type } = request.body || {};
+            try {
+                const publicIpChanged  = public_ip && public_ip !== (existing.public_ip || '');
+                const privateIpChanged = private_ip && private_ip !== (existing.private_ip || '');
+                const metaChanged      = hostname || os_type;
+
+                if (publicIpChanged || privateIpChanged || metaChanged) {
                     await fastify.db.query(`
                         UPDATE agents SET 
                             last_seen = NOW(),
                             status = 'active',
                             public_ip = COALESCE($2, public_ip),
                             private_ip = COALESCE($3, private_ip),
-                            prev_public_ip = CASE WHEN $2 IS NOT NULL AND $2 != public_ip THEN public_ip ELSE prev_public_ip END,
-                            prev_private_ip = CASE WHEN $3 IS NOT NULL AND $3 != private_ip THEN private_ip ELSE prev_private_ip END,
-                            ip_changed_at = CASE WHEN ($2 IS NOT NULL AND $2 != public_ip) OR ($3 IS NOT NULL AND $3 != private_ip) THEN NOW() ELSE ip_changed_at END,
+                            prev_public_ip = CASE WHEN $2 IS NOT NULL AND $2 != COALESCE(public_ip, '') THEN public_ip ELSE prev_public_ip END,
+                            prev_private_ip = CASE WHEN $3 IS NOT NULL AND $3 != COALESCE(private_ip, '') THEN private_ip ELSE prev_private_ip END,
+                            ip_changed_at = CASE WHEN ($2 IS NOT NULL AND $2 != COALESCE(public_ip, '')) OR ($3 IS NOT NULL AND $3 != COALESCE(private_ip, '')) THEN NOW() ELSE ip_changed_at END,
                             hostname = COALESCE($4, hostname),
                             os_type = COALESCE($5, os_type)
                         WHERE id = $1`, 
@@ -113,14 +126,14 @@ async function agentRoutes(fastify, options) {
                 } else {
                     await fastify.db.query("UPDATE agents SET last_seen = NOW(), status = 'active' WHERE id = $1", [agentId]);
                 }
-            } catch (dbErr) {
-                // Fallback: If new columns don't exist yet, just update heartbeat to prevent 500 error
+            } catch (err) {
+                // FINAL FALLBACK: Essential Heartbeat
                 await fastify.db.query("UPDATE agents SET last_seen = NOW(), status = 'active' WHERE id = $1", [agentId]);
             }
 
             return reply.send({ success: true });
         } catch (err) {
-            fastify.log.error(err, 'Agent ingest error');
+            fastify.log.error(err, 'Agent ingest fatal error');
             return reply.status(500).send({ error: 'Internal server error' });
         }
     });

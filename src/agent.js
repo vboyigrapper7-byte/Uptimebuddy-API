@@ -122,7 +122,6 @@ async function collectMetrics() {
 
     return payload;
 }
-}
 
 // ── Send metrics with retry ───────────────────────────────────────────────
 let failedAttempts = 0;
@@ -154,7 +153,8 @@ async function sendMetrics() {
             }
         } else if (err.request) {
             console.error(`[${ts}] ✗ NETWORK ERROR: Platform at ${INGEST_URL} is unreachable.`);
-            console.warn('[TROUBLESHOOT] Ensure the Monitor Hub platform is running and port 3001 is open in your firewall.');
+            console.warn(`[TROUBLESHOOT] Status: ${err.code} | Host: ${err.config.url}`);
+            console.warn('[TROUBLESHOOT] Ensure the Monitor Hub platform is running and accessible.');
         } else {
             console.error(`[${ts}] ✗ UNEXPECTED ERROR: ${err.message}`);
         }
