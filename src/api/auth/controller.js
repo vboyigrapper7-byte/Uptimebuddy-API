@@ -10,7 +10,6 @@ const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const otpService = require('./services/otpService');
 const emailService = require('./services/emailService');
-const { generateAccessToken, generateRefreshToken } = require('./token.utils');
 
 const RegisterSchema = z.object({
     email: z.string().email(),
@@ -144,7 +143,7 @@ const sendOTP = async (request, reply) => {
 };
 
 const verifyOTP = async (request, reply) => {
-    const { email, otp } = request.body;
+    const { email, otp, password } = request.body;
     if (!email || !otp) {
         return reply.status(400).send({ error: 'Email and verification code are required' });
     }
@@ -156,24 +155,42 @@ const verifyOTP = async (request, reply) => {
             return reply.status(400).send({ error: verification.error });
         }
 
-        // OTP is valid -> Create user using existing logic
+        // --- Firebase Strategy Sync ---
+        // 1. Check if user exists in Firebase, if not create them
+        let firebaseUser;
+        try {
+            firebaseUser = await admin.auth().getUserByEmail(email);
+        } catch (err) {
+            if (err.code === 'auth/user-not-found') {
+                if (!password) {
+                    return reply.status(400).send({ error: 'Password is required to complete registration' });
+                }
+                firebaseUser = await admin.auth().createUser({
+                    email,
+                    password,
+                    emailVerified: true
+                });
+            } else {
+                throw err;
+            }
+        }
+
+        // 2. Sync with local Postgres
         const user = await createUser(request.server.db, {
             email,
             passwordHash: verification.hashed_password
         });
 
-        // Cleanup
+        // 3. Cleanup
         await otpService.deleteOTP(request.server.db, email);
 
-        // Generate JWT Tokens
-        const accessToken = generateAccessToken(request.server, user);
-        const refreshToken = generateRefreshToken(request.server, user);
+        // 4. Generate Firebase Custom Token for the user
+        const customToken = await admin.auth().createCustomToken(firebaseUser.uid);
 
         return reply.status(201).send({
             message: 'Email verified and account created successfully!',
             user,
-            accessToken,
-            refreshToken
+            customToken
         });
     } catch (err) {
         request.log.error({ err, email, stack: err.stack }, 'Signup OTP verification failure');
