@@ -228,8 +228,8 @@ call npm install axios dotenv systeminformation node-windows --quiet
 :: ── Fetch Agent Script & Service Installer ─────────────────────────────────
 echo Connecting to platform: ${hostUrl}
 echo (This may take up to 60 seconds if the server is waking from sleep...)
-curl.exe --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 30 --max-time 120 -o agent.js "${hostUrl}/api/v1/agents/script"
-curl.exe --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 30 --max-time 120 -o service.js "${hostUrl}/api/v1/agents/windows-service.js"
+curl.exe --retry 10 --retry-delay 5 --retry-all-errors --connect-timeout 30 --max-time 120 -o agent.js "${hostUrl}/api/v1/agents/script"
+curl.exe --retry 10 --retry-delay 5 --retry-all-errors --connect-timeout 30 --max-time 120 -o service.js "${hostUrl}/api/v1/agents/windows-service.js"
 if %errorLevel% neq 0 (
     echo.
     echo [ERROR] Could not download agent from Monitor Hub Platform!

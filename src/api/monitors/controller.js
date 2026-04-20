@@ -51,10 +51,21 @@ const createMonitor = async (request, reply) => {
     if (ssrfError) return reply.code(400).send({ error: ssrfError });
 
     try {
+        let dbHeaders = null;
+        if (headers) {
+            try {
+                dbHeaders = typeof headers === 'object' ? JSON.stringify(headers) : headers;
+                // Double check it's valid JSON if it's a string
+                if (typeof dbHeaders === 'string') JSON.parse(dbHeaders);
+            } catch (e) {
+                dbHeaders = null; // Fallback to null if invalid
+            }
+        }
+
         const result = await request.server.db.query(
             `INSERT INTO monitors (user_id, name, type, target, keyword, interval_seconds, method, headers, body, threshold_ms, region)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id, name, type, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status, created_at`,
-            [userId, name, type, target, keyword ?? null, interval_seconds, method || 'GET', typeof headers === 'object' ? JSON.stringify(headers) : headers, body || null, threshold_ms || 0, region || 'Global']
+            [userId, name, type, target, keyword ?? null, interval_seconds, method || 'GET', dbHeaders, body || null, threshold_ms || 0, region || 'Global']
         );
         const monitor = result.rows[0];
 
