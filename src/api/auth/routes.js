@@ -32,7 +32,13 @@ async function authRoutes(fastify, options) {
             return reply.send(request.user);
         });
 
-        protectedScope.put('/me', controller.updateProfile);
+        protectedScope.get('/usage', async (request, reply) => {
+            const usageService = require('../../core/auth/usageService');
+            const usage = await usageService.getUserUsage(request.server.db, request.user.id);
+            const limits = usageService.getTierLimits(request.user.tier);
+            const overLimitIds = await usageService.getOverLimitMonitors(request.server.db, request.user);
+            return reply.send({ usage, limits, overLimitIds });
+        });
 
         // API Key Management
         protectedScope.post('/api-key', controller.createApiKey);

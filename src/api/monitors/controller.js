@@ -1,6 +1,8 @@
 const { monitorQueue } = require('../../core/queue/setup');
+const { scheduleMonitor, unscheduleMonitor } = require('../../core/queue/scheduler');
 const { z } = require('zod');
 const axios = require('axios');
+const usageService = require('../../core/auth/usageService');
 
 // ── SSRF blocklist — private/loopback IP ranges ───────────────────────────
 const PRIVATE_IP_RE = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|::1|0\.0\.0\.0)/i;
@@ -26,6 +28,7 @@ function validateTarget(type, target) {
 const CreateMonitorSchema = z.object({
     name:             z.string().min(1).max(100),
     type:             z.enum(['http', 'https', 'keyword', 'port', 'ping']),
+    category:         z.enum(['uptime', 'api']).default('uptime'),
     target:           z.string().min(1).max(500),
     keyword:          z.string().max(255).optional().nullable(),
     interval_seconds: z.number().int().min(30).max(86400).default(300),
@@ -43,10 +46,21 @@ const createMonitor = async (request, reply) => {
         return reply.code(400).send({ error: parsed.error.issues[0].message });
     }
 
-    const { name, type, target, keyword, interval_seconds, method, headers, body, threshold_ms, region } = parsed.data;
+    const { name, type, category, target, keyword, interval_seconds, method, headers, body, threshold_ms, region } = parsed.data;
     const userId = request.user.id;
 
-    // SSRF check
+    try {
+        await usageService.checkLimit(request.server.db, request.user, category);
+    } catch (limitErr) {
+        request.log.info(`Blocking creation for User ${userId}: ${limitErr.message}`);
+        return reply.code(403).send({ 
+            error: limitErr.message, 
+            limitReached: true,
+            upgradeRequired: true,
+            billingUrl: '/dashboard/billing'
+        });
+    }
+
     const ssrfError = validateTarget(type, target);
     if (ssrfError) return reply.code(400).send({ error: ssrfError });
 
@@ -55,45 +69,33 @@ const createMonitor = async (request, reply) => {
         if (headers) {
             try {
                 dbHeaders = typeof headers === 'object' ? JSON.stringify(headers) : headers;
-                // Double check it's valid JSON if it's a string
                 if (typeof dbHeaders === 'string') JSON.parse(dbHeaders);
             } catch (e) {
-                dbHeaders = null; // Fallback to null if invalid
+                dbHeaders = null;
             }
         }
 
         const result = await request.server.db.query(
-            `INSERT INTO monitors (user_id, name, type, target, keyword, interval_seconds, method, headers, body, threshold_ms, region)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id, name, type, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status, created_at`,
-            [userId, name, type, target, keyword ?? null, interval_seconds, method || 'GET', dbHeaders, body || null, threshold_ms || 0, region || 'Global']
+            `INSERT INTO monitors (user_id, name, type, category, target, keyword, interval_seconds, method, headers, body, threshold_ms, region)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) 
+             RETURNING id, name, type, category, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status, created_at`,
+            [userId, name, type, category, target, keyword ?? null, interval_seconds, method || 'GET', dbHeaders, body || null, threshold_ms || 0, region || 'Global']
         );
         const monitor = result.rows[0];
 
-        // Add repeatable BullMQ job with timeout detection
         try {
             await Promise.race([
-                monitorQueue.add(
-                    `check-${monitor.id}`,
-                    { monitorId: monitor.id, type: monitor.type, target: monitor.target },
-                    {
-                        repeat:           { every: interval_seconds * 1000 },
-                        jobId:            `monitor-${monitor.id}`,
-                        removeOnComplete: { count: 10 },
-                        removeOnFail:     { count: 50 },
-                    }
-                ),
+                scheduleMonitor(monitor),
                 new Promise((_, reject) => setTimeout(() => reject(new Error('Queue timeout (Redis unresponsive)')), 5000))
             ]);
         } catch (queueError) {
             request.log.error(queueError, `Queue failed for monitor ${monitor.id}`);
-            // We don't fail the whole request because the monitor IS in the DB, 
-            // but we should warn the user or log it heavily.
         }
         
         return reply.code(201).send(monitor);
     } catch (error) {
         request.log.error(error, 'createMonitor error');
-        return reply.code(500).send({ error: 'Failed to create monitor. Database or Queue may be unavailable.' });
+        return reply.code(500).send({ error: 'Failed to create monitor' });
     }
 };
 
@@ -106,7 +108,7 @@ const getMonitors = async (request, reply) => {
 
     try {
         const result = await request.server.db.query(
-            `SELECT id, name, type, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status, created_at
+            `SELECT id, name, type, category, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status, created_at
              FROM monitors WHERE user_id = $1
              ORDER BY created_at DESC
              LIMIT $2 OFFSET $3`,
@@ -160,23 +162,10 @@ const updateMonitor = async (request, reply) => {
         
         const monitor = result.rows[0];
 
-        // Reschedule if interval changed
         if (interval_seconds) {
             try {
-                const repeatableJobs = await monitorQueue.getRepeatableJobs();
-                const oldJob = repeatableJobs.find(j => j.id === `monitor-${id}`);
-                if (oldJob) await monitorQueue.removeRepeatableByKey(oldJob.key);
-
-                await monitorQueue.add(
-                    `check-${monitor.id}`,
-                    { monitorId: monitor.id, type: monitor.type, target: monitor.target },
-                    {
-                        repeat:           { every: monitor.interval_seconds * 1000 },
-                        jobId:            `monitor-${monitor.id}`,
-                        removeOnComplete: { count: 10 },
-                        removeOnFail:     { count: 50 },
-                    }
-                );
+                await unscheduleMonitor(id);
+                await scheduleMonitor(monitor);
             } catch (qErr) {
                 request.log.warn(qErr, `Failed to reschedule monitor ${id}`);
             }
@@ -203,11 +192,8 @@ const deleteMonitor = async (request, reply) => {
             return reply.code(404).send({ error: 'Monitor not found or unauthorized' });
         }
 
-        // Remove the repeatable BullMQ job — use the jobId we set during creation
         try {
-            const repeatableJobs = await monitorQueue.getRepeatableJobs();
-            const job = repeatableJobs.find(j => j.id === `monitor-${id}`);
-            if (job) await monitorQueue.removeRepeatableByKey(job.key);
+            await unscheduleMonitor(id);
         } catch (qErr) {
             request.log.warn(qErr, `Could not remove queue job for monitor ${id}`);
         }
@@ -225,7 +211,6 @@ const getMonitorMetrics = async (request, reply) => {
     const userId = request.user.id;
 
     try {
-        // Ownership check (cheap — only select id)
         const verify = await request.server.db.query(
             'SELECT id, name, type, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status FROM monitors WHERE id = $1 AND user_id = $2',
             [id, userId]
@@ -273,23 +258,15 @@ const getIncidents = async (request, reply) => {
 // ── Manual Tester ─────────────────────────────────────────────────────────
 const testMonitor = async (request, reply) => {
     const { target, type, method, headers, body } = request.body;
-
     if (!target) return reply.code(400).send({ error: 'Target URL is required' });
-
     const ssrfError = validateTarget(type || 'http', target);
     if (ssrfError) return reply.code(400).send({ error: ssrfError });
-
     const startTime = Date.now();
     try {
         let parsedHeaders = {};
         if (headers) {
-            try {
-                parsedHeaders = typeof headers === 'string' ? JSON.parse(headers) : headers;
-            } catch (e) {
-                // Ignore parse error, use as is if it's already an object
-            }
+            try { parsedHeaders = typeof headers === 'string' ? JSON.parse(headers) : headers; } catch (e) {}
         }
-
         const res = await axios({
             url: target,
             method: method || 'GET',
@@ -298,15 +275,14 @@ const testMonitor = async (request, reply) => {
             timeout: 10000,
             validateStatus: null,
             maxRedirects: 4,
-            maxContentLength: 2 * 1024 * 1024 // 2 MB
+            maxContentLength: 2 * 1024 * 1024 
         });
-
         return reply.send({
             success: true,
             status: res.status,
             time: Date.now() - startTime,
             headers: res.headers,
-            data: res.data // Return raw data (axios already parsed it if JSON)
+            data: res.data 
         });
     } catch (err) {
         const isTimeout = err.code === 'ECONNABORTED';
@@ -320,4 +296,38 @@ const testMonitor = async (request, reply) => {
     }
 };
 
-module.exports = { createMonitor, getMonitors, updateMonitor, deleteMonitor, getMonitorMetrics, getIncidents, testMonitor };
+// ── Toggle Status (Pause/Resume) ──────────────────────────────────────────
+const toggleMonitorStatus = async (request, reply) => {
+    const { id } = request.params;
+    const { action } = request.body; 
+    const userId = request.user.id;
+    if (!['pause', 'resume'].includes(action)) {
+        return reply.code(400).send({ error: 'Invalid action. Use "pause" or "resume".' });
+    }
+    try {
+        const newStatus = action === 'pause' ? 'paused' : 'pending';
+        const result = await request.server.db.query(
+            'UPDATE monitors SET status = $1 WHERE id = $2 AND user_id = $3 RETURNING *',
+            [newStatus, id, userId]
+        );
+        if (result.rowCount === 0) return reply.code(404).send({ error: 'Monitor not found' });
+        const monitor = result.rows[0];
+        if (action === 'pause') {
+            await unscheduleMonitor(id);
+        } else {
+            try {
+                await usageService.checkLimit(request.server.db, request.user, monitor.category);
+                await scheduleMonitor(monitor);
+            } catch (limitErr) {
+                await request.server.db.query('UPDATE monitors SET status = $1 WHERE id = $2', ['paused', id]);
+                return reply.code(403).send({ error: `Cannot resume: ${limitErr.message}`, upgradeRequired: true });
+            }
+        }
+        return reply.send({ message: `Monitor ${action}d successfully`, monitor });
+    } catch (error) {
+        request.log.error(error, 'toggleMonitorStatus error');
+        return reply.code(500).send({ error: `Failed to ${action} monitor` });
+    }
+};
+
+module.exports = { createMonitor, getMonitors, updateMonitor, deleteMonitor, getMonitorMetrics, getIncidents, testMonitor, toggleMonitorStatus };

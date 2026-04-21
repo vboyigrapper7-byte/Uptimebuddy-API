@@ -489,9 +489,23 @@ echo "========================================="`;
         authScope.post('/generate-token', async (request, reply) => {
             const userId     = request.user.id;
             const { name, server_group } = request.body || {};
+            const usageService = require('../../core/auth/usageService');
 
             if (!name || !name.trim()) {
                 return reply.status(400).send({ error: 'Server name is required' });
+            }
+
+            // 1. Quota Enforcement [Phase C - Hard Enforcement]
+            try {
+                await usageService.checkLimit(fastify.db, request.user, 'server');
+            } catch (limitErr) {
+                fastify.log.info(`Blocking server token for User ${userId}: ${limitErr.message}`);
+                return reply.code(403).send({ 
+                    error: limitErr.message,
+                    limitReached: true,
+                    upgradeRequired: true,
+                    billingUrl: '/dashboard/billing'
+                });
             }
 
             try {

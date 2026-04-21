@@ -8,14 +8,17 @@ const crypto = require('crypto');
 
 /**
  * Register User
- * Hashes password and user defaults.
+ * Hashes password and assigns default trial (14-day Pro)
  */
 async function createUser(db, { email, password, passwordHash, role = 'customer' }) {
     // If passwordHash is provided (e.g. from OTP flow), use it directly. Otherwise hash it.
     const finalHash = passwordHash || await bcrypt.hash(password, 12);
     
+    const trialDays = 14;
     const result = await db.query(
-        'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, role, tier',
+        `INSERT INTO users (email, password_hash, role, tier, plan_id, trial_ends_at) 
+         VALUES ($1, $2, $3, 'pro', 'pro_trial', NOW() + INTERVAL '14 days') 
+         RETURNING id, email, role, tier, plan_id, trial_ends_at`,
         [email, finalHash, role]
     );
     return result.rows[0];

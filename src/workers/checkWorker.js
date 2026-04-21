@@ -70,7 +70,7 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
                 method: method || 'GET',
                 headers: { ...parsedHeaders, 'User-Agent': 'MonitorHub-Monitor/2.0' },
                 data: body,
-                timeout: 10000,
+                timeout: 30000,
                 validateStatus: null, // don't throw on 4xx/5xx — we handle those
                 maxRedirects: 5,
                 maxContentLength: 5 * 1024 * 1024, // 5 MB limit
@@ -226,7 +226,7 @@ async function performCheck(type, target, keyword, method, headers, body) {
                 method: method || 'GET',
                 headers: { ...parsedHeaders, 'User-Agent': 'MonitorHub-Monitor/2.0' },
                 data: body,
-                timeout: 8000,
+                timeout: 30000,
                 validateStatus: null
             });
             return { status: (res.status >= 200 && res.status < 400) ? 'up' : 'down', time: Date.now() - startTime };

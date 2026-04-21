@@ -8,6 +8,7 @@ async function monitorRoutes(fastify, options) {
 
     fastify.post('/',            createMonitor);
     fastify.post('/test',        testMonitor);
+    fastify.post('/:id/toggle',  toggleMonitorStatus);
     fastify.get('/',             getMonitors);
     fastify.put('/:id',          updateMonitor);
     fastify.delete('/:id',       deleteMonitor);
