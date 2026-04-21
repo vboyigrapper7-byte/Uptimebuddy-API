@@ -1,4 +1,4 @@
-const { createMonitor, getMonitors, updateMonitor, deleteMonitor, getMonitorMetrics, getIncidents, testMonitor } = require('./controller');
+const { createMonitor, getMonitors, updateMonitor, deleteMonitor, getMonitorMetrics, getIncidents, testMonitor, toggleMonitorStatus } = require('./controller');
 
 async function monitorRoutes(fastify, options) {
     const { requireAuth } = require('../auth/middleware');
