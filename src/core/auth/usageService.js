@@ -39,15 +39,20 @@ async function getUserUsage(db, userId) {
     );
     counts.server = parseInt(agentRes.rows[0].count, 10);
 
-    // 3. Fetch count of records in Recycle Bin (scheduled for deletion)
-    const recycleRes = await db.query(
-        `SELECT COUNT(*) as count 
-         FROM monitor_metrics mm
-         JOIN monitors m ON mm.monitor_id = m.id
-         WHERE m.user_id = $1 AND mm.deletion_scheduled_at IS NOT NULL`,
-        [userId]
-    );
-    counts.recycleBin = parseInt(recycleRes.rows[0].count, 10);
+    // 3. Fetch count of records in Recycle Bin (Safe check)
+    try {
+        const recycleRes = await db.query(
+            `SELECT COUNT(*) as count 
+             FROM monitor_metrics mm
+             JOIN monitors m ON mm.monitor_id = m.id
+             WHERE m.user_id = $1 AND mm.deletion_scheduled_at IS NOT NULL`,
+            [userId]
+        );
+        counts.recycleBin = parseInt(recycleRes.rows[0].count, 10);
+    } catch (e) {
+        // Fallback if migration hasn't run yet
+        counts.recycleBin = 0;
+    }
 
     return counts;
 }

@@ -223,14 +223,19 @@ const getMonitorMetrics = async (request, reply) => {
         );
         if (verify.rows.length === 0) return reply.code(404).send({ error: 'Monitor not found' });
 
+        const { range } = request.query;
+        let limit = 60;
+        if (range === '24h') limit = 288; // roughly 24h at 5min interval
+        if (range === '7d') limit = 2016; // roughly 7d at 5min interval
+
         const res = await request.server.db.query(
             `SELECT TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'HH24:MI:SS') AS time,
                     response_time_ms, status
              FROM monitor_metrics
              WHERE monitor_id = $1
              ORDER BY recorded_at DESC
-             LIMIT 60`,
-            [id]
+             LIMIT $2`,
+            [id, limit]
         );
 
         return reply.send({ monitor: verify.rows[0], metrics: res.rows.reverse() });
