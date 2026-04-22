@@ -31,7 +31,7 @@ async function shouldSendAlert(monitorId, newStatus) {
     const res = await pool.query(
         `SELECT id FROM incidents
          WHERE monitor_id = $1
-           AND (started_at >= NOW() - INTERVAL '2 minutes' OR resolved_at >= NOW() - INTERVAL '2 minutes')
+           AND (started_at >= NOW() - INTERVAL '1 minute' OR resolved_at >= NOW() - INTERVAL '1 minute')
          LIMIT 1`,
         [monitorId]
     );

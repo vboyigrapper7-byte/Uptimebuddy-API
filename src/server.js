@@ -9,6 +9,7 @@ const cors    = require('@fastify/cors');
 const rateLimit = require('@fastify/rate-limit');
 const helmet = require('@fastify/helmet');
 const winston = require('winston');
+const axios = require('axios');
 
 const logger = winston.createLogger({
     level: process.env.LOG_LEVEL || 'info',
@@ -180,6 +181,21 @@ if (require.main === module) {
             const port = parseInt(process.env.PORT || '3001', 10);
             await server.listen({ port, host: '0.0.0.0' });
             logger.info(`[Server] API process listening on port ${port}`);
+
+            // ── Render Keep-Alive (Self-Ping) ─────────────────────────────
+            // Pings the health endpoint every 10 minutes to prevent sleeping
+            // on Render/Heroku free tiers.
+            if (process.env.NODE_ENV === 'production') {
+                const SELF_URL = process.env.BACKEND_URL || `http://localhost:${port}`;
+                setInterval(async () => {
+                    try {
+                        const res = await axios.get(`${SELF_URL}/health`, { timeout: 5000 });
+                        logger.info(`[Keep-Alive] Self-ping successful: ${res.status}`);
+                    } catch (err) {
+                        logger.warn(`[Keep-Alive] Self-ping failed: ${err.message}`);
+                    }
+                }, 10 * 60 * 1000); // 10 minutes
+            }
         })
         .catch((err) => {
             logger.error('[Server] Fatal startup error:', { 
