@@ -59,44 +59,45 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
     let responseTime = 0;
 
     try {
-        // ── HTTP / HTTPS ────────────────────────────────────────────────
-        if (type === 'http' || type === 'https') {
+        // ── HTTP / HTTPS / Keyword Analytics (Unified) ─────────────────
+        if (type === 'http' || type === 'https' || type === 'keyword') {
             let parsedHeaders = {};
             if (headers) {
                 try { parsedHeaders = typeof headers === 'string' ? JSON.parse(headers) : headers; } catch(e){}
             }
+            
             const res = await axios({
                 url: target,
                 method: method || 'GET',
                 headers: { ...parsedHeaders, 'User-Agent': 'MonitorHub-Monitor/2.0' },
                 data: body,
                 timeout: 30000,
-                validateStatus: null, // don't throw on 4xx/5xx — we handle those
+                validateStatus: null, // handle all status codes manually
                 maxRedirects: 5,
-                maxContentLength: 5 * 1024 * 1024, // 5 MB limit
+                maxContentLength: 5 * 1024 * 1024,
             });
+            
             responseTime = Date.now() - startTime;
-            if (res.status >= 200 && res.status < 400) {
-                status = 'up';
+            
+            // Check status code
+            const isStatusOk = res.status >= 200 && res.status < 400;
+            
+            if (isStatusOk) {
+                // If a keyword is specified, verify it exists in the body
+                if (keyword) {
+                    const bodyText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+                    if (bodyText.includes(keyword)) {
+                        status = 'up';
+                    } else {
+                        status = 'down';
+                        errorMessage = `Keyword "${keyword}" not found in response`;
+                    }
+                } else {
+                    status = 'up';
+                }
             } else {
+                status = 'down';
                 errorMessage = `HTTP ${res.status}`;
-            }
-        }
-        // ── Keyword check ───────────────────────────────────────────────
-        else if (type === 'keyword') {
-            const res = await axios.get(target, {
-                timeout: 10000,
-                maxContentLength: 2 * 1024 * 1024, // 2 MB — enough for any reasonable page
-                headers: { 'User-Agent': 'MonitorHub-Monitor/2.0' },
-            });
-            responseTime = Date.now() - startTime;
-            const bodyText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
-            if (res.status >= 200 && keyword && bodyText.includes(keyword)) {
-                status = 'up';
-            } else {
-                errorMessage = res.status >= 400
-                    ? `HTTP ${res.status}`
-                    : `Keyword "${keyword}" not found in response`;
             }
         }
         // ── TCP Port / Ping ─────────────────────────────────────────────
@@ -216,7 +217,7 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
 async function performCheck(type, target, keyword, method, headers, body) {
     const startTime = Date.now();
     try {
-        if (type === 'http' || type === 'https') {
+        if (type === 'http' || type === 'https' || type === 'keyword') {
             let parsedHeaders = {};
             if (headers) {
                 try { parsedHeaders = typeof headers === 'string' ? JSON.parse(headers) : headers; } catch(e){}
@@ -229,12 +230,16 @@ async function performCheck(type, target, keyword, method, headers, body) {
                 timeout: 30000,
                 validateStatus: null
             });
-            return { status: (res.status >= 200 && res.status < 400) ? 'up' : 'down', time: Date.now() - startTime };
-        }
-        if (type === 'keyword') {
-            const res = await axios.get(target, { timeout: 8000 });
-            const bodyText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
-            return { status: (res.status >= 200 && keyword && bodyText.includes(keyword)) ? 'up' : 'down', time: Date.now() - startTime };
+            
+            const isStatusOk = res.status >= 200 && res.status < 400;
+            if (isStatusOk) {
+                if (keyword) {
+                    const bodyText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+                    return { status: bodyText.includes(keyword) ? 'up' : 'down', time: Date.now() - startTime };
+                }
+                return { status: 'up', time: Date.now() - startTime };
+            }
+            return { status: 'down', time: Date.now() - startTime };
         }
         if (type === 'port' || type === 'ping') {
             let [host, port] = target.includes(':') ? target.split(':') : [target, 80];

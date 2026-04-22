@@ -60,6 +60,9 @@ const createMonitor = async (request, reply) => {
             billingUrl: '/dashboard/billing'
         });
     }
+    
+    // Enforce tier-specific interval minimums
+    const effectiveInterval = usageService.getEffectiveInterval(request.user, interval_seconds);
 
     const ssrfError = validateTarget(type, target);
     if (ssrfError) return reply.code(400).send({ error: ssrfError });
@@ -79,7 +82,7 @@ const createMonitor = async (request, reply) => {
             `INSERT INTO monitors (user_id, name, type, category, target, keyword, interval_seconds, method, headers, body, threshold_ms, region)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) 
              RETURNING id, name, type, category, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status, created_at`,
-            [userId, name, type, category, target, keyword ?? null, interval_seconds, method || 'GET', dbHeaders, body || null, threshold_ms || 0, region || 'Global']
+            [userId, name, type, category, target, keyword ?? null, effectiveInterval, method || 'GET', dbHeaders, body || null, threshold_ms || 0, region || 'Global']
         );
         const monitor = result.rows[0];
 
@@ -145,6 +148,9 @@ const updateMonitor = async (request, reply) => {
             }
         }
 
+        // Enforce tier-specific interval minimums if updating interval
+        const effectiveInterval = interval_seconds ? usageService.getEffectiveInterval(request.user, interval_seconds) : null;
+
         const result = await request.server.db.query(
             `UPDATE monitors SET
                name             = COALESCE($1, name),
@@ -156,7 +162,7 @@ const updateMonitor = async (request, reply) => {
                region           = COALESCE($7, region)
              WHERE id = $8 AND user_id = $9
              RETURNING id, name, type, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status`,
-            [name || null, interval_seconds || null, method || null, dbHeaders, body || null, threshold_ms || null, region || null, id, userId]
+            [name || null, effectiveInterval, method || null, dbHeaders, body || null, threshold_ms || null, region || null, id, userId]
         );
         if (result.rowCount === 0) return reply.code(404).send({ error: 'Monitor not found' });
         

@@ -83,6 +83,18 @@ async function checkLimit(db, user, category) {
 }
 
 /**
+ * Validate and sanitize check interval based on user tier
+ * @param {object} user 
+ * @param {number} requestedInterval 
+ * @returns {number} The effective interval (clamped to minInterval)
+ */
+function getEffectiveInterval(user, requestedInterval) {
+    const tierConfig = PLAN_TIERS[user.tier] || PLAN_TIERS.free;
+    const minAllowed = tierConfig.minInterval || 300;
+    return Math.max(requestedInterval, minAllowed);
+}
+
+/**
  * Get effective limits for a user
  * @param {string} tier 
  */

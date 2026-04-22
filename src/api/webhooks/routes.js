@@ -1,5 +1,6 @@
 const ALLOWED_PROVIDERS = ['slack', 'discord', 'telegram', 'email'];
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PRIVATE_IP_RE = /^(127\.|10\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|192\.168\.)/;
 
 async function webhookRoutes(fastify, options) {
     const { requireAuth } = require('../auth/middleware');
