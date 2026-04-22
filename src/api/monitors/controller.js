@@ -265,39 +265,77 @@ const getIncidents = async (request, reply) => {
 const testMonitor = async (request, reply) => {
     const { target, type, method, headers, body } = request.body;
     if (!target) return reply.code(400).send({ error: 'Target URL is required' });
+    
     const ssrfError = validateTarget(type || 'http', target);
     if (ssrfError) return reply.code(400).send({ error: ssrfError });
+    
     const startTime = Date.now();
     try {
         let parsedHeaders = {};
         if (headers) {
-            try { parsedHeaders = typeof headers === 'string' ? JSON.parse(headers) : headers; } catch (e) {}
+            try { 
+                parsedHeaders = typeof headers === 'string' ? JSON.parse(headers) : headers; 
+            } catch (e) {
+                // If it's not JSON, it might be a malformed string from a partially configured UI
+                request.log.warn(`Failed to parse headers: ${headers}`);
+            }
         }
+
         const res = await axios({
             url: target,
             method: method || 'GET',
-            headers: { ...parsedHeaders, 'User-Agent': 'MonitorHub-Tester/1.0' },
+            headers: { 
+                ...parsedHeaders, 
+                'User-Agent': 'MonitorHub-Tester/2.0',
+                'Accept': '*/*'
+            },
             data: body,
-            timeout: 10000,
-            validateStatus: null,
-            maxRedirects: 4,
-            maxContentLength: 2 * 1024 * 1024 
+            timeout: 15000, // Increased to 15s for slower APIs
+            validateStatus: () => true, // Don't throw on any status code
+            maxRedirects: 5,
+            maxContentLength: 5 * 1024 * 1024, // 5MB limit
+            responseType: 'text', // Get raw text to calculate size accurately
+            transformResponse: [(data) => data] // Don't auto-parse JSON on backend so we can control it on frontend
         });
+        
+        const time = Date.now() - startTime;
+        const size = Buffer.byteLength(res.data || '', 'utf8');
+
+        // Try to determine if it's JSON for the frontend hint
+        let isJson = false;
+        try {
+            if (res.headers['content-type']?.includes('application/json')) {
+                isJson = true;
+            } else {
+                JSON.parse(res.data);
+                isJson = true;
+            }
+        } catch (e) {}
+
         return reply.send({
-            success: true,
+            success: res.status >= 200 && res.status < 400,
             status: res.status,
-            time: Date.now() - startTime,
+            statusText: res.statusText || 'OK',
+            time,
+            size,
+            isJson,
             headers: res.headers,
             data: res.data 
         });
     } catch (err) {
+        const time = Date.now() - startTime;
         const isTimeout = err.code === 'ECONNABORTED';
+        const isNetworkError = !err.response;
+
         return reply.send({ 
             success: false, 
             status: err.response ? err.response.status : 0, 
-            time: Date.now() - startTime, 
-            error: isTimeout ? 'Request timeout (10s exceeded)' : err.message,
-            data: err.response ? err.response.data : null
+            statusText: err.response ? err.response.statusText : 'Network Error',
+            time, 
+            size: 0,
+            error: isTimeout ? 'Request timeout (15s exceeded)' : (isNetworkError ? `Connection failed: ${err.message}` : err.message),
+            data: err.response ? err.response.data : null,
+            headers: err.response ? err.response.headers : {}
         });
     }
 };
