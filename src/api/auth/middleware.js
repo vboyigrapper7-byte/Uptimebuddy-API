@@ -23,7 +23,7 @@ async function requireAuth(request, reply) {
         let res;
         try {
             res = await request.server.db.query(
-                'SELECT id, email, role, tier, plan_id, trial_ends_at FROM users WHERE email = $1',
+                'SELECT id, email, name, status_slug, role, tier, plan_id, trial_ends_at FROM users WHERE email = $1',
                 [decodedToken.email]
             );
         } catch (dbErr) {

@@ -7,7 +7,7 @@ const PLAN_TIERS = {
     free: {
         id: 'free',
         name: 'Free',
-        price: 0,
+        priceINR: 0,
         limits: {
             uptime: 5,
             api: 2,
@@ -23,7 +23,7 @@ const PLAN_TIERS = {
     starter: {
         id: 'starter',
         name: 'Starter',
-        price: 9,
+        priceINR: 749,
         limits: {
             uptime: 25,
             api: 10,
@@ -39,7 +39,7 @@ const PLAN_TIERS = {
     pro: {
         id: 'pro',
         name: 'Pro',
-        price: 24,
+        priceINR: 1999,
         limits: {
             uptime: 100,
             api: 50,
@@ -55,7 +55,7 @@ const PLAN_TIERS = {
     business: {
         id: 'business',
         name: 'Business',
-        price: 79,
+        priceINR: 6499,
         limits: {
             uptime: 500,
             api: 250,
