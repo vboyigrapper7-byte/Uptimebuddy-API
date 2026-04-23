@@ -38,6 +38,12 @@ const createOrder = async (request, reply) => {
 
         const order = await razorpay.orders.create(options);
 
+        // PERSISTENCE: Save order to DB before returning to frontend
+        await request.server.db.query(
+            'INSERT INTO transactions (user_id, order_id, plan_id, amount, status) VALUES ($1, $2, $3, $4, $5)',
+            [request.user.id, order.id, planId, options.amount, 'pending']
+        );
+
         return reply.send({
             id: order.id,
             currency: order.currency,
@@ -68,21 +74,38 @@ const verifyPayment = async (request, reply) => {
             return reply.code(400).send({ message: 'Invalid payment signature. Verification failed.' });
         }
 
-        // Signature is valid. Update user's tier in DB.
         const db = request.server.db;
+
+        // ANTI-TAMPERING: Fetch original plan from DB, do not trust request.body.planId
+        const txRes = await db.query('SELECT plan_id, status FROM transactions WHERE order_id = $1', [razorpay_order_id]);
+        if (txRes.rows.length === 0) {
+            return reply.code(404).send({ message: 'Order reference not found in system.' });
+        }
         
-        // We assume users table has a 'tier' column. (It does, we've seen it).
-        // Update user tier
+        const transaction = txRes.rows[0];
+        if (transaction.status === 'paid') {
+            return reply.send({ success: true, message: 'Payment already processed.', tier: transaction.plan_id });
+        }
+
+        const verifiedPlanId = transaction.plan_id;
+
+        // Update user's tier
         await db.query(`
             UPDATE users 
             SET tier = $1, updated_at = NOW()
             WHERE id = $2
-        `, [planId, request.user.id]);
+        `, [verifiedPlanId, request.user.id]);
+
+        // Mark transaction as paid (IDEMPOTENCY)
+        await db.query(
+            'UPDATE transactions SET payment_id = $1, status = $2, updated_at = NOW() WHERE order_id = $3',
+            [razorpay_payment_id, 'paid', razorpay_order_id]
+        );
 
         return reply.send({
             success: true,
             message: 'Payment verified and plan upgraded successfully!',
-            tier: planId
+            tier: verifiedPlanId
         });
     } catch (error) {
          request.log.error('Razorpay Verify Error:', error);
