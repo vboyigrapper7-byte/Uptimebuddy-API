@@ -31,6 +31,7 @@ const getRoutesAndServices = () => {
         monitorRoutes: require('./api/monitors/routes'),
         webhookRoutes: require('./api/webhooks/routes'),
         publicRoutes: require('./api/public/routes'),
+        billingRoutes: require('./api/billing/routes'),
         pool: require('./core/db/pool')
     };
 };
@@ -41,7 +42,7 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://monitorhubs.com';
 const buildServer = async () => {
     // ── Pre-boot Initialization ───────────────────────────────────────────
     // Must happen FIRST so variables like 'pool' are available to decorators
-    const { authRoutes, agentRoutes, monitorRoutes, webhookRoutes, publicRoutes, pool } = getRoutesAndServices();
+    const { authRoutes, agentRoutes, monitorRoutes, webhookRoutes, publicRoutes, billingRoutes, pool } = getRoutesAndServices();
 
     const server = Fastify({
         logger: {
@@ -139,6 +140,7 @@ const buildServer = async () => {
     server.register(monitorRoutes, { prefix: '/api/v1/monitors' });
     server.register(webhookRoutes, { prefix: '/api/v1/webhooks' });
     server.register(publicRoutes,  { prefix: '/api/v1/public' });
+    server.register(billingRoutes, { prefix: '/api/v1/billing' });
 
     return server;
 };
