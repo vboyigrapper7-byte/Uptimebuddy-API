@@ -27,6 +27,8 @@ async function authRoutes(fastify, options) {
     fastify.register(async (protectedScope) => {
         protectedScope.addHook('onRequest', requireAuth);
 
+        protectedScope.post('/sync', controller.syncSession);
+
         protectedScope.get('/me', async (request, reply) => {
             // Using request.user directly because it's populated by requireAuth
             return reply.send(request.user);

@@ -237,5 +237,14 @@ const resendOTP = async (request, reply) => {
     }
 };
 
-module.exports = { register, createApiKey, updateProfile, sendOTP, verifyOTP, resendOTP };
+const syncSession = async (request, reply) => {
+    // This route is protected by requireAuth, which already does the sync logic.
+    // We just return the synced user object.
+    return reply.send({
+        message: 'Session synced successfully',
+        user: request.user
+    });
+};
+
+module.exports = { register, createApiKey, updateProfile, sendOTP, verifyOTP, resendOTP, syncSession };
 

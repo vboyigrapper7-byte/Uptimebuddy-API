@@ -36,9 +36,12 @@ async function requireAuth(request, reply) {
             try {
                 const crypto = require('crypto');
                 const placeholderHash = crypto.randomBytes(32).toString('hex');
+                // Determine provider from token (firebase property)
+                const provider = decodedToken.firebase?.sign_in_provider === 'google.com' ? 'google' : 'email';
+                
                 res = await request.server.db.query(
-                    'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, role, tier',
-                    [decodedToken.email, placeholderHash, 'customer']
+                    'INSERT INTO users (email, password_hash, role, provider) VALUES ($1, $2, $3, $4) RETURNING id, email, role, tier, provider',
+                    [decodedToken.email, placeholderHash, 'customer', provider]
                 );
             } catch (insertErr) {
                 request.log.error('Failed to auto-provision user:', insertErr.message);
