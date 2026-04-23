@@ -141,6 +141,7 @@ async function getOverLimitMonitors(db, user) {
 module.exports = {
     getUserUsage,
     checkLimit,
+    getEffectiveInterval,
     getTierLimits,
     getOverLimitMonitors
 };
