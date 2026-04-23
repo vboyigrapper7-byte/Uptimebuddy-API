@@ -3,16 +3,16 @@ const crypto = require('crypto');
 const { PLAN_TIERS } = require('../../core/billing/tiers');
 
 const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_SgwFBxvbUDtXsF',
-  key_secret: process.env.RAZORPAY_KEY_SECRET || 'XUp1zxqsgR2eRdTNJOUEk2cR',
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-// Fixed INR Pricing (can be replaced by DB lookup or dynamic config later)
+// Fixed INR Pricing (based on round-off as requested)
 const INR_PRICES = {
     free: 0,
-    starter: 749,
+    starter: 799,
     pro: 1999,
-    business: 6499
+    business: 6999
 };
 
 const createOrder = async (request, reply) => {
@@ -58,7 +58,7 @@ const verifyPayment = async (request, reply) => {
         }
 
         // Verify Signature
-        const secret = process.env.RAZORPAY_KEY_SECRET || 'XUp1zxqsgR2eRdTNJOUEk2cR';
+        const secret = process.env.RAZORPAY_KEY_SECRET;
         const generated_signature = crypto
             .createHmac('sha256', secret)
             .update(`${razorpay_order_id}|${razorpay_payment_id}`)
@@ -90,7 +90,16 @@ const verifyPayment = async (request, reply) => {
     }
 };
 
+const getPlans = async (request, reply) => {
+    return reply.send({
+        tiers: PLAN_TIERS,
+        prices: INR_PRICES,
+        currency: 'INR'
+    });
+};
+
 module.exports = {
     createOrder,
-    verifyPayment
+    verifyPayment,
+    getPlans
 };

@@ -23,7 +23,7 @@ const PLAN_TIERS = {
     starter: {
         id: 'starter',
         name: 'Starter',
-        priceINR: 749,
+        priceINR: 799, // Round off
         limits: {
             uptime: 25,
             api: 10,
@@ -39,7 +39,7 @@ const PLAN_TIERS = {
     pro: {
         id: 'pro',
         name: 'Pro',
-        priceINR: 1999,
+        priceINR: 1999, // Round off
         limits: {
             uptime: 100,
             api: 50,
@@ -55,7 +55,7 @@ const PLAN_TIERS = {
     business: {
         id: 'business',
         name: 'Business',
-        priceINR: 6499,
+        priceINR: 6999, // Round off
         limits: {
             uptime: 500,
             api: 250,
