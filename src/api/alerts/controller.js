@@ -115,14 +115,22 @@ const testEmailAlert = async (request, reply) => {
     const alertService = require('../../core/alerting/alertService');
 
     try {
-        await alertService.sendEmail({
+        if (!process.env.RESEND_API_KEY) {
+            return reply.code(500).send({ error: 'RESEND_API_KEY is not configured on the server.' });
+        }
+
+        const success = await alertService.sendEmail({
             target: 'MonitorHub Test',
             newStatus: 'up',
             errorMessage: 'This is a test notification to verify your email settings.',
             timestamp: new Date().toISOString()
         }, userEmail);
 
-        return reply.send({ message: 'Test email dispatched successfully' });
+        if (!success) {
+            return reply.code(500).send({ error: 'Email service accepted the request but failed to deliver. Check your Resend dashboard.' });
+        }
+
+        return reply.send({ message: 'Test email dispatched successfully to ' + userEmail });
     } catch (err) {
         request.log.error(err);
         return reply.code(500).send({ error: 'Failed to send test email: ' + err.message });

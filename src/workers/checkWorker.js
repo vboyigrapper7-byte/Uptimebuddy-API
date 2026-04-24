@@ -46,7 +46,7 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
     // Fetch fresh config (target may have changed since job was enqueued)
     const monitorRes = await pool.query(
         `SELECT m.*, u.tier, u.plan_expiry,
-                s.on_down, s.on_up, s.on_warning, s.cooldown_mins,
+                s.on_down, s.on_up, s.on_warning, s.cooldown_mins, s.threshold_retries,
                 (SELECT count(*) FROM monitors WHERE user_id = m.user_id) as user_monitor_count
          FROM monitors m
          JOIN users u ON m.user_id = u.id

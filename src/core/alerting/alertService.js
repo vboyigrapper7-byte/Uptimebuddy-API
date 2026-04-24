@@ -63,8 +63,8 @@ class AlertService {
      * Dispatch a status update to a specific Email address.
      */
     async sendEmail(payload, email) {
-        if (!email) return;
-        await emailService.sendAlert(email, payload);
+        if (!email) return false;
+        return await emailService.sendAlert(email, payload);
     }
 
     /**
