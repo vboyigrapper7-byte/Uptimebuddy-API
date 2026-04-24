@@ -3,9 +3,8 @@ const auditService = require('../../core/auth/auditService');
 
 async function auditRoutes(fastify, options) {
     fastify.addHook('preHandler', requireAuth);
-    fastify.addHook('preHandler', requirePlan('audit_logs'));
-
-    fastify.get('/logs', async (request, reply) => {
+    
+    fastify.get('/logs', { preHandler: [requirePlan('audit_logs')] }, async (request, reply) => {
         try {
             // Find teamId for user
             const teamRes = await request.server.db.query(

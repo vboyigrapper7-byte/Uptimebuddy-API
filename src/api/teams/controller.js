@@ -4,7 +4,7 @@ const getMembers = async (request, reply) => {
     try {
         // Find teams where user is owner or member
         const res = await pool.query(
-            `SELECT u.email, tm.role, tm.id
+            `SELECT u.email, tm.role, tm.user_id
              FROM team_members tm
              JOIN users u ON tm.user_id = u.id
              WHERE tm.team_id IN (SELECT team_id FROM team_members WHERE user_id = $1)`,
