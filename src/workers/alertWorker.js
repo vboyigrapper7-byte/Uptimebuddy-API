@@ -90,22 +90,20 @@ const alertWorker = new Worker('alert-webhooks', async (job) => {
             } else if (wh.provider === 'discord') {
                 payload = alertService.getDiscordPayload(job.data);
             } else if (wh.provider === 'telegram') {
-                // Telegram storage format: bot_token|chat_id
                 const [botToken, chatId] = wh.url.split('|');
                 if (botToken && chatId) {
                     await alertService.sendTelegram(job.data, botToken, chatId);
                 }
-                continue; // telegram doesn't need the axios.post below
+                continue;
             } else if (wh.provider === 'email') {
                 const emails = wh.url.split(',').map(e => e.trim()).filter(e => e.length > 0);
                 for (const email of emails) {
                     await alertService.sendEmail(job.data, email);
                 }
-                logger.worker('AlertWorker', monitorId, `✓ Email alerts dispatched to ${emails.length} recipients`);
                 continue;
             } else if (wh.provider === 'generic') {
                 payload = {
-                    event: newStatus === 'up' ? 'MONITOR_RECOVERED' : 'MONITOR_DOWN',
+                    event: newStatus === 'up' ? 'MONITOR_RECOVERED' : (newStatus === 'warning' ? 'MONITOR_DEGRADED' : 'MONITOR_DOWN'),
                     monitor_id: monitorId,
                     target,
                     status: newStatus,
@@ -115,11 +113,26 @@ const alertWorker = new Worker('alert-webhooks', async (job) => {
             }
 
             if (payload) {
-                await axios.post(wh.url, payload, { timeout: 8000 });
-                logger.worker('AlertWorker', monitorId, `✓ ${wh.provider} alert dispatched`);
+                // Independent Retry Logic for Webhooks
+                let success = false;
+                let attempts = 0;
+                while (!success && attempts < 3) {
+                    try {
+                        attempts++;
+                        await axios.post(wh.url, payload, { timeout: 8000 });
+                        success = true;
+                        logger.worker('AlertWorker', monitorId, `✓ ${wh.provider} alert dispatched (Attempt ${attempts})`);
+                    } catch (err) {
+                        if (attempts >= 3) {
+                            logger.error(`[AlertWorker] Final failure for ${wh.provider} after ${attempts} attempts: ${err.message}`);
+                        } else {
+                            await new Promise(r => setTimeout(r, 2000 * attempts)); // Backoff
+                        }
+                    }
+                }
             }
         } catch (err) {
-            console.error(`[AlertWorker] Failed to dispatch ${wh.provider} webhook:`, err.message);
+            console.error(`[AlertWorker] Unexpected error for ${wh.provider}:`, err.message);
         }
     }
 }, {

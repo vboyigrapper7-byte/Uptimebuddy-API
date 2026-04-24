@@ -21,25 +21,21 @@ const pingPromise = (target, port) =>
     });
 
 // ── Alert cooldown via DB (avoids alert storms on flapping monitors) ──────
-const ALERT_COOLDOWN_MS = 5 * 60 * 1000; // 5 minutes
+const ALERT_COOLDOWN_MS = 60 * 1000; // 1 minute global cooldown per monitor
 
 /**
- * Smart Alert Cooldown
- * - Always allow recovery (UP) alerts to ensure users know when problems are solved.
- * - Prevents "Alert Storms" by suppressing DOWN alerts if any alert (UP or DOWN) 
- *   was sent in the last 2 minutes for this monitor.
+ * Enhanced Alert Cooldown
+ * Prevents alert spam by ensuring at least 1 minute between ANY two alerts for the same monitor.
  */
-async function shouldSendAlert(monitorId, newStatus) {
-    if (newStatus === 'up') return true;
-
+async function canSendAlert(monitorId) {
     const res = await pool.query(
-        `SELECT id FROM incidents
-         WHERE monitor_id = $1
-           AND (started_at >= NOW() - INTERVAL '1 minute' OR resolved_at >= NOW() - INTERVAL '1 minute')
-         LIMIT 1`,
+        'SELECT last_alert_at FROM monitors WHERE id = $1',
         [monitorId]
     );
-    return res.rows.length === 0;
+    if (res.rows.length === 0 || !res.rows[0].last_alert_at) return true;
+    
+    const lastAlertAt = new Date(res.rows[0].last_alert_at).getTime();
+    return (Date.now() - lastAlertAt) >= ALERT_COOLDOWN_MS;
 }
 
 // ── Main job processor ────────────────────────────────────────────────────
@@ -145,65 +141,80 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
 
     console.log(`[CheckWorker][${region}] Monitor ${monitorId} → ${status} (${responseTime}ms)`);
 
-    // ── Insert metric ────────────────────────────────────────────────────
+    // ── Update Metrics & State ──────────────────────────────────────────────
     const recordedAt = new Date();
+    const maxAttempts = job.opts.attempts || 1;
+    const isLastAttempt = job.attemptsMade + 1 >= maxAttempts;
+
+    // 1. Determine "Confirmed" status for alerting
+    let confirmedStatus = prev_status;
+    if (status === 'up') {
+        confirmedStatus = (threshold_ms > 0 && responseTime > threshold_ms) ? 'warning' : 'up';
+    } else if (isLastAttempt) {
+        confirmedStatus = 'down';
+    }
+
+    // 2. Insert Metric (Always)
     await pool.query(
         'INSERT INTO monitor_metrics (monitor_id, recorded_at, response_time_ms, status, status_code, error_message) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
         [monitorId, recordedAt, responseTime, status, statusCode, errorMessage]
     );
 
-    // ── Update monitor current status & last_checked ─────────────────────
-    await pool.query('UPDATE monitors SET status = $1, last_checked = $2 WHERE id = $3', [status, recordedAt, monitorId]);
-
-    // ── Edge detection & Alerting ─────────────────────────────────────────
-    // If status is 'down' and we still have attempts left, throw error to trigger BullMQ retry
-    // This makes the retry non-blocking for the worker thread.
-    const maxAttempts = job.opts.attempts || 1;
-    const isLastAttempt = job.attemptsMade + 1 >= maxAttempts;
-
+    // 3. Handle Retries (Non-blocking)
     if (status === 'down' && !isLastAttempt) {
-        console.log(`[CheckWorker] Monitor ${monitorId} is DOWN (Attempt ${job.attemptsMade + 1}/${maxAttempts}) — triggering native retry`);
-        throw new Error(errorMessage || 'Monitor check failed');
+        // Just update last_checked, but keep status the same so next check can detect transition
+        await pool.query('UPDATE monitors SET last_checked = $1 WHERE id = $2', [recordedAt, monitorId]);
+        throw new Error(errorMessage || `Check failed (Attempt ${job.attemptsMade + 1}/${maxAttempts})`);
     }
 
-    // Only alert on status CHANGE from the previous stable status
-    if (prev_status && prev_status !== 'pending' && prev_status !== status) {
-        console.log(`[CheckWorker] Confirmed status change: ${prev_status} → ${status} for monitor ${monitorId}`);
-
-        const canAlert = await shouldSendAlert(monitorId, status);
-        if (canAlert) {
+    // 4. Update Confirmed Status and Alert
+    const hasStatusChanged = prev_status !== confirmedStatus && prev_status !== 'pending';
+    
+    if (hasStatusChanged) {
+        const allowedToAlert = await canSendAlert(monitorId);
+        if (allowedToAlert) {
             await alertQueue.add(
                 `alert-${monitorId}-${Date.now()}`,
                 { 
                     monitorId, 
                     target, 
                     previousStatus: prev_status, 
-                    newStatus: status, 
-                    errorMessage, 
+                    newStatus: confirmedStatus, 
+                    errorMessage: confirmedStatus === 'warning' ? `Response threshold exceeded: ${responseTime}ms` : errorMessage, 
                     responseTime,
-                    threshold_ms,
-                    region,
                     timestamp: recordedAt.toISOString() 
                 },
-                { removeOnComplete: { count: 100 }, removeOnFail: { count: 50 } }
+                { removeOnComplete: { count: 100 } }
             );
 
-            // Record incident in DB for history view
-            if (status === 'down') {
+            // Record incident or resolve
+            if (confirmedStatus === 'down') {
                 await pool.query(
                     'INSERT INTO incidents (monitor_id, started_at, error_message) VALUES ($1, $2, $3)',
                     [monitorId, recordedAt, errorMessage]
                 );
-            } else if (status === 'up') {
+            } else if (prev_status === 'down') {
                 await pool.query(
-                    `UPDATE incidents SET resolved_at = $1
-                     WHERE monitor_id = $2 AND resolved_at IS NULL
-                     ORDER BY started_at DESC
-                     LIMIT 1`,
+                    'UPDATE incidents SET resolved_at = $1 WHERE monitor_id = $2 AND resolved_at IS NULL',
                     [recordedAt, monitorId]
                 );
             }
+
+            // Finally update DB with confirmed status and record the alert time for cooldown
+            await pool.query(
+                'UPDATE monitors SET status = $1, last_checked = $2, last_alert_at = $3 WHERE id = $4',
+                [confirmedStatus, recordedAt, recordedAt, monitorId]
+            );
+        } else {
+            // Update status anyway, but don't send alert due to cooldown
+            await pool.query(
+                'UPDATE monitors SET status = $1, last_checked = $2 WHERE id = $3',
+                [confirmedStatus, recordedAt, monitorId]
+            );
         }
+    } else {
+        // No status change confirmed — just refresh last_checked
+        await pool.query('UPDATE monitors SET last_checked = $1 WHERE id = $2', [recordedAt, monitorId]);
     }
 }, {
     connection: workerRedisConnection,

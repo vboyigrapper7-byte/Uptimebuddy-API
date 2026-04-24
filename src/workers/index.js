@@ -10,9 +10,10 @@ require('./checkWorker');
 require('./alertWorker');
 require('./retentionWorker');
 require('./statsWorker');
+require('./reminderWorker');
 
 const { syncMonitors } = require('../core/queue/scheduler');
-const { retentionQueue, statsQueue } = require('../core/queue/setup');
+const { retentionQueue, statsQueue, reminderQueue } = require('../core/queue/setup');
 
 console.log('--- All Workers Initialized ---');
 
@@ -40,3 +41,13 @@ statsQueue.add(
         jobId: 'system-stats-job'
     }
 ).then(() => console.log('[Worker] Periodic stats computation job scheduled.'));
+
+// 4. Schedule Reminder Checks (Runs every 10 minutes)
+reminderQueue.add(
+    'persistent-outage-check',
+    {},
+    {
+        repeat: { every: 10 * 60 * 1000 },
+        jobId: 'system-reminder-job'
+    }
+).then(() => console.log('[Worker] Periodic reminder check job scheduled.'));

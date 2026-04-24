@@ -28,18 +28,32 @@ class AlertService {
         if (!botToken || !chatId) return;
 
         try {
-            const message = `*${emoji} ${isDown ? 'Server Down' : 'Server Recovered'}*\n` +
+            const statusText = newStatus === 'warning' ? 'DEGRADED (Slow)' : (isDown ? 'DOWN' : 'RECOVERED');
+            const emoji = newStatus === 'warning' ? '⚠️' : (isDown ? '🚨' : '✅');
+            const timestamp = new Date().toLocaleString('en-US', { timeZone: 'UTC' }) + ' UTC';
+
+            const message = `*${emoji} ${newStatus === 'warning' ? 'Service Degradation' : (isDown ? 'Server Down' : 'Server Recovered')}*\n` +
                           `🌐 *Monitor:* ${target}\n` +
                           `📊 *Status:* ${statusText}\n` +
                           `⏰ *Time:* ${timestamp}\n` +
                           (errorMessage ? `❌ *Error:* \`${errorMessage}\`` : '');
 
-            await axios.post(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-                chat_id: chatId,
-                text: message,
-                parse_mode: 'Markdown'
-            }, { timeout: 8000 });
-            console.log(`[AlertService] Telegram dispatch success for ${target}`);
+            let attempts = 0;
+            while (attempts < 3) {
+                try {
+                    attempts++;
+                    await axios.post(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+                        chat_id: chatId,
+                        text: message,
+                        parse_mode: 'Markdown'
+                    }, { timeout: 8000 });
+                    console.log(`[AlertService] Telegram dispatch success for ${target} (Attempt ${attempts})`);
+                    break;
+                } catch (err) {
+                    if (attempts >= 3) throw err;
+                    await new Promise(r => setTimeout(r, 2000 * attempts));
+                }
+            }
         } catch (err) {
             console.error(`[AlertService] Telegram delivery failed: ${err.message}`);
         }
@@ -70,10 +84,16 @@ class AlertService {
     getSlackPayload(payload) {
         const { target, previousStatus, newStatus, errorMessage, timestamp } = payload;
         const isDown = newStatus === 'down';
+        const isWarning = newStatus === 'warning';
+        
+        let color = '#10b981'; // green
+        if (isDown) color = '#ef4444'; // red
+        if (isWarning) color = '#f59e0b'; // orange
+
         return {
-            text: `${isDown ? '🚨' : '✅'} *${isDown ? 'ALERT' : 'RECOVERY'}*`,
+            text: `${isDown ? '🚨' : (isWarning ? '⚠️' : '✅')} *${isDown ? 'ALERT' : (isWarning ? 'DEGRADATION' : 'RECOVERY')}*`,
             attachments: [{
-                color: isDown ? '#ef4444' : '#10b981',
+                color: color,
                 fields: [
                     { title: 'Monitor',   value: target,       short: false },
                     { title: 'Transition', value: `${previousStatus.toUpperCase()} → ${newStatus.toUpperCase()}`, short: true },
@@ -90,10 +110,16 @@ class AlertService {
     getDiscordPayload(payload) {
         const { target, previousStatus, newStatus, errorMessage, timestamp } = payload;
         const isDown = newStatus === 'down';
+        const isWarning = newStatus === 'warning';
+
+        let color = 3447003; // green
+        if (isDown) color = 15548997; // red
+        if (isWarning) color = 16102656; // orange
+
         return {
             embeds: [{
-                title: `${isDown ? '🚨 ALERT — Service Down' : '✅ RECOVERY — Service Restored'}`,
-                color: isDown ? 15548997 : 3447003,
+                title: `${isDown ? '🚨 ALERT — Service Down' : (isWarning ? '⚠️ WARNING — Service Degraded' : '✅ RECOVERY — Service Restored')}`,
+                color: color,
                 fields: [
                     { name: 'Monitor',    value: target,       inline: false },
                     { name: 'Status',     value: `${previousStatus.toUpperCase()} → ${newStatus.toUpperCase()}`, inline: true },
