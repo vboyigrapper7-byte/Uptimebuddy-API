@@ -27,15 +27,16 @@ const ALERT_COOLDOWN_MS = 60 * 1000; // 1 minute global cooldown per monitor
  * Enhanced Alert Cooldown
  * Prevents alert spam by ensuring at least 1 minute between ANY two alerts for the same monitor.
  */
-async function canSendAlert(monitorId) {
+async function canSendAlert(monitorId, customCooldownMins) {
     const res = await pool.query(
         'SELECT last_alert_at FROM monitors WHERE id = $1',
         [monitorId]
     );
     if (res.rows.length === 0 || !res.rows[0].last_alert_at) return true;
     
+    const cooldownMs = (customCooldownMins || 1) * 60 * 1000;
     const lastAlertAt = new Date(res.rows[0].last_alert_at).getTime();
-    return (Date.now() - lastAlertAt) >= ALERT_COOLDOWN_MS;
+    return (Date.now() - lastAlertAt) >= cooldownMs;
 }
 
 // ── Main job processor ────────────────────────────────────────────────────
@@ -45,9 +46,11 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
     // Fetch fresh config (target may have changed since job was enqueued)
     const monitorRes = await pool.query(
         `SELECT m.*, u.tier, u.plan_expiry,
+                s.on_down, s.on_up, s.on_warning, s.cooldown_mins,
                 (SELECT count(*) FROM monitors WHERE user_id = m.user_id) as user_monitor_count
          FROM monitors m
          JOIN users u ON m.user_id = u.id
+         LEFT JOIN alert_settings s ON m.user_id = s.user_id
          WHERE m.id = $1`,
         [monitorId]
     );
@@ -58,7 +61,12 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
     }
 
     const monitor = monitorRes.rows[0];
-    const { target, type, keyword, status: prev_status, user_id, method, headers, body, timeout_ms, max_retries, expected_status, threshold_ms, region, assertion_config, tier, plan_expiry, user_monitor_count } = monitor;
+    const { 
+        target, type, keyword, status: prev_status, user_id, method, headers, body, 
+        timeout_ms, max_retries, expected_status, threshold_ms, region, assertion_config, 
+        tier, plan_expiry, user_monitor_count,
+        on_down, on_up, on_warning, cooldown_mins, alerts_enabled
+    } = monitor;
 
     // ── 1. Monitor Bypass Guard (Plan Enforcement) ─────────────────────────
     const tierConfig = planService.getEffectiveTier({ tier, plan_expiry });
@@ -168,49 +176,65 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
     }
 
     // 4. Update Confirmed Status and Alert
-    const hasStatusChanged = prev_status !== confirmedStatus && prev_status !== 'pending';
+    const isFirstCheck = prev_status === 'pending';
+    const hasStatusChanged = prev_status !== confirmedStatus;
     
-    if (hasStatusChanged) {
-        const allowedToAlert = await canSendAlert(monitorId);
-        if (allowedToAlert) {
-            await alertQueue.add(
-                `alert-${monitorId}-${Date.now()}`,
-                { 
-                    monitorId, 
-                    target, 
-                    previousStatus: prev_status, 
-                    newStatus: confirmedStatus, 
-                    errorMessage: confirmedStatus === 'warning' ? `Response threshold exceeded: ${responseTime}ms` : errorMessage, 
-                    responseTime,
-                    timestamp: recordedAt.toISOString() 
-                },
-                { removeOnComplete: { count: 100 } }
-            );
+    if (hasStatusChanged || isFirstCheck) {
+        // ── Smart Alerting Logic ──────────────────────────────────────────
+        // 1. Determine if we SHOULD alert based on global settings & toggles
+        let shouldAlert = hasStatusChanged && !isFirstCheck && alerts_enabled !== false;
 
-            // Record incident or resolve
-            if (confirmedStatus === 'down') {
-                await pool.query(
-                    'INSERT INTO incidents (monitor_id, started_at, error_message) VALUES ($1, $2, $3)',
-                    [monitorId, recordedAt, errorMessage]
+        if (shouldAlert) {
+            // Respect user-defined triggers (on_down, on_up, on_warning)
+            if (confirmedStatus === 'down' && on_down === false) shouldAlert = false;
+            if (confirmedStatus === 'up' && on_up === false) shouldAlert = false;
+            if (confirmedStatus === 'warning' && on_warning === false) shouldAlert = false;
+        }
+
+        if (shouldAlert) {
+            const allowedToAlert = await canSendAlert(monitorId, cooldown_mins);
+            if (allowedToAlert) {
+                console.log(`[CheckWorker] Dispatching alert: ${prev_status} → ${confirmedStatus} for monitor ${monitorId}`);
+                
+                await alertQueue.add(
+                    `alert-${monitorId}-${Date.now()}`,
+                    { 
+                        monitorId, 
+                        target, 
+                        previousStatus: prev_status, 
+                        newStatus: confirmedStatus, 
+                        errorMessage: confirmedStatus === 'warning' ? `Response threshold exceeded: ${responseTime}ms` : errorMessage, 
+                        responseTime,
+                        timestamp: recordedAt.toISOString() 
+                    },
+                    { removeOnComplete: { count: 100 } }
                 );
-            } else if (prev_status === 'down') {
+
+                // Record incident or resolve
+                if (confirmedStatus === 'down') {
+                    await pool.query(
+                        'INSERT INTO incidents (monitor_id, started_at, error_message) VALUES ($1, $2, $3)',
+                        [monitorId, recordedAt, errorMessage]
+                    );
+                } else if (prev_status === 'down') {
+                    await pool.query(
+                        'UPDATE incidents SET resolved_at = $1 WHERE monitor_id = $2 AND resolved_at IS NULL',
+                        [recordedAt, monitorId]
+                    );
+                }
+
+                // Update DB with confirmed status and record the alert time
                 await pool.query(
-                    'UPDATE incidents SET resolved_at = $1 WHERE monitor_id = $2 AND resolved_at IS NULL',
-                    [recordedAt, monitorId]
+                    'UPDATE monitors SET status = $1, last_checked = $2, last_alert_at = $3 WHERE id = $4',
+                    [confirmedStatus, recordedAt, recordedAt, monitorId]
                 );
+            } else {
+                // Cooldown active — update status but don't alert
+                await pool.query('UPDATE monitors SET status = $1, last_checked = $2 WHERE id = $3', [confirmedStatus, recordedAt, monitorId]);
             }
-
-            // Finally update DB with confirmed status and record the alert time for cooldown
-            await pool.query(
-                'UPDATE monitors SET status = $1, last_checked = $2, last_alert_at = $3 WHERE id = $4',
-                [confirmedStatus, recordedAt, recordedAt, monitorId]
-            );
         } else {
-            // Update status anyway, but don't send alert due to cooldown
-            await pool.query(
-                'UPDATE monitors SET status = $1, last_checked = $2 WHERE id = $3',
-                [confirmedStatus, recordedAt, monitorId]
-            );
+            // No alert needed (e.g. first check or alerts disabled), just update status
+            await pool.query('UPDATE monitors SET status = $1, last_checked = $2 WHERE id = $3', [confirmedStatus, recordedAt, monitorId]);
         }
     } else {
         // No status change confirmed — just refresh last_checked
@@ -222,45 +246,6 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
     limiter: { max: 100, duration: 1000 },
 });
 
-// Helper for check logic decomposition
-async function performCheck(type, target, keyword, method, headers, body, timeout_ms, expected_status) {
-    const startTime = Date.now();
-    try {
-        if (type === 'http' || type === 'https' || type === 'keyword') {
-            let parsedHeaders = {};
-            if (headers) {
-                try { parsedHeaders = typeof headers === 'string' ? JSON.parse(headers) : headers; } catch(e){}
-            }
-            const res = await axios({
-                url: target,
-                method: method || 'GET',
-                headers: { ...parsedHeaders, 'User-Agent': 'MonitorHub-Monitor/2.0' },
-                data: body,
-                timeout: timeout_ms || 30000,
-                validateStatus: null,
-                ...getSafeAxiosConfig() // SSRF Protection
-            });
-            
-            const isStatusOk = isStatusExpected(res.status, expected_status);
-            if (isStatusOk) {
-                if (keyword) {
-                    const bodyText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
-                    return { status: bodyText.includes(keyword) ? 'up' : 'down', time: Date.now() - startTime };
-                }
-                return { status: 'up', time: Date.now() - startTime };
-            }
-            return { status: 'down', time: Date.now() - startTime };
-        }
-        if (type === 'port' || type === 'ping') {
-            let [host, port] = target.includes(':') ? target.split(':') : [target, 80];
-            const pingRes = await pingPromise(host, parseInt(port, 10));
-            return { status: pingRes.up ? 'up' : 'down', time: pingRes.time };
-        }
-    } catch {
-        return { status: 'down', time: Date.now() - startTime };
-    }
-    return { status: 'down', time: 0 };
-}
 
 function isStatusExpected(status, expectedString) {
     if (!expectedString) return status >= 200 && status < 400;

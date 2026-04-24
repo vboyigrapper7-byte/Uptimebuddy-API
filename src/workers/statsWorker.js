@@ -25,7 +25,7 @@ async function computeMonitorStats() {
             )
             SELECT 
                 m.id as monitor_id,
-                ROUND(CAST(COUNT(met.status) FILTER (WHERE met.status = 'up') AS NUMERIC) / GREATEST(COUNT(met.status), 1) * 100, 2) as uptime,
+                ROUND(CAST(COUNT(met.status) FILTER (WHERE met.status IN ('up', 'warning')) AS NUMERIC) / GREATEST(COUNT(met.status), 1) * 100, 2) as uptime,
                 ROUND(AVG(met.response_time_ms)) as latency
             FROM monitors m
             LEFT JOIN metrics_24h met ON m.id = met.monitor_id

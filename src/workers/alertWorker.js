@@ -5,6 +5,7 @@ const pool       = require('../core/db/pool');
 const alertService = require('../core/alerting/alertService');
 const logger       = require('../core/utils/logger');
 const { workerRedisConnection } = require('../core/queue/setup');
+const ESCALATION_STEP_INTERVAL_MINS = 5;
 
 const alertWorker = new Worker('alert-webhooks', async (job) => {
     const { monitorId, target, previousStatus, newStatus, errorMessage, timestamp } = job.data;
@@ -54,7 +55,7 @@ const alertWorker = new Worker('alert-webhooks', async (job) => {
         const lastTrigger = currentState.last_trigger ? new Date(currentState.last_trigger) : null;
         const minsSinceLast = lastTrigger ? (now - lastTrigger) / 60000 : 999;
 
-        if (currentState.step > 0 && minsSinceLast < 5) {
+        if (currentState.step > 0 && minsSinceLast < ESCALATION_STEP_INTERVAL_MINS) {
             logger.worker('AlertWorker', monitorId, `Suppressing duplicate escalation (Step ${currentState.step}, ${Math.round(minsSinceLast)}m ago)`);
             return; // Skip if too soon
         }
@@ -116,6 +117,7 @@ const alertWorker = new Worker('alert-webhooks', async (job) => {
                 // Independent Retry Logic for Webhooks
                 let success = false;
                 let attempts = 0;
+                let lastError = null;
                 while (!success && attempts < 3) {
                     try {
                         attempts++;
@@ -123,6 +125,7 @@ const alertWorker = new Worker('alert-webhooks', async (job) => {
                         success = true;
                         logger.worker('AlertWorker', monitorId, `✓ ${wh.provider} alert dispatched (Attempt ${attempts})`);
                     } catch (err) {
+                        lastError = err.message;
                         if (attempts >= 3) {
                             logger.error(`[AlertWorker] Final failure for ${wh.provider} after ${attempts} attempts: ${err.message}`);
                         } else {
@@ -130,6 +133,13 @@ const alertWorker = new Worker('alert-webhooks', async (job) => {
                         }
                     }
                 }
+
+                // Log the alert delivery result
+                await pool.query(
+                    `INSERT INTO alert_logs (user_id, monitor_id, alert_type, status, error_message, provider)
+                     VALUES ($1, $2, $3, $4, $5, $6)`,
+                    [userId, monitorId, newStatus, success ? 'success' : 'failed', success ? null : lastError, wh.provider]
+                );
             }
         } catch (err) {
             console.error(`[AlertWorker] Unexpected error for ${wh.provider}:`, err.message);

@@ -15,14 +15,18 @@ const reminderWorker = new Worker('reminder-checks', async (job) => {
     logger.info('[ReminderWorker] Scanning for persistent outages...');
 
     try {
-        // Find monitors that are DOWN and haven't been alerted in the last 30 minutes
+        // Find monitors that are DOWN and haven't been alerted in their specific reminder interval
         const res = await pool.query(`
-            SELECT id, target, status, last_alert_at, last_checked, error_message
-            FROM monitors
-            WHERE status = 'down'
-              AND (last_alert_at IS NULL OR last_alert_at < NOW() - INTERVAL '$1 minutes')
+            SELECT m.id, m.target, m.status, m.last_alert_at, m.last_checked, m.error_message,
+                   COALESCE(s.reminder_mins, 30) as reminder_mins
+            FROM monitors m
+            LEFT JOIN alert_settings s ON m.user_id = s.user_id
+            WHERE m.status = 'down'
+              AND m.alerts_enabled = true
+              AND (s.reminder_mins IS NULL OR s.reminder_mins > 0)
+              AND (m.last_alert_at IS NULL OR m.last_alert_at < NOW() - (COALESCE(s.reminder_mins, 30) || ' minutes')::interval)
             LIMIT 100
-        `, [REMINDER_INTERVAL_MINS]);
+        `);
 
         if (res.rows.length === 0) {
             logger.info('[ReminderWorker] No persistent outages requiring reminders.');
