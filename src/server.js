@@ -32,6 +32,8 @@ const getRoutesAndServices = () => {
         webhookRoutes: require('./api/webhooks/routes'),
         publicRoutes: require('./api/public/routes'),
         billingRoutes: require('./api/billing/routes'),
+        teamRoutes: require('./api/teams/routes'),
+        auditRoutes: require('./api/audit/routes'),
         pool: require('./core/db/pool')
     };
 };
@@ -141,6 +143,8 @@ const buildServer = async () => {
     server.register(webhookRoutes, { prefix: '/api/v1/webhooks' });
     server.register(publicRoutes,  { prefix: '/api/v1/public' });
     server.register(billingRoutes, { prefix: '/api/v1/billing' });
+    server.register(teamRoutes,    { prefix: '/api/v1/teams' });
+    server.register(auditRoutes,   { prefix: '/api/v1/audit' });
 
     return server;
 };

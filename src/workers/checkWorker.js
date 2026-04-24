@@ -2,7 +2,10 @@ require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env'
 const { Worker }          = require('bullmq');
 const axios               = require('axios');
 const tcpp                = require('tcp-ping');
+const jp                  = require('jsonpath');
 const pool                = require('../core/db/pool');
+const planService         = require('../core/billing/planService');
+const logger              = require('../core/utils/logger');
 const { workerRedisConnection, alertQueue } = require('../core/queue/setup');
 
 // ── TCP Ping wrapper ──────────────────────────────────────────────────────
@@ -44,15 +47,39 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
 
     // Fetch fresh config (target may have changed since job was enqueued)
     const monitorRes = await pool.query(
-        'SELECT id, type, target, keyword, status AS prev_status, user_id, method, headers, body, threshold_ms, region FROM monitors WHERE id = $1',
+        `SELECT m.*, u.tier, u.plan_expiry,
+                (SELECT count(*) FROM monitors WHERE user_id = m.user_id) as user_monitor_count
+         FROM monitors m
+         JOIN users u ON m.user_id = u.id
+         WHERE m.id = $1`,
         [monitorId]
     );
+
     if (monitorRes.rows.length === 0) {
-        console.log(`[CheckWorker] Monitor ${monitorId} not found — skipping (likely deleted)`);
+        logger.info(`[CheckWorker] Monitor ${monitorId} not found — skipping`);
         return;
     }
 
-    const { target, type, keyword, prev_status, user_id, method, headers, body, threshold_ms, region } = monitorRes.rows[0];
+    const monitor = monitorRes.rows[0];
+    const { target, type, keyword, status: prev_status, user_id, method, headers, body, threshold_ms, region, assertion_config, tier, plan_expiry, user_monitor_count } = monitor;
+
+    // ── 1. Monitor Bypass Guard (Plan Enforcement) ─────────────────────────
+    const tierConfig = planService.getEffectiveTier({ tier, plan_expiry });
+    const limit = tierConfig.limits.uptime || 5;
+
+    if (user_monitor_count > limit) {
+        // Find which monitors are "In-Budget" (simplistic: oldest ones)
+        const budgetRes = await pool.query(
+            'SELECT id FROM monitors WHERE user_id = $1 ORDER BY created_at ASC LIMIT $2',
+            [user_id, limit]
+        );
+        const allowedIds = budgetRes.rows.map(r => r.id);
+        if (!allowedIds.includes(monitorId)) {
+            logger.worker('CheckWorker', monitorId, 'Over-limit bypass triggered — skipping monitor execution');
+            return;
+        }
+    }
+
     const startTime = Date.now();
     let status       = 'down';
     let errorMessage = null;
@@ -72,33 +99,17 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
                 headers: { ...parsedHeaders, 'User-Agent': 'MonitorHub-Monitor/2.0' },
                 data: body,
                 timeout: 30000,
-                validateStatus: null, // handle all status codes manually
+                validateStatus: null,
                 maxRedirects: 5,
                 maxContentLength: 5 * 1024 * 1024,
             });
             
             responseTime = Date.now() - startTime;
             
-            // Check status code
-            const isStatusOk = res.status >= 200 && res.status < 400;
-            
-            if (isStatusOk) {
-                // If a keyword is specified, verify it exists in the body
-                if (keyword) {
-                    const bodyText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
-                    if (bodyText.includes(keyword)) {
-                        status = 'up';
-                    } else {
-                        status = 'down';
-                        errorMessage = `Keyword "${keyword}" not found in response`;
-                    }
-                } else {
-                    status = 'up';
-                }
-            } else {
-                status = 'down';
-                errorMessage = `HTTP ${res.status}`;
-            }
+            // ── Response Validation (Advanced Assertions) ─────────────────────
+            const validation = validateResponse(res, { keyword, assertion_config });
+            status = validation.status;
+            errorMessage = validation.errorMessage;
         }
         // ── TCP Port / Ping ─────────────────────────────────────────────
         else if (type === 'port' || type === 'ping') {
@@ -252,14 +263,62 @@ async function performCheck(type, target, keyword, method, headers, body) {
     return { status: 'down', time: 0 };
 }
 
+// ── Helper: Response Validator (Advanced Assertions) ───────────────────────
+function validateResponse(res, config) {
+    const { keyword, assertion_config } = config;
+    const ac = assertion_config || {};
+
+    // 1. Status Code Check
+    const minStatus = ac.min_status || 200;
+    const maxStatus = ac.max_status || 399;
+    if (res.status < minStatus || res.status > maxStatus) {
+        return { status: 'down', errorMessage: `HTTP ${res.status} (Expected ${minStatus}-${maxStatus})` };
+    }
+
+    // 2. Keyword Check (Legacy support)
+    if (keyword) {
+        const bodyText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+        if (!bodyText.includes(keyword)) {
+            return { status: 'down', errorMessage: `Keyword "${keyword}" not found` };
+        }
+    }
+
+    // 3. JSON Path Check
+    if (ac.json_path && ac.json_value !== undefined) {
+        try {
+            const matches = jp.query(res.data, ac.json_path);
+            if (matches.length === 0 || String(matches[0]) !== String(ac.json_value)) {
+                return { status: 'down', errorMessage: `JSONPath "${ac.json_path}" mismatch: got ${matches[0]}` };
+            }
+        } catch (e) {
+            return { status: 'down', errorMessage: `JSONPath Query Error: ${e.message}` };
+        }
+    }
+
+    // 4. Regex Check
+    if (ac.regex_pattern) {
+        try {
+            const regex = new RegExp(ac.regex_pattern);
+            const bodyText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+            if (!regex.test(bodyText)) {
+                return { status: 'down', errorMessage: `Regex pattern mismatch` };
+            }
+        } catch (e) {
+            return { status: 'down', errorMessage: `Invalid Regex Pattern: ${e.message}` };
+        }
+    }
+
+    return { status: 'up', errorMessage: null };
+}
+
 checkWorker.on('completed', (job) => {
-    console.log(`[CheckWorker] Job ${job.id} completed`);
+    logger.info(`[CheckWorker] Job ${job.id} completed`);
 });
 checkWorker.on('failed', (job, err) => {
-    console.error(`[CheckWorker] Job ${job?.id} failed:`, err.message);
+    logger.error(`[CheckWorker] Job ${job?.id} failed: ${err.message}`);
 });
 checkWorker.on('error', (err) => {
-    console.error('[CheckWorker] Worker error:', err.message);
+    logger.error(`[CheckWorker] Worker error: ${err.message}`);
 });
 
 console.log('[CheckWorker] Listening for monitor-checks...');

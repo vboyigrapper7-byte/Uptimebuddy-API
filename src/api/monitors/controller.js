@@ -36,7 +36,9 @@ const CreateMonitorSchema = z.object({
     headers:          z.any().optional(), // Can be string or object
     body:             z.string().optional(),
     threshold_ms:     z.number().int().min(0).max(60000).optional().default(0),
-    region:           z.string().max(50).optional().default('Global')
+    region:           z.string().max(50).optional().default('Global'),
+    priority:         z.string().max(20).optional().default('medium'),
+    assertion_config: z.any().optional()
 });
 
 // ── Create ────────────────────────────────────────────────────────────────
@@ -46,7 +48,7 @@ const createMonitor = async (request, reply) => {
         return reply.code(400).send({ error: parsed.error.issues[0].message });
     }
 
-    const { name, type, category, target, keyword, interval_seconds, method, headers, body, threshold_ms, region } = parsed.data;
+    const { name, type, category, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, priority, assertion_config } = parsed.data;
     const userId = request.user.id;
 
     try {
@@ -79,10 +81,10 @@ const createMonitor = async (request, reply) => {
         }
 
         const result = await request.server.db.query(
-            `INSERT INTO monitors (user_id, name, type, category, target, keyword, interval_seconds, method, headers, body, threshold_ms, region)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) 
-             RETURNING id, name, type, category, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status, created_at`,
-            [userId, name, type, category, target, keyword ?? null, effectiveInterval, method || 'GET', dbHeaders, body || null, threshold_ms || 0, region || 'Global']
+            `INSERT INTO monitors (user_id, name, type, category, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, priority, assertion_config)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) 
+             RETURNING id, name, type, category, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status, priority, assertion_config, created_at`,
+            [userId, name, type, category, target, keyword ?? null, effectiveInterval, method || 'GET', dbHeaders, body || null, threshold_ms || 0, region || 'Global', priority || 'medium', assertion_config ? JSON.stringify(assertion_config) : null]
         );
         const monitor = result.rows[0];
 
@@ -111,7 +113,7 @@ const getMonitors = async (request, reply) => {
 
     try {
         const result = await request.server.db.query(
-            `SELECT id, name, type, category, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status, created_at
+            `SELECT id, name, type, category, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status, priority, assertion_config, created_at
              FROM monitors WHERE user_id = $1
              ORDER BY created_at DESC
              LIMIT $2 OFFSET $3`,
@@ -128,9 +130,9 @@ const getMonitors = async (request, reply) => {
 const updateMonitor = async (request, reply) => {
     const { id } = request.params;
     const userId = request.user.id;
-    const { name, interval_seconds, method, headers, body, threshold_ms, region } = request.body || {};
+    const { name, interval_seconds, method, headers, body, threshold_ms, region, priority, assertion_config } = request.body || {};
 
-    if (!name && !interval_seconds && !method && !headers && !body && !threshold_ms && !region) {
+    if (!name && !interval_seconds && !method && !headers && !body && !threshold_ms && !region && !priority && !assertion_config) {
         return reply.code(400).send({ error: 'Nothing to update' });
     }
     if (interval_seconds && (interval_seconds < 30 || interval_seconds > 86400)) {
@@ -159,10 +161,12 @@ const updateMonitor = async (request, reply) => {
                headers          = COALESCE($4, headers),
                body             = COALESCE($5, body),
                threshold_ms     = COALESCE($6, threshold_ms),
-               region           = COALESCE($7, region)
-             WHERE id = $8 AND user_id = $9
-             RETURNING id, name, type, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status`,
-            [name || null, effectiveInterval, method || null, dbHeaders, body || null, threshold_ms || null, region || null, id, userId]
+               region           = COALESCE($7, region),
+               priority         = COALESCE($8, priority),
+               assertion_config = COALESCE($9, assertion_config)
+             WHERE id = $10 AND user_id = $11
+             RETURNING id, name, type, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status, priority, assertion_config`,
+            [name || null, effectiveInterval, method || null, dbHeaders, body || null, threshold_ms || null, region || null, priority || null, assertion_config ? JSON.stringify(assertion_config) : null, id, userId]
         );
         if (result.rowCount === 0) return reply.code(404).send({ error: 'Monitor not found' });
         
@@ -218,7 +222,7 @@ const getMonitorMetrics = async (request, reply) => {
 
     try {
         const verify = await request.server.db.query(
-            'SELECT id, name, type, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status FROM monitors WHERE id = $1 AND user_id = $2',
+            'SELECT id, name, type, target, keyword, interval_seconds, method, headers, body, threshold_ms, region, status, priority, assertion_config FROM monitors WHERE id = $1 AND user_id = $2',
             [id, userId]
         );
         if (verify.rows.length === 0) return reply.code(404).send({ error: 'Monitor not found' });
