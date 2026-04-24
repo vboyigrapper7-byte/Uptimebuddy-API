@@ -265,18 +265,22 @@ if %errorLevel% neq 0 (
 )
 del "%NODE_MSI%"
 
-:: ── Path Refresh (Strictly Registry Based - No PowerShell) ─────────────────
+:: ── Path Refresh (Robust Registry Sync) ──────────────────────────────────────
 echo [INFO] Refreshing environment variables...
-for /f "skip=2 tokens=3*" %%A in ('reg query "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment" /v "Path" 2^>nul') do set "MACHINE_PATH=%%A %%B"
-for /f "skip=2 tokens=3*" %%A in ('reg query "HKCU\\Environment" /v "Path" 2^>nul') do set "USER_PATH=%%A %%B"
-
-if defined MACHINE_PATH (
-    if defined USER_PATH (
-        set "PATH=!MACHINE_PATH!;!USER_PATH!"
-    ) else (
-        set "PATH=!MACHINE_PATH!"
-    )
+set "NEW_PATH="
+for /f "tokens=2*" %%A in ('reg query "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment" /v "Path" 2^>nul') do set "NEW_PATH=%%B"
+for /f "tokens=2*" %%A in ('reg query "HKCU\\Environment" /v "Path" 2^>nul') do (
+    if defined NEW_PATH (set "NEW_PATH=!NEW_PATH!;%%B") else (set "NEW_PATH=%%B")
 )
+
+:: Apply new path if successfully retrieved
+if defined NEW_PATH (
+    set "PATH=!NEW_PATH!"
+)
+
+:: CRITICAL: Always ensure essential Windows directories are in PATH
+:: This prevents "command not recognized" errors even if registry parsing fails
+echo !PATH! | findstr /i "system32" >nul || set "PATH=!PATH!;%SystemRoot%\\System32;%SystemRoot%;%SystemRoot%\\System32\\Wbem;%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\"
 
 :: ── Final Verification ─────────────────────────────────────────────────────
 node -v >nul 2>&1
@@ -298,26 +302,34 @@ call npm install axios dotenv systeminformation node-windows https-proxy-agent -
 :: ── Fetch Agent Script & Service Installer ─────────────────────────────────
 echo [INFO] Connecting to platform: ${hostUrl}
 
-:: ── Secure Download with Revocation & Bitsadmin Fallback ──────────────────
-:: Attempt 1: Standard Curl (Fast)
+:: ── Secure Download with Revocation, PowerShell & Bitsadmin Fallback ───────
+:: Agent Script
 curl.exe --connect-timeout 15 --max-time 30 -o agent.js "${hostUrl}/api/v1/agents/script"
 if %errorLevel% neq 0 (
-    echo [INFO] Curl failed or SSL revocation issue detected. Retrying with --ssl-no-revoke...
-    curl.exe --ssl-no-revoke --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 --max-time 120 -o agent.js "${hostUrl}/api/v1/agents/script"
+    echo [INFO] Curl failed. Retrying with --ssl-no-revoke...
+    curl.exe --ssl-no-revoke --retry 3 --connect-timeout 30 --max-time 120 -o agent.js "${hostUrl}/api/v1/agents/script"
 )
 if %errorLevel% neq 0 (
-    echo [INFO] Curl fallback failed. Attempting bitsadmin for agent.js...
+    echo [INFO] Curl failed. Attempting PowerShell download...
+    powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object System.Net.WebClient).DownloadFile('${hostUrl}/api/v1/agents/script', 'agent.js')"
+)
+if %errorLevel% neq 0 (
+    echo [INFO] PowerShell failed. Attempting bitsadmin fallback...
     bitsadmin /transfer "AgentDownload" /priority FOREGROUND "${hostUrl}/api/v1/agents/script" "%cd%\\agent.js" >nul
 )
 
-:: Repeat for Service Installer
+:: Service Installer
 curl.exe --connect-timeout 15 --max-time 30 -o service.js "${hostUrl}/api/v1/agents/windows-service.js"
 if %errorLevel% neq 0 (
-    echo [INFO] Initial connection failed. Retrying with --ssl-no-revoke...
-    curl.exe --ssl-no-revoke --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 --max-time 120 -o service.js "${hostUrl}/api/v1/agents/windows-service.js"
+    echo [INFO] Curl failed. Retrying with --ssl-no-revoke...
+    curl.exe --ssl-no-revoke --retry 3 --connect-timeout 30 --max-time 120 -o service.js "${hostUrl}/api/v1/agents/windows-service.js"
 )
 if %errorLevel% neq 0 (
-    echo [INFO] Curl fallback failed. Attempting bitsadmin for service.js...
+    echo [INFO] Curl failed. Attempting PowerShell download...
+    powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object System.Net.WebClient).DownloadFile('${hostUrl}/api/v1/agents/windows-service.js', 'service.js')"
+)
+if %errorLevel% neq 0 (
+    echo [INFO] PowerShell failed. Attempting bitsadmin fallback...
     bitsadmin /transfer "ServiceDownload" /priority FOREGROUND "${hostUrl}/api/v1/agents/windows-service.js" "%cd%\\service.js" >nul
 )
 
@@ -383,11 +395,11 @@ npm install axios dotenv systeminformation
 echo "Installing PM2 globally..."
 npm install -g pm2
 echo "Connecting to platform: ${hostUrl}"
-curl --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 30 --max-time 120 -o agent.js "${hostUrl}/api/v1/agents/script"
-if [ $? -ne 0 ]; then
+curl --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 30 --max-time 120 -o agent.js "${hostUrl}/api/v1/agents/script" || \
+wget --tries=5 --waitretry=10 --timeout=30 -O agent.js "${hostUrl}/api/v1/agents/script"
+if [ ! -f "agent.js" ]; then
     echo "[ERROR] Could not download agent from Monitor Hub Platform!"
     echo "Ensure this server can reach ${hostUrl}"
-    echo "If using Render free tier, wait 60s and re-run."
     exit 1
 fi
 echo "AGENT_TOKEN=${token}" > .env

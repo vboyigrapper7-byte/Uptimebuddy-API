@@ -31,12 +31,38 @@ CREATE TABLE IF NOT EXISTS monitors (
     user_id          INT          REFERENCES users(id) ON DELETE CASCADE,
     name             VARCHAR(255) NOT NULL,
     type             VARCHAR(50)  NOT NULL CHECK (type IN ('http','https','keyword','port','ping')),
+    category         VARCHAR(20)  DEFAULT 'uptime',
     target           VARCHAR(500) NOT NULL,
     keyword          VARCHAR(255),
     interval_seconds INT          DEFAULT 300 CHECK (interval_seconds >= 30 AND interval_seconds <= 86400),
+    method           VARCHAR(10)  DEFAULT 'GET',
+    headers          TEXT,         -- Stored as JSON string
+    body             TEXT,
+    timeout_ms       INT          DEFAULT 10000,
+    max_retries      INT          DEFAULT 3,
+    expected_status  VARCHAR(50)  DEFAULT '200-399',
+    threshold_ms     INT          DEFAULT 0,
+    region           VARCHAR(50)  DEFAULT 'Global',
+    priority         VARCHAR(20)  DEFAULT 'medium',
     status           VARCHAR(50)  DEFAULT 'pending',
+    assertion_config JSONB,
+    escalation_state JSONB        DEFAULT '{"step": 0, "last_trigger": null}',
     created_at       TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Ensure existing installs have the new columns (safe migrations)
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS category VARCHAR(20) DEFAULT 'uptime';
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS method VARCHAR(10) DEFAULT 'GET';
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS headers TEXT;
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS body TEXT;
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS timeout_ms INT DEFAULT 10000;
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS max_retries INT DEFAULT 3;
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS expected_status VARCHAR(50) DEFAULT '200-399';
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS threshold_ms INT DEFAULT 0;
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS region VARCHAR(50) DEFAULT 'Global';
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS priority VARCHAR(20) DEFAULT 'medium';
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS assertion_config JSONB;
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS escalation_state JSONB DEFAULT '{"step": 0, "last_trigger": null}';
 
 CREATE INDEX IF NOT EXISTS idx_monitors_user_id    ON monitors(user_id);
 CREATE INDEX IF NOT EXISTS idx_monitors_status      ON monitors(status);

@@ -61,7 +61,7 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
     }
 
     const monitor = monitorRes.rows[0];
-    const { target, type, keyword, status: prev_status, user_id, method, headers, body, threshold_ms, region, assertion_config, tier, plan_expiry, user_monitor_count } = monitor;
+    const { target, type, keyword, status: prev_status, user_id, method, headers, body, timeout_ms, max_retries, expected_status, threshold_ms, region, assertion_config, tier, plan_expiry, user_monitor_count } = monitor;
 
     // ── 1. Monitor Bypass Guard (Plan Enforcement) ─────────────────────────
     const tierConfig = planService.getEffectiveTier({ tier, plan_expiry });
@@ -84,6 +84,7 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
     let status       = 'down';
     let errorMessage = null;
     let responseTime = 0;
+    let statusCode   = null;
 
     try {
         // ── HTTP / HTTPS / Keyword Analytics (Unified) ─────────────────
@@ -98,16 +99,17 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
                 method: method || 'GET',
                 headers: { ...parsedHeaders, 'User-Agent': 'MonitorHub-Monitor/2.0' },
                 data: body,
-                timeout: 30000,
+                timeout: timeout_ms || 30000,
                 validateStatus: null,
                 maxRedirects: 5,
                 maxContentLength: 5 * 1024 * 1024,
             });
             
+            statusCode = res.status;
             responseTime = Date.now() - startTime;
             
             // ── Response Validation (Advanced Assertions) ─────────────────────
-            const validation = validateResponse(res, { keyword, assertion_config });
+            const validation = validateResponse(res, { keyword, assertion_config, expected_status });
             status = validation.status;
             errorMessage = validation.errorMessage;
         }
@@ -144,8 +146,8 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
     // ── Insert metric ────────────────────────────────────────────────────
     const recordedAt = new Date();
     await pool.query(
-        'INSERT INTO monitor_metrics (monitor_id, recorded_at, response_time_ms, status) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
-        [monitorId, recordedAt, responseTime, status]
+        'INSERT INTO monitor_metrics (monitor_id, recorded_at, response_time_ms, status, status_code, error_message) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
+        [monitorId, recordedAt, responseTime, status, statusCode, errorMessage]
     );
 
     // ── Update monitor current status ────────────────────────────────────
@@ -155,15 +157,16 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
     if (prev_status && prev_status !== 'pending' && prev_status !== status) {
         console.log(`[CheckWorker] Status change: ${prev_status} → ${status} for monitor ${monitorId}`);
 
-        // If status went down, verify it at least 2 more times to confirm a "Real Outage"
+        // If status went down, verify it at least X more times to confirm a "Real Outage"
         let finalStatus = status;
-        if (status === 'down') {
-            console.log(`[CheckWorker] Down detected — initiating verification pass for monitor ${monitorId}`);
+        const retryCount = max_retries || 2;
+        if (status === 'down' && retryCount > 0) {
+            console.log(`[CheckWorker] Down detected — initiating verification pass (${retryCount} retries) for monitor ${monitorId}`);
             let failures = 1;
-            for (let i = 0; i < 2; i++) {
+            for (let i = 0; i < retryCount; i++) {
                 // Wait 2 seconds between verification checks
                 await new Promise(r => setTimeout(r, 2000));
-                const verifyRes = await performCheck(type, target, keyword, method, headers, body);
+                const verifyRes = await performCheck(type, target, keyword, method, headers, body, timeout_ms, expected_status);
                 if (verifyRes.status === 'down') {
                     failures++;
                 } else {
@@ -171,9 +174,9 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
                     break;
                 }
             }
-            // Only confirm outage if ALL checks (initial + 2 verifications) failed
-            if (failures < 3) {
-                console.log(`[CheckWorker] Monitor ${monitorId} recovered during verification (${failures}/3 failures) — not alerting`);
+            // Only confirm outage if ALL checks failed
+            if (failures < (retryCount + 1)) {
+                console.log(`[CheckWorker] Monitor ${monitorId} recovered during verification (${failures}/${retryCount + 1} failures) — not alerting`);
                 finalStatus = 'up';
             }
         }
@@ -225,7 +228,7 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
 });
 
 // Helper for check logic decomposition
-async function performCheck(type, target, keyword, method, headers, body) {
+async function performCheck(type, target, keyword, method, headers, body, timeout_ms, expected_status) {
     const startTime = Date.now();
     try {
         if (type === 'http' || type === 'https' || type === 'keyword') {
@@ -238,11 +241,11 @@ async function performCheck(type, target, keyword, method, headers, body) {
                 method: method || 'GET',
                 headers: { ...parsedHeaders, 'User-Agent': 'MonitorHub-Monitor/2.0' },
                 data: body,
-                timeout: 30000,
+                timeout: timeout_ms || 30000,
                 validateStatus: null
             });
             
-            const isStatusOk = res.status >= 200 && res.status < 400;
+            const isStatusOk = isStatusExpected(res.status, expected_status);
             if (isStatusOk) {
                 if (keyword) {
                     const bodyText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
@@ -263,16 +266,33 @@ async function performCheck(type, target, keyword, method, headers, body) {
     return { status: 'down', time: 0 };
 }
 
+function isStatusExpected(status, expectedString) {
+    if (!expectedString) return status >= 200 && status < 400;
+    
+    try {
+        const parts = expectedString.split(',').map(p => p.trim());
+        for (const part of parts) {
+            if (part.includes('-')) {
+                const [min, max] = part.split('-').map(Number);
+                if (status >= min && status <= max) return true;
+            } else {
+                if (status === Number(part)) return true;
+            }
+        }
+    } catch (e) {
+        return status >= 200 && status < 400;
+    }
+    return false;
+}
+
 // ── Helper: Response Validator (Advanced Assertions) ───────────────────────
 function validateResponse(res, config) {
-    const { keyword, assertion_config } = config;
+    const { keyword, assertion_config, expected_status } = config;
     const ac = assertion_config || {};
 
     // 1. Status Code Check
-    const minStatus = ac.min_status || 200;
-    const maxStatus = ac.max_status || 399;
-    if (res.status < minStatus || res.status > maxStatus) {
-        return { status: 'down', errorMessage: `HTTP ${res.status} (Expected ${minStatus}-${maxStatus})` };
+    if (!isStatusExpected(res.status, expected_status)) {
+        return { status: 'down', errorMessage: `HTTP ${res.status} (Expected ${expected_status || '200-399'})` };
     }
 
     // 2. Keyword Check (Legacy support)
