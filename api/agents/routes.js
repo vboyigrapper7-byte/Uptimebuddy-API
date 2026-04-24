@@ -297,18 +297,18 @@ call npm install axios dotenv systeminformation node-windows --quiet
 
 :: ── Fetch Agent Script & Service Installer ─────────────────────────────────
 echo [INFO] Connecting to platform: ${hostUrl}
-echo (This may take up to 60 seconds if the server is waking from sleep...)
 
 :: ── Secure Download with Revocation Fallback ──────────────────────────────
-curl.exe --retry 10 --retry-delay 5 --retry-all-errors --connect-timeout 30 --max-time 120 -o agent.js "${hostUrl}/api/v1/agents/script"
+:: First attempt: Fast check without retries to detect SSL/Revocation issues immediately
+curl.exe --connect-timeout 15 --max-time 30 -o agent.js "${hostUrl}/api/v1/agents/script"
 if %errorLevel% neq 0 (
-    echo [INFO] Retrying agent download with --ssl-no-revoke...
+    echo [INFO] Initial connection failed. Retrying with --ssl-no-revoke and wake-up logic...
     curl.exe --ssl-no-revoke --retry 10 --retry-delay 5 --retry-all-errors --connect-timeout 30 --max-time 120 -o agent.js "${hostUrl}/api/v1/agents/script"
 )
 
-curl.exe --retry 10 --retry-delay 5 --retry-all-errors --connect-timeout 30 --max-time 120 -o service.js "${hostUrl}/api/v1/agents/windows-service.js"
+curl.exe --connect-timeout 15 --max-time 30 -o service.js "${hostUrl}/api/v1/agents/windows-service.js"
 if %errorLevel% neq 0 (
-    echo [INFO] Retrying service installer download with --ssl-no-revoke...
+    echo [INFO] Initial connection failed. Retrying with --ssl-no-revoke and wake-up logic...
     curl.exe --ssl-no-revoke --retry 10 --retry-delay 5 --retry-all-errors --connect-timeout 30 --max-time 120 -o service.js "${hostUrl}/api/v1/agents/windows-service.js"
 )
 
@@ -373,7 +373,6 @@ npm install axios dotenv systeminformation
 echo "Installing PM2 globally..."
 npm install -g pm2
 echo "Connecting to platform: ${hostUrl}"
-echo "(This may take up to 60 seconds if the server is waking from sleep...)"
 curl --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 30 --max-time 120 -o agent.js "${hostUrl}/api/v1/agents/script"
 if [ $? -ne 0 ]; then
     echo "[ERROR] Could not download agent from Monitor Hub Platform!"
