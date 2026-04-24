@@ -109,4 +109,60 @@ const getAlertLogs = async (request, reply) => {
     }
 };
 
-module.exports = { getAlertSettings, updateAlertSettings, getAlertLogs };
+const testEmailAlert = async (request, reply) => {
+    const userId = request.user.id;
+    const userEmail = request.user.email;
+    const alertService = require('../../core/alerting/alertService');
+
+    try {
+        await alertService.sendEmail({
+            target: 'MonitorHub Test',
+            newStatus: 'up',
+            errorMessage: 'This is a test notification to verify your email settings.',
+            timestamp: new Date().toISOString()
+        }, userEmail);
+
+        return reply.send({ message: 'Test email dispatched successfully' });
+    } catch (err) {
+        request.log.error(err);
+        return reply.code(500).send({ error: 'Failed to send test email: ' + err.message });
+    }
+};
+
+const testWebhookAlert = async (request, reply) => {
+    const userId = request.user.id;
+    const axios = require('axios');
+    const alertService = require('../../core/alerting/alertService');
+
+    try {
+        const webhooks = await pool.query('SELECT provider, url FROM webhooks WHERE user_id = $1', [userId]);
+        if (webhooks.rows.length === 0) {
+            return reply.code(400).send({ error: 'No webhooks configured. Please add one first.' });
+        }
+
+        const payload = alertService.getSlackPayload({
+            target: 'MonitorHub Test',
+            previousStatus: 'pending',
+            newStatus: 'up',
+            errorMessage: 'Test webhook message',
+            timestamp: new Date().toISOString()
+        });
+
+        const results = [];
+        for (const wh of webhooks.rows) {
+            try {
+                await axios.post(wh.url, payload, { timeout: 5000 });
+                results.push({ provider: wh.provider, status: 'success' });
+            } catch (err) {
+                results.push({ provider: wh.provider, status: 'failed', error: err.message });
+            }
+        }
+
+        return reply.send({ message: 'Test webhooks processed', results });
+    } catch (err) {
+        request.log.error(err);
+        return reply.code(500).send({ error: 'Failed to process test webhooks' });
+    }
+};
+
+module.exports = { getAlertSettings, updateAlertSettings, getAlertLogs, testEmailAlert, testWebhookAlert };
