@@ -12,6 +12,9 @@ function validateMetrics(metrics) {
     if (typeof disk_percent  !== 'number' || disk_percent  < 0 || disk_percent  > 100) return false;
     if (typeof ram_mb        !== 'number' || ram_mb        < 0 || ram_mb        > 4194304) return false;
     if (metrics.ram_total_mb  !== undefined && (typeof metrics.ram_total_mb  !== 'number' || metrics.ram_total_mb  < 0)) return false;
+    // Add validation for new disk metrics
+    if (metrics.disk_total_gb !== undefined && (typeof metrics.disk_total_gb !== 'number')) return false;
+    if (metrics.disk_free_gb  !== undefined && (typeof metrics.disk_free_gb  !== 'number')) return false;
     if (metrics.net_rx_mb     !== undefined && (typeof metrics.net_rx_mb     !== 'number' || metrics.net_rx_mb    < 0)) return false;
     if (metrics.net_tx_mb     !== undefined && (typeof metrics.net_tx_mb     !== 'number' || metrics.net_tx_mb    < 0)) return false;
     if (metrics.uptime_seconds !== undefined && (typeof metrics.uptime_seconds !== 'number' || metrics.uptime_seconds < 0)) return false;
@@ -57,39 +60,80 @@ async function agentRoutes(fastify, options) {
         }
 
         try {
-            const agentResult = await fastify.db.query(
-                'SELECT id FROM agents WHERE agent_token = $1',
-                [agent_token]
-            );
-            if (agentResult.rows.length === 0) {
-                return reply.status(401).send({ error: 'Invalid agent token' });
+            // 1. Initial Lookup (Resilient to missing IP columns)
+            let agentId, existing;
+            try {
+                const res = await fastify.db.query('SELECT id, public_ip, private_ip FROM agents WHERE agent_token = $1', [agent_token]);
+                if (res.rows.length === 0) return reply.status(401).send({ error: 'Invalid agent token' });
+                agentId  = res.rows[0].id;
+                existing = res.rows[0];
+            } catch (err) {
+                // FALLBACK: If columns don't exist yet
+                const res = await fastify.db.query('SELECT id FROM agents WHERE agent_token = $1', [agent_token]);
+                if (res.rows.length === 0) return reply.status(401).send({ error: 'Invalid agent token' });
+                agentId  = res.rows[0].id;
+                existing = { id: agentId }; // No IP history available
             }
 
-            const agentId     = agentResult.rows[0].id;
-            const recordedAt  = new Date(); // Always use server time — never trust client timestamp
+            const recordedAt = new Date();
 
-            await fastify.db.query(
-                `INSERT INTO agent_metrics
-                 (agent_id, recorded_at, cpu_percent, ram_mb, ram_total_mb, disk_percent, net_rx_mb, net_tx_mb, uptime_seconds, process_count)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                 ON CONFLICT DO NOTHING`,
-                [
-                    agentId, recordedAt,
-                    metrics.cpu_percent, metrics.ram_mb, metrics.ram_total_mb ?? null,
-                    metrics.disk_percent,
-                    metrics.net_rx_mb ?? null, metrics.net_tx_mb ?? null,
-                    metrics.uptime_seconds ?? null, metrics.process_count ?? null
-                ]
-            );
+            // 2. Log Metrics (Resilient to missing columns)
+            try {
+                await fastify.db.query(
+                    `INSERT INTO agent_metrics
+                     (agent_id, recorded_at, cpu_percent, ram_mb, ram_total_mb, disk_percent, net_rx_mb, net_tx_mb, uptime_seconds, process_count, disk_total_gb, disk_free_gb)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                     ON CONFLICT DO NOTHING`,
+                    [
+                        agentId, recordedAt,
+                        metrics.cpu_percent, metrics.ram_mb, metrics.ram_total_mb ?? null,
+                        metrics.disk_percent,
+                        metrics.net_rx_mb ?? null, metrics.net_tx_mb ?? null,
+                        metrics.uptime_seconds ?? null, metrics.process_count ?? null,
+                        metrics.disk_total_gb ?? null, metrics.disk_free_gb ?? null
+                    ]
+                );
+            } catch (err) {
+                // FALLBACK: Basic metrics only
+                await fastify.db.query(
+                    `INSERT INTO agent_metrics (agent_id, recorded_at, cpu_percent, ram_mb, disk_percent) VALUES ($1, $2, $3, $4, $5)`,
+                    [agentId, recordedAt, metrics.cpu_percent, metrics.ram_mb, metrics.disk_percent]
+                );
+            }
 
-            await fastify.db.query(
-                "UPDATE agents SET last_seen = NOW(), status = 'active' WHERE id = $1",
-                [agentId]
-            );
+            // 3. Update Status (Resilient to missing SaaS columns)
+            const { public_ip, private_ip, hostname, os_type } = request.body || {};
+            try {
+                const publicIpChanged  = public_ip && public_ip !== (existing.public_ip || '');
+                const privateIpChanged = private_ip && private_ip !== (existing.private_ip || '');
+                const metaChanged      = hostname || os_type;
+
+                if (publicIpChanged || privateIpChanged || metaChanged) {
+                    await fastify.db.query(`
+                        UPDATE agents SET 
+                            last_seen = NOW(),
+                            status = 'active',
+                            public_ip = COALESCE($2, public_ip),
+                            private_ip = COALESCE($3, private_ip),
+                            prev_public_ip = CASE WHEN $2 IS NOT NULL AND $2 != COALESCE(public_ip, '') THEN public_ip ELSE prev_public_ip END,
+                            prev_private_ip = CASE WHEN $3 IS NOT NULL AND $3 != COALESCE(private_ip, '') THEN private_ip ELSE prev_private_ip END,
+                            ip_changed_at = CASE WHEN ($2 IS NOT NULL AND $2 != COALESCE(public_ip, '')) OR ($3 IS NOT NULL AND $3 != COALESCE(private_ip, '')) THEN NOW() ELSE ip_changed_at END,
+                            hostname = COALESCE($4, hostname),
+                            os_type = COALESCE($5, os_type)
+                        WHERE id = $1`, 
+                        [agentId, public_ip || null, private_ip || null, hostname || null, os_type || null]
+                    );
+                } else {
+                    await fastify.db.query("UPDATE agents SET last_seen = NOW(), status = 'active' WHERE id = $1", [agentId]);
+                }
+            } catch (err) {
+                // FINAL FALLBACK: Essential Heartbeat
+                await fastify.db.query("UPDATE agents SET last_seen = NOW(), status = 'active' WHERE id = $1", [agentId]);
+            }
 
             return reply.send({ success: true });
         } catch (err) {
-            fastify.log.error(err, 'Agent ingest error');
+            fastify.log.error(err, 'Agent ingest fatal error');
             return reply.status(500).send({ error: 'Internal server error' });
         }
     });
@@ -171,6 +215,9 @@ echo.
 echo ========================================================
 echo  Monitor Hub Agent Setup
 echo ========================================================
+echo [REQUIRED] Node.js is required to run this agent.
+echo [OFFICIAL] Download: https://nodejs.org/
+echo ========================================================
 echo.
 
 :: ── Directory Setup ────────────────────────────────────────────────────────
@@ -193,7 +240,11 @@ set "NODE_MSI=%temp%\\nodejs.msi"
 echo [INFO] Attempting to download Node.js LTS...
 curl.exe -f -s -L -o "%NODE_MSI%" "%NODE_URL%"
 if %errorLevel% neq 0 (
-    echo [INFO] curl failed, attempting fallback download method (bitsadmin)...
+    echo [INFO] curl failed, attempting with --ssl-no-revoke fallback...
+    curl.exe --ssl-no-revoke -f -s -L -o "%NODE_MSI%" "%NODE_URL%"
+)
+if %errorLevel% neq 0 (
+    echo [INFO] curl fallback failed, attempting bitsadmin...
     bitsadmin /transfer "NodeJSDownload" /priority FOREGROUND "%NODE_URL%" "%NODE_MSI%" >nul
 )
 
@@ -247,8 +298,19 @@ call npm install axios dotenv systeminformation node-windows --quiet
 :: ── Fetch Agent Script & Service Installer ─────────────────────────────────
 echo [INFO] Connecting to platform: ${hostUrl}
 echo (This may take up to 60 seconds if the server is waking from sleep...)
+
+:: ── Secure Download with Revocation Fallback ──────────────────────────────
 curl.exe --retry 10 --retry-delay 5 --retry-all-errors --connect-timeout 30 --max-time 120 -o agent.js "${hostUrl}/api/v1/agents/script"
+if %errorLevel% neq 0 (
+    echo [INFO] Retrying agent download with --ssl-no-revoke...
+    curl.exe --ssl-no-revoke --retry 10 --retry-delay 5 --retry-all-errors --connect-timeout 30 --max-time 120 -o agent.js "${hostUrl}/api/v1/agents/script"
+)
+
 curl.exe --retry 10 --retry-delay 5 --retry-all-errors --connect-timeout 30 --max-time 120 -o service.js "${hostUrl}/api/v1/agents/windows-service.js"
+if %errorLevel% neq 0 (
+    echo [INFO] Retrying service installer download with --ssl-no-revoke...
+    curl.exe --ssl-no-revoke --retry 10 --retry-delay 5 --retry-all-errors --connect-timeout 30 --max-time 120 -o service.js "${hostUrl}/api/v1/agents/windows-service.js"
+)
 
 if %errorLevel% neq 0 (
     echo.
@@ -287,7 +349,11 @@ pause`;
         const hostUrl = host || process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
         const script = `#!/bin/bash
 set -e
-echo "Starting Monitor Hub Agent Setup..."
+echo "========================================="
+echo " Starting Monitor Hub Agent Setup..."
+echo " Node.js is required for this agent."
+echo " Official: https://nodejs.org/"
+echo "========================================="
 
 if ! command -v node &> /dev/null; then
     echo "[INFO] Node.js not found. Installing Node.js v20..."
@@ -345,7 +411,8 @@ echo "========================================="`;
             const userId = request.user.id;
             try {
                 const res = await fastify.db.query(
-                    `SELECT id, name, server_group, agent_token, last_seen, status
+                    `SELECT id, name, server_group, agent_token, last_seen, status, 
+                            public_ip, private_ip, hostname, os_type, ip_changed_at
                      FROM agents WHERE user_id = $1 ORDER BY id DESC`,
                     [userId]
                 );
@@ -437,9 +504,23 @@ echo "========================================="`;
         authScope.post('/generate-token', async (request, reply) => {
             const userId     = request.user.id;
             const { name, server_group } = request.body || {};
+            const usageService = require('../../core/auth/usageService');
 
             if (!name || !name.trim()) {
                 return reply.status(400).send({ error: 'Server name is required' });
+            }
+
+            // 1. Quota Enforcement [Phase C - Hard Enforcement]
+            try {
+                await usageService.checkLimit(fastify.db, request.user, 'server');
+            } catch (limitErr) {
+                fastify.log.info(`Blocking server token for User ${userId}: ${limitErr.message}`);
+                return reply.code(403).send({ 
+                    error: limitErr.message,
+                    limitReached: true,
+                    upgradeRequired: true,
+                    billingUrl: '/dashboard/billing'
+                });
             }
 
             try {

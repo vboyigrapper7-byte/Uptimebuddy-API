@@ -77,6 +77,7 @@ const updateProfile = async (request, reply) => {
     }
 
     try {
+        // Attempt full update
         const res = await request.server.db.query(
             `UPDATE users SET 
                name = COALESCE($1, name),
@@ -84,13 +85,20 @@ const updateProfile = async (request, reply) => {
              WHERE id = $3 RETURNING id, email, name, status_slug, tier, role, created_at`,
             [name?.trim() || null, status_slug?.toLowerCase() || null, request.user.id]
         );
-
-        if (res.rows.length === 0) {
-            return reply.status(404).send({ error: 'User not found' });
-        }
-
         return reply.send({ message: 'Profile updated successfully', user: res.rows[0] });
     } catch (err) {
+        // Fallback: If status_slug column is missing, try updating only the name
+        if (err.code === '42703' || err.message.includes('status_slug')) {
+            try {
+                const res = await request.server.db.query(
+                    'UPDATE users SET name = $1 WHERE id = $2 RETURNING id, email, name, tier, role, created_at',
+                    [name?.trim() || null, request.user.id]
+                );
+                return reply.send({ message: 'Profile updated (Status Page slug unavailable)', user: res.rows[0] });
+            } catch (innerErr) {
+                request.log.error(innerErr);
+            }
+        }
         request.log.error(err, 'Failed to update profile');
         return reply.status(500).send({ error: 'Internal server error while updating profile' });
     }
@@ -229,5 +237,14 @@ const resendOTP = async (request, reply) => {
     }
 };
 
-module.exports = { register, createApiKey, updateProfile, sendOTP, verifyOTP, resendOTP };
+const syncSession = async (request, reply) => {
+    // This route is protected by requireAuth, which already does the sync logic.
+    // We just return the synced user object.
+    return reply.send({
+        message: 'Session synced successfully',
+        user: request.user
+    });
+};
+
+module.exports = { register, createApiKey, updateProfile, sendOTP, verifyOTP, resendOTP, syncSession };
 

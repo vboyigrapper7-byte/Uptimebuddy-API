@@ -5,6 +5,7 @@
 
 const admin = require('../../core/auth/firebase');
 const { validateApiKey } = require('./service');
+const planService = require('../../core/billing/planService');
 
 /**
  * Standard Auth Guard: Validates Firebase ID Token
@@ -23,7 +24,7 @@ async function requireAuth(request, reply) {
         let res;
         try {
             res = await request.server.db.query(
-                'SELECT id, email, role, tier FROM users WHERE email = $1',
+                'SELECT id, email, name, status_slug, role, tier, plan_id, trial_ends_at, plan_expiry, subscription_id FROM users WHERE email = $1',
                 [decodedToken.email]
             );
         } catch (dbErr) {
@@ -36,9 +37,12 @@ async function requireAuth(request, reply) {
             try {
                 const crypto = require('crypto');
                 const placeholderHash = crypto.randomBytes(32).toString('hex');
+                // Determine provider from token (firebase property)
+                const provider = decodedToken.firebase?.sign_in_provider === 'google.com' ? 'google' : 'email';
+                
                 res = await request.server.db.query(
-                    'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id, email, role, tier',
-                    [decodedToken.email, placeholderHash, 'customer']
+                    'INSERT INTO users (email, password_hash, role, provider) VALUES ($1, $2, $3, $4) RETURNING id, email, role, tier, provider',
+                    [decodedToken.email, placeholderHash, 'customer', provider]
                 );
             } catch (insertErr) {
                 request.log.error('Failed to auto-provision user:', insertErr.message);
@@ -81,4 +85,44 @@ async function requireApiKey(request, reply) {
     request.user = user;
 }
 
-module.exports = { requireAuth, requireRole, requireApiKey };
+/**
+ * Plan Guard: Ensures user has required feature access
+ */
+function requirePlan(feature) {
+    return async (request, reply) => {
+        if (!request.user) return reply.status(401).send({ error: 'Auth required' });
+        
+        const hasAccess = planService.canUseFeature(request.user, feature);
+        if (!hasAccess) {
+            return reply.status(403).send({ 
+                error: `Upgrade required: ${feature.replace(/_/g, ' ')} is not available on your current plan.` 
+            });
+        }
+    };
+}
+
+/**
+ * Team Role Guard: Ensures user has specific role within a team context
+ */
+function requireTeamRole(requiredRole) {
+    return async (request, reply) => {
+        const teamId = request.params.teamId || request.body.teamId;
+        if (!teamId) return reply.status(400).send({ error: 'Team ID required' });
+
+        const memberRes = await request.server.db.query(
+            'SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2',
+            [teamId, request.user.id]
+        );
+
+        if (memberRes.rows.length === 0) {
+            return reply.status(403).send({ error: 'Forbidden: Not a member of this team' });
+        }
+
+        const roleLevels = { 'viewer': 1, 'member': 2, 'admin': 3, 'owner': 4 };
+        if (roleLevels[memberRes.rows[0].role] < roleLevels[requiredRole]) {
+            return reply.status(403).send({ error: `Forbidden: Requires ${requiredRole} role` });
+        }
+    };
+}
+
+module.exports = { requireAuth, requireRole, requireApiKey, requirePlan, requireTeamRole };

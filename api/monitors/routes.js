@@ -1,4 +1,4 @@
-const { createMonitor, getMonitors, updateMonitor, deleteMonitor, getMonitorMetrics, getIncidents, testMonitor } = require('./controller');
+const { createMonitor, getMonitors, updateMonitor, deleteMonitor, getMonitorMetrics, getIncidents, testMonitor, toggleMonitorStatus } = require('./controller');
 
 async function monitorRoutes(fastify, options) {
     const { requireAuth } = require('../auth/middleware');
@@ -8,6 +8,7 @@ async function monitorRoutes(fastify, options) {
 
     fastify.post('/',            createMonitor);
     fastify.post('/test',        testMonitor);
+    fastify.post('/:id/toggle',  toggleMonitorStatus);
     fastify.get('/',             getMonitors);
     fastify.put('/:id',          updateMonitor);
     fastify.delete('/:id',       deleteMonitor);
