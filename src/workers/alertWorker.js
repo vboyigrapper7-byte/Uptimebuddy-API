@@ -31,6 +31,28 @@ const alertWorker = new Worker('alert-webhooks', async (job) => {
 
     const { user_id: userId, priority, escalation_state } = monitor;
 
+    // ── 0. Fetch User Settings & Account Email ─────────────────────────────
+    let settings, userEmail;
+    try {
+        const userRes = await pool.query(
+            `SELECT u.email, s.emails_enabled, s.webhooks_enabled 
+             FROM users u 
+             LEFT JOIN alert_settings s ON u.id = s.user_id 
+             WHERE u.id = $1`,
+            [userId]
+        );
+        if (userRes.rows.length > 0) {
+            userEmail = userRes.rows[0].email;
+            settings = userRes.rows[0];
+        }
+    } catch (err) {
+        logger.error(`[AlertWorker] Settings Error: ${err.message}`);
+    }
+
+    // Default to true if no settings record exists yet
+    const emailsEnabled = settings?.emails_enabled !== false;
+    const webhooksEnabled = settings?.webhooks_enabled !== false;
+
     // ── 1. Priority Routing Logic ──────────────────────────────────────────
     // If priority is 'low' and it's a 'down' alert, we might want to delay 
     // or group. For now, let's just log it. 
@@ -67,10 +89,36 @@ const alertWorker = new Worker('alert-webhooks', async (job) => {
         );
     }
 
-    // ── 1. Dispatch System-wide Alerts (Telegram, Email) ───────────────────
+    // ── 1. Dispatch Account Email Alert (If Enabled) ───────────────────────
+    if (emailsEnabled && userEmail) {
+        try {
+            await alertService.sendEmail(job.data, userEmail);
+            console.log(`[AlertWorker] Account email alert dispatched to ${userEmail}`);
+            
+            await pool.query(
+                `INSERT INTO alert_logs (user_id, monitor_id, alert_type, status, provider)
+                 VALUES ($1, $2, $3, $4, $5)`,
+                [userId, monitorId, newStatus, 'success', 'account-email']
+            );
+        } catch (err) {
+            logger.error(`[AlertWorker] Account email failed: ${err.message}`);
+            await pool.query(
+                `INSERT INTO alert_logs (user_id, monitor_id, alert_type, status, error_message, provider)
+                 VALUES ($1, $2, $3, $4, $5, $6)`,
+                [userId, monitorId, newStatus, 'failed', err.message, 'account-email']
+            );
+        }
+    }
+
+    // ── 2. Dispatch System-wide Alerts (Internal Ops) ───────────────────
     await alertService.dispatch(job.data);
 
-    // ── 2. Dispatch Per-user Webhooks (Slack, Discord) ──────────────────────
+    // ── 3. Dispatch Per-user Webhooks (Slack, Discord, Custom) ────────────────
+    if (!webhooksEnabled) {
+        logger.info(`[AlertWorker] Webhooks disabled for user ${userId} — skipping`);
+        return;
+    }
+
     let webhooks;
     try {
         const webhookRes = await pool.query(

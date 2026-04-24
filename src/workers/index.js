@@ -51,3 +51,19 @@ reminderQueue.add(
         jobId: 'system-reminder-job'
     }
 ).then(() => console.log('[Worker] Periodic reminder check job scheduled.'));
+
+// 5. SELF-HEALING: Periodic Sync (Runs every hour)
+// This ensures that if Redis is ever wiped/restarted, the monitors are re-queued automatically.
+const { Queue } = require('bullmq');
+const { redisConnection } = require('../core/queue/setup');
+const syncQueue = new Queue('sync-tasks', { connection: redisConnection });
+
+// Use a simple setInterval or a BullMQ repeat job for the worker itself to trigger sync
+setInterval(async () => {
+    console.log('[Worker] Running periodic self-healing sync...');
+    try {
+        await syncMonitors();
+    } catch (err) {
+        console.error('[Worker] Periodic sync failed:', err);
+    }
+}, 60 * 60 * 1000); // Every 1 hour

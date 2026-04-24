@@ -17,7 +17,7 @@ async function scheduleMonitor(monitor) {
                 jobId: repeatableJobId,
                 removeOnComplete: { count: 10 },
                 removeOnFail: { count: 50 },
-                attempts: 3, // Native BullMQ retries
+                attempts: 11, // High enough to cover user-defined threshold_retries (max 10)
                 backoff: {
                     type: 'exponential',
                     delay: 2000 // Start with 2s delay, then 4s, 8s...

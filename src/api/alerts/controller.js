@@ -2,14 +2,14 @@ const pool = require('../../core/db/pool');
 const { z } = require('zod');
 
 const UpdateSettingsSchema = z.object({
-    on_down:           z.boolean().optional(),
-    on_up:             z.boolean().optional(),
-    on_warning:        z.boolean().optional(),
-    threshold_retries: z.number().int().min(0).max(10).optional(),
-    cooldown_mins:     z.number().int().min(1).max(1440).optional(),
-    reminder_mins:     z.number().int().min(0).max(1440).optional(),
-    emails_enabled:    z.boolean().optional(),
-    webhooks_enabled:  z.boolean().optional()
+    on_down:           z.boolean().nullable().optional(),
+    on_up:             z.boolean().nullable().optional(),
+    on_warning:        z.boolean().nullable().optional(),
+    threshold_retries: z.number().int().min(0).max(10).nullable().optional(),
+    cooldown_mins:     z.number().int().min(1).max(1440).nullable().optional(),
+    reminder_mins:     z.number().int().min(0).max(1440).nullable().optional(),
+    emails_enabled:    z.boolean().nullable().optional(),
+    webhooks_enabled:  z.boolean().nullable().optional()
 });
 
 const getAlertSettings = async (request, reply) => {
@@ -54,7 +54,17 @@ const updateAlertSettings = async (request, reply) => {
         const result = await pool.query(
             `INSERT INTO alert_settings 
                 (user_id, on_down, on_up, on_warning, threshold_retries, cooldown_mins, reminder_mins, emails_enabled, webhooks_enabled)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             VALUES (
+                $1, 
+                COALESCE($2, TRUE), 
+                COALESCE($3, TRUE), 
+                COALESCE($4, FALSE), 
+                COALESCE($5, 3), 
+                COALESCE($6, 5), 
+                COALESCE($7, 30), 
+                COALESCE($8, TRUE), 
+                COALESCE($9, TRUE)
+             )
              ON CONFLICT (user_id) DO UPDATE SET
                 on_down = COALESCE($2, alert_settings.on_down),
                 on_up = COALESCE($3, alert_settings.on_up),

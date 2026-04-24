@@ -42,8 +42,9 @@ workerRedisConnection.on('connect', () => {
 const jobOptions = {
     attempts: 3,
     backoff: { type: 'exponential', delay: 2000 },
-    removeOnComplete: true,
-    removeOnFail: 100
+    // Keep last 100 completed and 200 failed jobs for debugging/audit
+    removeOnComplete: { count: 100 },
+    removeOnFail: { count: 200 }
 };
 
 const monitorQueue   = new Queue('monitor-checks',  { connection: redisConnection, defaultJobOptions: jobOptions });

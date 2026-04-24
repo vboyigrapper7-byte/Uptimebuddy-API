@@ -151,7 +151,13 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
 
     // ── Update Metrics & State ──────────────────────────────────────────────
     const recordedAt = new Date();
-    const maxAttempts = job.opts.attempts || 1;
+    
+    // Respect user-defined threshold retries from alert_settings
+    const userThreshold = (monitor.threshold_retries !== undefined && monitor.threshold_retries !== null) 
+        ? monitor.threshold_retries 
+        : (job.opts.attempts || 3);
+    
+    const maxAttempts = userThreshold;
     const isLastAttempt = job.attemptsMade + 1 >= maxAttempts;
 
     // 1. Determine "Confirmed" status for alerting

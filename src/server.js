@@ -112,16 +112,22 @@ const buildServer = async () => {
             status: 'ok',
             service: 'monitorhub-api',
             database: 'unknown',
+            redis: 'unknown',
             table_check: 'unknown',
             error: null
         };
 
         try {
-            // Check connection
+            // 1. Check Postgres
             await pool.query('SELECT 1');
             diagnostics.database = 'connected';
             
-            // Check for users table
+            // 2. Check Redis (Crucial for Upstash Keep-Alive)
+            const { redisConnection } = require('./core/queue/setup');
+            const redisStatus = await redisConnection.ping();
+            diagnostics.redis = redisStatus === 'PONG' ? 'connected' : 'unresponsive';
+
+            // 3. Check for users table
             await pool.query('SELECT id FROM users LIMIT 1');
             diagnostics.table_check = 'users table exists';
             
@@ -130,7 +136,7 @@ const buildServer = async () => {
             diagnostics.status = 'error';
             diagnostics.database = 'disconnected';
             diagnostics.error = err.message;
-            diagnostics.hint = "Check if DATABASE_URL is correct and schema.sql has been run.";
+            diagnostics.hint = "Check if DATABASE_URL/REDIS_URL are correct.";
             return reply.code(503).send(diagnostics);
         }
     });
