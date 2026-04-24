@@ -27,7 +27,7 @@ async function enforceRetention() {
 
         // 2. Mark new metrics for deletion based on Tier Allowance
         for (const [tierKey, config] of Object.entries(PLAN_TIERS)) {
-            const days = config.retentionDays;
+            const days = Math.min(config.retentionDays || 14, 14); // Force max 14 days for safety in this pass
             
             // Mark monitor metrics
             const monitorRes = await client.query(
@@ -37,7 +37,7 @@ async function enforceRetention() {
                  JOIN users u ON m.user_id = u.id
                  WHERE mm.monitor_id = m.id
                  AND u.tier = $1
-                 AND mm.recorded_at < NOW() - INTERVAL '${days} days'
+                 AND mm.recorded_at < NOW() - INTERVAL '14 days'
                  AND mm.deletion_scheduled_at IS NULL`,
                 [tierKey]
             );

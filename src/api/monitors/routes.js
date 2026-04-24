@@ -6,8 +6,13 @@ async function monitorRoutes(fastify, options) {
     // All monitor routes require authentication
     fastify.addHook('onRequest', requireAuth);
 
-    fastify.post('/',            createMonitor);
-    fastify.post('/test',        testMonitor);
+    fastify.post('/', { 
+        config: { rateLimit: { max: 5, timeWindow: '1 minute' } }
+    }, createMonitor);
+    
+    fastify.post('/test', { 
+        config: { rateLimit: { max: 10, timeWindow: '1 minute' } }
+    }, testMonitor);
     fastify.post('/:id/toggle',  toggleMonitorStatus);
     fastify.get('/',             getMonitors);
     fastify.put('/:id',          updateMonitor);

@@ -17,6 +17,11 @@ async function scheduleMonitor(monitor) {
                 jobId: repeatableJobId,
                 removeOnComplete: { count: 10 },
                 removeOnFail: { count: 50 },
+                attempts: 3, // Native BullMQ retries
+                backoff: {
+                    type: 'exponential',
+                    delay: 2000 // Start with 2s delay, then 4s, 8s...
+                }
             }
         );
         console.log(`[Scheduler] Queued monitor ${monitor.id} | Interval: ${monitor.interval_seconds}s`);

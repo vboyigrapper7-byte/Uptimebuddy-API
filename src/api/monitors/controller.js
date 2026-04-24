@@ -3,6 +3,7 @@ const { scheduleMonitor, unscheduleMonitor } = require('../../core/queue/schedul
 const { z } = require('zod');
 const axios = require('axios');
 const usageService = require('../../core/auth/usageService');
+const { getSafeAxiosConfig } = require('../../core/utils/ssrf');
 
 // ── SSRF blocklist — private/loopback IP ranges ───────────────────────────
 const PRIVATE_IP_RE = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|::1|0\.0\.0\.0)/i;
@@ -134,11 +135,12 @@ const getMonitors = async (request, reply) => {
     try {
         const result = await request.server.db.query(
             `SELECT m.*,
-                    (SELECT recorded_at FROM monitor_metrics WHERE monitor_id = m.id ORDER BY recorded_at DESC LIMIT 1) as last_checked,
-                    (SELECT ROUND(AVG(response_time_ms)) FROM monitor_metrics WHERE monitor_id = m.id AND recorded_at > NOW() - INTERVAL '24 hours') as avg_latency,
-                    (SELECT ROUND(CAST(COUNT(*) FILTER (WHERE status = 'up') AS NUMERIC) / GREATEST(COUNT(*), 1) * 100, 2) 
-                     FROM monitor_metrics WHERE monitor_id = m.id AND recorded_at > NOW() - INTERVAL '24 hours') as uptime
-             FROM monitors m WHERE user_id = $1
+                    m.last_checked,
+                    ms.avg_latency_24h as avg_latency,
+                    ms.uptime_24h as uptime
+             FROM monitors m 
+             LEFT JOIN monitor_stats ms ON m.id = ms.monitor_id
+             WHERE user_id = $1
              ORDER BY created_at DESC
              LIMIT $2 OFFSET $3`,
             [userId, limit, offset]
@@ -247,7 +249,12 @@ const getMonitorMetrics = async (request, reply) => {
 
     try {
         const verify = await request.server.db.query(
-            'SELECT id, name, type, target, keyword, interval_seconds, method, headers, body, timeout_ms, max_retries, expected_status, threshold_ms, region, status, priority, assertion_config FROM monitors WHERE id = $1 AND user_id = $2',
+            `SELECT m.*,
+                    ms.uptime_24h as uptime_24h,
+                    ms.avg_latency_24h as avg_latency_24h
+             FROM monitors m 
+             LEFT JOIN monitor_stats ms ON m.id = ms.monitor_id
+             WHERE id = $1 AND user_id = $2`,
             [id, userId]
         );
         if (verify.rows.length === 0) return reply.code(404).send({ error: 'Monitor not found' });
@@ -268,22 +275,14 @@ const getMonitorMetrics = async (request, reply) => {
         );
 
         const metrics = res.rows.reverse();
-        
-        // ── Uptime Calculation Logic ──────────────────────────────────────────
-        let uptime = 100;
-        let avgResponseTime = 0;
-        if (metrics.length > 0) {
-            const upCount = metrics.filter(m => m.status === 'up').length;
-            uptime = parseFloat(((upCount / metrics.length) * 100).toFixed(2));
-            
-            const totalTime = metrics.reduce((acc, curr) => acc + (curr.response_time_ms || 0), 0);
-            avgResponseTime = Math.round(totalTime / metrics.length);
-        }
 
         return reply.send({ 
             monitor: verify.rows[0], 
             metrics,
-            stats: { uptime, avgResponseTime }
+            stats: { 
+                uptime: verify.rows[0].uptime_24h || 100, 
+                avgResponseTime: verify.rows[0].avg_latency_24h || 0 
+            }
         });
     } catch (error) {
         request.log.error(error, 'getMonitorMetrics error');
@@ -374,7 +373,8 @@ const testMonitor = async (request, reply) => {
             maxRedirects: 5,
             maxContentLength: 5 * 1024 * 1024, // 5MB limit
             responseType: 'text', // Get raw text to calculate size accurately
-            transformResponse: [(data) => data] // Don't auto-parse JSON on backend so we can control it on frontend
+            transformResponse: [(data) => data], // Don't auto-parse JSON on backend so we can control it on frontend
+            ...getSafeAxiosConfig() // SSRF Protection
         });
         
         const time = Date.now() - startTime;

@@ -7,6 +7,7 @@ const pool                = require('../core/db/pool');
 const planService         = require('../core/billing/planService');
 const logger              = require('../core/utils/logger');
 const { workerRedisConnection, alertQueue } = require('../core/queue/setup');
+const { getSafeAxiosConfig } = require('../core/utils/ssrf');
 
 // ── TCP Ping wrapper ──────────────────────────────────────────────────────
 const pingPromise = (target, port) =>
@@ -103,6 +104,7 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
                 validateStatus: null,
                 maxRedirects: 5,
                 maxContentLength: 5 * 1024 * 1024,
+                ...getSafeAxiosConfig() // SSRF Protection
             });
             
             statusCode = res.status;
@@ -150,75 +152,57 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
         [monitorId, recordedAt, responseTime, status, statusCode, errorMessage]
     );
 
-    // ── Update monitor current status ────────────────────────────────────
-    await pool.query('UPDATE monitors SET status = $1 WHERE id = $2', [status, monitorId]);
+    // ── Update monitor current status & last_checked ─────────────────────
+    await pool.query('UPDATE monitors SET status = $1, last_checked = $2 WHERE id = $3', [status, recordedAt, monitorId]);
 
-    // ── Edge detection — only alert on status CHANGE, with confirmation ──────
+    // ── Edge detection & Alerting ─────────────────────────────────────────
+    // If status is 'down' and we still have attempts left, throw error to trigger BullMQ retry
+    // This makes the retry non-blocking for the worker thread.
+    const maxAttempts = job.opts.attempts || 1;
+    const isLastAttempt = job.attemptsMade + 1 >= maxAttempts;
+
+    if (status === 'down' && !isLastAttempt) {
+        console.log(`[CheckWorker] Monitor ${monitorId} is DOWN (Attempt ${job.attemptsMade + 1}/${maxAttempts}) — triggering native retry`);
+        throw new Error(errorMessage || 'Monitor check failed');
+    }
+
+    // Only alert on status CHANGE from the previous stable status
     if (prev_status && prev_status !== 'pending' && prev_status !== status) {
-        console.log(`[CheckWorker] Status change: ${prev_status} → ${status} for monitor ${monitorId}`);
+        console.log(`[CheckWorker] Confirmed status change: ${prev_status} → ${status} for monitor ${monitorId}`);
 
-        // If status went down, verify it at least X more times to confirm a "Real Outage"
-        let finalStatus = status;
-        const retryCount = max_retries || 2;
-        if (status === 'down' && retryCount > 0) {
-            console.log(`[CheckWorker] Down detected — initiating verification pass (${retryCount} retries) for monitor ${monitorId}`);
-            let failures = 1;
-            for (let i = 0; i < retryCount; i++) {
-                // Wait 2 seconds between verification checks
-                await new Promise(r => setTimeout(r, 2000));
-                const verifyRes = await performCheck(type, target, keyword, method, headers, body, timeout_ms, expected_status);
-                if (verifyRes.status === 'down') {
-                    failures++;
-                } else {
-                    finalStatus = 'up'; // Recovered during verification
-                    break;
-                }
-            }
-            // Only confirm outage if ALL checks failed
-            if (failures < (retryCount + 1)) {
-                console.log(`[CheckWorker] Monitor ${monitorId} recovered during verification (${failures}/${retryCount + 1} failures) — not alerting`);
-                finalStatus = 'up';
-            }
-        }
+        const canAlert = await shouldSendAlert(monitorId, status);
+        if (canAlert) {
+            await alertQueue.add(
+                `alert-${monitorId}-${Date.now()}`,
+                { 
+                    monitorId, 
+                    target, 
+                    previousStatus: prev_status, 
+                    newStatus: status, 
+                    errorMessage, 
+                    responseTime,
+                    threshold_ms,
+                    region,
+                    timestamp: recordedAt.toISOString() 
+                },
+                { removeOnComplete: { count: 100 }, removeOnFail: { count: 50 } }
+            );
 
-        if (prev_status !== finalStatus) {
-            const canAlert = await shouldSendAlert(monitorId, finalStatus);
-            if (canAlert) {
-                await alertQueue.add(
-                    `alert-${monitorId}-${Date.now()}`,
-                    { 
-                        monitorId, 
-                        target, 
-                        previousStatus: prev_status, 
-                        newStatus: finalStatus, 
-                        errorMessage, 
-                        responseTime,
-                        threshold_ms,
-                        region,
-                        timestamp: recordedAt.toISOString() 
-                    },
-                    { removeOnComplete: { count: 100 }, removeOnFail: { count: 50 } }
+            // Record incident in DB for history view
+            if (status === 'down') {
+                await pool.query(
+                    'INSERT INTO incidents (monitor_id, started_at, error_message) VALUES ($1, $2, $3)',
+                    [monitorId, recordedAt, errorMessage]
                 );
-
-                // Record incident in DB for history view
-                if (finalStatus === 'down') {
-                    await pool.query(
-                        'INSERT INTO incidents (monitor_id, started_at, error_message) VALUES ($1, $2, $3)',
-                        [monitorId, recordedAt, errorMessage]
-                    );
-                } else if (finalStatus === 'up') {
-                    // Resolve the most recent open incident for this monitor
-                    await pool.query(
-                        `UPDATE incidents SET resolved_at = $1
-                         WHERE monitor_id = $2 AND resolved_at IS NULL
-                         ORDER BY started_at DESC
-                         LIMIT 1`,
-                        [recordedAt, monitorId]
-                    );
-                }
+            } else if (status === 'up') {
+                await pool.query(
+                    `UPDATE incidents SET resolved_at = $1
+                     WHERE monitor_id = $2 AND resolved_at IS NULL
+                     ORDER BY started_at DESC
+                     LIMIT 1`,
+                    [recordedAt, monitorId]
+                );
             }
-            // Update final status in DB
-            await pool.query('UPDATE monitors SET status = $1 WHERE id = $2', [finalStatus, monitorId]);
         }
     }
 }, {
@@ -242,7 +226,8 @@ async function performCheck(type, target, keyword, method, headers, body, timeou
                 headers: { ...parsedHeaders, 'User-Agent': 'MonitorHub-Monitor/2.0' },
                 data: body,
                 timeout: timeout_ms || 30000,
-                validateStatus: null
+                validateStatus: null,
+                ...getSafeAxiosConfig() // SSRF Protection
             });
             
             const isStatusOk = isStatusExpected(res.status, expected_status);
