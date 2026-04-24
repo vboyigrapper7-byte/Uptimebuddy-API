@@ -240,7 +240,11 @@ set "NODE_MSI=%temp%\\nodejs.msi"
 echo [INFO] Attempting to download Node.js LTS...
 curl.exe -f -s -L -o "%NODE_MSI%" "%NODE_URL%"
 if %errorLevel% neq 0 (
-    echo [INFO] curl failed, attempting fallback download method (bitsadmin)...
+    echo [INFO] curl failed, attempting with --ssl-no-revoke fallback...
+    curl.exe --ssl-no-revoke -f -s -L -o "%NODE_MSI%" "%NODE_URL%"
+)
+if %errorLevel% neq 0 (
+    echo [INFO] curl fallback failed, attempting bitsadmin...
     bitsadmin /transfer "NodeJSDownload" /priority FOREGROUND "%NODE_URL%" "%NODE_MSI%" >nul
 )
 
@@ -289,18 +293,39 @@ echo [SUCCESS] Node.js installed and verified.
 echo [INFO] Initializing agent environment...
 call npm init -y >nul
 echo [INFO] Installing local dependencies...
-call npm install axios dotenv systeminformation node-windows --quiet
+call npm install axios dotenv systeminformation node-windows https-proxy-agent --quiet
 
 :: ── Fetch Agent Script & Service Installer ─────────────────────────────────
 echo [INFO] Connecting to platform: ${hostUrl}
-echo (This may take up to 60 seconds if the server is waking from sleep...)
-curl.exe --retry 10 --retry-delay 5 --retry-all-errors --connect-timeout 30 --max-time 120 -o agent.js "${hostUrl}/api/v1/agents/script"
-curl.exe --retry 10 --retry-delay 5 --retry-all-errors --connect-timeout 30 --max-time 120 -o service.js "${hostUrl}/api/v1/agents/windows-service.js"
 
+:: ── Secure Download with Revocation & Bitsadmin Fallback ──────────────────
+:: Attempt 1: Standard Curl (Fast)
+curl.exe --connect-timeout 15 --max-time 30 -o agent.js "${hostUrl}/api/v1/agents/script"
 if %errorLevel% neq 0 (
+    echo [INFO] Curl failed or SSL revocation issue detected. Retrying with --ssl-no-revoke...
+    curl.exe --ssl-no-revoke --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 --max-time 120 -o agent.js "${hostUrl}/api/v1/agents/script"
+)
+if %errorLevel% neq 0 (
+    echo [INFO] Curl fallback failed. Attempting bitsadmin for agent.js...
+    bitsadmin /transfer "AgentDownload" /priority FOREGROUND "${hostUrl}/api/v1/agents/script" "%cd%\\agent.js" >nul
+)
+
+:: Repeat for Service Installer
+curl.exe --connect-timeout 15 --max-time 30 -o service.js "${hostUrl}/api/v1/agents/windows-service.js"
+if %errorLevel% neq 0 (
+    echo [INFO] Initial connection failed. Retrying with --ssl-no-revoke...
+    curl.exe --ssl-no-revoke --retry 5 --retry-delay 5 --retry-all-errors --connect-timeout 30 --max-time 120 -o service.js "${hostUrl}/api/v1/agents/windows-service.js"
+)
+if %errorLevel% neq 0 (
+    echo [INFO] Curl fallback failed. Attempting bitsadmin for service.js...
+    bitsadmin /transfer "ServiceDownload" /priority FOREGROUND "${hostUrl}/api/v1/agents/windows-service.js" "%cd%\\service.js" >nul
+)
+
+if not exist "agent.js" (
     echo.
-    echo [ERROR] Could not download agent from Monitor Hub Platform!
+    echo [ERROR] CRITICAL: Could not download agent from Monitor Hub Platform!
     echo [INFO] Target: ${hostUrl}
+    echo [HINT] Ensure your firewall allows outbound traffic to ${hostUrl}
     pause
     exit /b 1
 )
@@ -358,7 +383,6 @@ npm install axios dotenv systeminformation
 echo "Installing PM2 globally..."
 npm install -g pm2
 echo "Connecting to platform: ${hostUrl}"
-echo "(This may take up to 60 seconds if the server is waking from sleep...)"
 curl --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 30 --max-time 120 -o agent.js "${hostUrl}/api/v1/agents/script"
 if [ $? -ne 0 ]; then
     echo "[ERROR] Could not download agent from Monitor Hub Platform!"

@@ -155,13 +155,25 @@ async function sendMetrics() {
         const data = await collectMetrics();
         const { cpu_percent, ram_mb, disk_percent, net_rx_mb, net_tx_mb, uptime_seconds } = data.metrics;
 
-        const headers = { 
-            'Content-Type': 'application/json', 
-            'User-Agent':   'MonitorHub-Agent/3.0',
-            'X-Agent-Token': AGENT_TOKEN,
-        };
+        const proxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
+        let httpsAgent = null;
 
-        await axios.post(INGEST_URL, data, { timeout: 8000, headers });
+        if (proxy) {
+            try {
+                const { HttpsProxyAgent } = require('https-proxy-agent');
+                httpsAgent = new HttpsProxyAgent(proxy);
+            } catch (e) {
+                // Agent not installed yet, will skip proxy for this attempt
+            }
+        }
+
+        await axios.post(INGEST_URL, data, { 
+            timeout: 10000, 
+            headers, 
+            httpsAgent,
+            // Allow bypassing local MITM issues if specifically configured
+            rejectUnauthorized: process.env.NODE_TLS_REJECT_UNAUTHORIZED !== '0'
+        });
 
         const ts = new Date().toISOString();
         console.log(`[${ts}] ✓ CPU: ${cpu_percent}% | RAM: ${ram_mb}MB | Disk: ${disk_percent}% | Net↓${net_rx_mb}MB ↑${net_tx_mb}MB | Up: ${Math.floor(uptime_seconds/3600)}h`);
