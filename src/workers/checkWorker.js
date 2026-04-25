@@ -27,7 +27,10 @@ const ALERT_COOLDOWN_MS = 60 * 1000; // 1 minute global cooldown per monitor
  * Enhanced Alert Cooldown
  * Prevents alert spam by ensuring at least 1 minute between ANY two alerts for the same monitor.
  */
-async function canSendAlert(monitorId, customCooldownMins) {
+async function canSendAlert(monitorId, newStatus, customCooldownMins) {
+    // Recovery alerts (up) should always be dispatched immediately
+    if (newStatus === 'up') return true;
+
     const res = await pool.query(
         'SELECT last_alert_at FROM monitors WHERE id = $1',
         [monitorId]
@@ -186,9 +189,29 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
     const hasStatusChanged = prev_status !== confirmedStatus;
     
     if (hasStatusChanged || isFirstCheck) {
-        // ── Smart Alerting Logic ──────────────────────────────────────────
-        // 1. Determine if we SHOULD alert based on global settings & toggles
-        let shouldAlert = hasStatusChanged && !isFirstCheck && alerts_enabled !== false;
+        // ── 1. Incident Management (Always track, regardless of alert settings) ─────
+        if (confirmedStatus === 'down' && prev_status !== 'down') {
+            // New outage started
+            await pool.query(
+                'INSERT INTO incidents (monitor_id, started_at, error_message) VALUES ($1, $2, $3)',
+                [monitorId, recordedAt, errorMessage]
+            );
+        } else if (confirmedStatus === 'up' && prev_status === 'down') {
+            // Outage resolved
+            await pool.query(
+                'UPDATE incidents SET resolved_at = $1 WHERE monitor_id = $2 AND resolved_at IS NULL',
+                [recordedAt, monitorId]
+            );
+        }
+
+        // ── 2. Smart Alerting Logic ──────────────────────────────────────────
+        // Determine if we SHOULD alert based on global settings & toggles
+        // We now allow alerts on isFirstCheck if the status is NOT 'up' (Discovery Alert)
+        let shouldAlert = alerts_enabled !== false;
+
+        if (isFirstCheck && confirmedStatus === 'up') {
+            shouldAlert = false; // Don't alert for healthy monitors on their first run
+        }
 
         if (shouldAlert) {
             // Respect user-defined triggers (on_down, on_up, on_warning)
@@ -198,7 +221,7 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
         }
 
         if (shouldAlert) {
-            const allowedToAlert = await canSendAlert(monitorId, cooldown_mins);
+            const allowedToAlert = await canSendAlert(monitorId, confirmedStatus, cooldown_mins);
             if (allowedToAlert) {
                 console.log(`[CheckWorker] Dispatching alert: ${prev_status} → ${confirmedStatus} for monitor ${monitorId}`);
                 
@@ -216,30 +239,17 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
                     { removeOnComplete: { count: 100 } }
                 );
 
-                // Record incident or resolve
-                if (confirmedStatus === 'down') {
-                    await pool.query(
-                        'INSERT INTO incidents (monitor_id, started_at, error_message) VALUES ($1, $2, $3)',
-                        [monitorId, recordedAt, errorMessage]
-                    );
-                } else if (prev_status === 'down') {
-                    await pool.query(
-                        'UPDATE incidents SET resolved_at = $1 WHERE monitor_id = $2 AND resolved_at IS NULL',
-                        [recordedAt, monitorId]
-                    );
-                }
-
                 // Update DB with confirmed status and record the alert time
                 await pool.query(
                     'UPDATE monitors SET status = $1, last_checked = $2, last_alert_at = $3 WHERE id = $4',
                     [confirmedStatus, recordedAt, recordedAt, monitorId]
                 );
             } else {
-                // Cooldown active — update status but don't alert
+                // Cooldown active — update status but don't record as last_alert_at
                 await pool.query('UPDATE monitors SET status = $1, last_checked = $2 WHERE id = $3', [confirmedStatus, recordedAt, monitorId]);
             }
         } else {
-            // No alert needed (e.g. first check or alerts disabled), just update status
+            // No alert needed (e.g. alerts disabled), just update status
             await pool.query('UPDATE monitors SET status = $1, last_checked = $2 WHERE id = $3', [confirmedStatus, recordedAt, monitorId]);
         }
     } else {
