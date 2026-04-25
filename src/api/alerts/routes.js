@@ -5,7 +5,7 @@ async function alertRoutes(fastify, options) {
     fastify.addHook('onRequest', requireAuth);
 
     fastify.get('/settings', getAlertSettings);
-    fastify.patch('/settings', updateAlertSettings);
+    fastify.put('/settings', updateAlertSettings);
     fastify.get('/history', getAlertLogs);
     fastify.post('/test-email', testEmailAlert);
     fastify.post('/test-webhook', testWebhookAlert);
