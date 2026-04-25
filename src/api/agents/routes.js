@@ -105,12 +105,13 @@ async function agentRoutes(fastify, options) {
 
             // 3. Update Status (Resilient to missing SaaS columns)
             const { public_ip, private_ip, hostname, os_type } = request.body || {};
+            
             try {
                 const publicIpChanged  = public_ip && public_ip !== (existing.public_ip || '');
                 const privateIpChanged = private_ip && private_ip !== (existing.private_ip || '');
-                const metaChanged      = hostname || os_type;
+                const metaChanged      = hostname || os_type || agent_version;
 
-                if (publicIpChanged || privateIpChanged || metaChanged || agent_version) {
+                if (metaChanged || publicIpChanged || privateIpChanged) {
                     await fastify.db.query(`
                         UPDATE agents SET 
                             last_seen = NOW(),
@@ -493,6 +494,22 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
         const scriptPath = path.resolve(__dirname, '../../../uptimebuddy-agent.py');
         const content = await fs.promises.readFile(scriptPath, 'utf-8');
         return reply.type('text/plain').send(content);
+    });
+
+    // ────────────────────────────────────────────────────────────────────
+    // PROFESSIONAL MSI DISTRIBUTION
+    // ────────────────────────────────────────────────────────────────────
+    fastify.get('/install_windows.msi', async (request, reply) => {
+        const { token } = request.query;
+        const msiPath = path.resolve(__dirname, '../../../MonitorHubAgent.msi');
+        
+        if (fs.existsSync(msiPath)) {
+            return reply.download('MonitorHubAgent.msi');
+        } else {
+            // Fallback to professional .bat if MSI is not built/uploaded yet
+            const hostUrl = process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
+            return reply.redirect(`${hostUrl}/api/v1/agents/install_windows.bat?token=${token}`);
+        }
     });
 
     // ────────────────────────────────────────────────────────────────────
