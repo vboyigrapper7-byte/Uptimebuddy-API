@@ -49,6 +49,8 @@ async function agentRoutes(fastify, options) {
     }, async (request, reply) => {
         // Extract agent_token from header (preferred) or body (legacy)
         const agent_token = request.headers['x-agent-token'] || request.body?.agent_token;
+        const agent_type  = request.headers['x-agent-type']  || request.body?.agent_type || 'node';
+        const agent_version = request.headers['x-agent-version'] || request.body?.agent_version;
         const { metrics } = request.body || {};
 
         if (!agent_token || !metrics) {
@@ -108,11 +110,13 @@ async function agentRoutes(fastify, options) {
                 const privateIpChanged = private_ip && private_ip !== (existing.private_ip || '');
                 const metaChanged      = hostname || os_type;
 
-                if (publicIpChanged || privateIpChanged || metaChanged) {
+                if (publicIpChanged || privateIpChanged || metaChanged || agent_version) {
                     await fastify.db.query(`
                         UPDATE agents SET 
                             last_seen = NOW(),
                             status = 'active',
+                            agent_type = $6,
+                            agent_version = COALESCE($7, agent_version),
                             public_ip = COALESCE($2, public_ip),
                             private_ip = COALESCE($3, private_ip),
                             prev_public_ip = CASE WHEN $2 IS NOT NULL AND $2 != COALESCE(public_ip, '') THEN public_ip ELSE prev_public_ip END,
@@ -121,17 +125,28 @@ async function agentRoutes(fastify, options) {
                             hostname = COALESCE($4, hostname),
                             os_type = COALESCE($5, os_type)
                         WHERE id = $1`, 
-                        [agentId, public_ip || null, private_ip || null, hostname || null, os_type || null]
+                        [agentId, public_ip || null, private_ip || null, hostname || null, os_type || null, agent_type, agent_version || null]
                     );
                 } else {
                     await fastify.db.query("UPDATE agents SET last_seen = NOW(), status = 'active' WHERE id = $1", [agentId]);
                 }
             } catch (err) {
                 // FINAL FALLBACK: Essential Heartbeat
-                await fastify.db.query("UPDATE agents SET last_seen = NOW(), status = 'active' WHERE id = $1", [agentId]);
+                await fastify.db.query("UPDATE agents SET last_seen = NOW(), status = 'active', agent_type = $2 WHERE id = $1", [agentId, agent_type]);
             }
 
-            return reply.send({ success: true });
+            // 4. Check for Updates (Optional feature for Go agent)
+            let update_available = null;
+            if (agent_type === 'go' && agent_version) {
+                try {
+                    const latestRes = await fastify.db.query('SELECT version FROM agent_releases WHERE is_stable = true ORDER BY created_at DESC LIMIT 1');
+                    if (latestRes.rows.length > 0 && latestRes.rows[0].version !== agent_version) {
+                        update_available = latestRes.rows[0].version;
+                    }
+                } catch (e) { /* ignore manifest errors */ }
+            }
+
+            return reply.send({ success: true, update_available });
         } catch (err) {
             fastify.log.error(err, 'Agent ingest fatal error');
             return reply.status(500).send({ error: 'Internal server error' });
@@ -362,6 +377,137 @@ pause`;
             .type('application/octet-stream')
             .header('Content-Disposition', 'attachment; filename="setup_monitorhub_windows.bat"')
             .send(script);
+    });
+
+    // ────────────────────────────────────────────────────────────────────
+    // PUBLIC — Agent Distribution (Go Agent)
+    // ────────────────────────────────────────────────────────────────────
+    
+    // 1. Version Manifest (Latest or Specific)
+    fastify.get('/manifest/:version', {
+        config: { rateLimit: { max: 100, timeWindow: '1 minute' } }
+    }, async (request, reply) => {
+        const { version } = request.params;
+        
+        try {
+            let query = 'SELECT * FROM agent_releases WHERE is_stable = true ';
+            let params = [];
+            
+            if (version === 'latest') {
+                query += 'ORDER BY created_at DESC LIMIT 1';
+            } else {
+                query += 'AND version = $1 LIMIT 1';
+                params.push(version);
+            }
+
+            const releaseRes = await fastify.db.query(query, params);
+            if (releaseRes.rows.length === 0) return reply.status(404).send({ error: 'Release not found' });
+
+            const release = releaseRes.rows[0];
+            
+            // ── Rollout Control Logic ─────────────────────────────────────────
+            // If it's a 'latest' request and the release has a rollout percentage
+            if (version === 'latest' && release.rollout_percentage < 100) {
+                // Simple deterministic hash-based rollout (sticky per agent)
+                const agentToken = request.headers['x-agent-token'];
+                if (agentToken) {
+                    const hash = crypto.createHash('md5').update(agentToken).digest('hex');
+                    const bucket = parseInt(hash.substring(0, 2), 16) % 100;
+                    if (bucket >= release.rollout_percentage) {
+                        // Not in rollout group — find previous stable release
+                        const prevRes = await fastify.db.query(
+                            'SELECT * FROM agent_releases WHERE is_stable = true AND created_at < $1 ORDER BY created_at DESC LIMIT 1',
+                            [release.created_at]
+                        );
+                        if (prevRes.rows.length > 0) {
+                            return reply.send(await buildManifest(fastify, prevRes.rows[0]));
+                        }
+                    }
+                }
+            }
+
+            const manifest = await buildManifest(fastify, release);
+            
+            // ── CDN / Caching Headers ─────────────────────────────────────────
+            reply.header('Cache-Control', 'public, max-age=600'); // 10 mins
+            reply.header('ETag', `"${release.version}-${release.id}"`);
+
+            return reply.send(manifest);
+        } catch (err) {
+            fastify.log.error(err, 'Manifest error');
+            return reply.status(500).send({ error: 'Internal server error' });
+        }
+    });
+
+    // Alias for /manifest/latest
+    fastify.get('/manifest', (req, res) => res.redirect('/api/v1/agents/manifest/latest'));
+
+    async function buildManifest(fastify, release) {
+        const binaryRes = await fastify.db.query('SELECT os, arch, sha256 FROM agent_binaries WHERE release_id = $1', [release.id]);
+        const platforms = {};
+        binaryRes.rows.forEach(b => {
+            platforms[`${b.os}-${b.arch}`] = {
+                url: `/api/v1/agents/bin/${b.os}/${b.arch}?v=${release.version}`,
+                sha256: b.sha256
+            };
+        });
+        return {
+            version: release.version,
+            stable: release.is_stable,
+            release_notes: release.release_notes,
+            rollout: {
+                enabled: release.rollout_percentage < 100,
+                percentage: release.rollout_percentage || 100
+            },
+            platforms
+        };
+    }
+
+    // 2. Binary Download
+    fastify.get('/bin/:os/:arch', {
+        config: { rateLimit: { max: 20, timeWindow: '1 minute' } }
+    }, async (request, reply) => {
+        const { os, arch } = request.params;
+        
+        try {
+            const res = await fastify.db.query(`
+                SELECT b.file_path, b.id, b.sha256 
+                FROM agent_binaries b
+                JOIN agent_releases r ON b.release_id = r.id
+                WHERE r.is_stable = true AND b.os = $1 AND b.arch = $2
+                ORDER BY r.created_at DESC LIMIT 1
+            `, [os, arch]);
+
+            if (res.rows.length === 0) return reply.status(404).send({ error: 'Binary not found' });
+
+            const binary = res.rows[0];
+            
+            // ── CDN Headers ───────────────────────────────────────────────────
+            reply.header('Cache-Control', 'public, max-age=86400'); // 24 hours for immutable binaries
+            reply.header('Content-Disposition', `attachment; filename="monitorhub-agent-${os}-${arch}"`);
+            
+            // Increment download count (async)
+            fastify.db.query('UPDATE agent_binaries SET download_count = download_count + 1 WHERE id = $1', [binary.id]).catch(() => {});
+
+            // Log download to audit (optional)
+            fastify.log.info(`[AgentDistribution] Download: ${os}/${arch}`);
+
+            if (binary.file_path.startsWith('http')) {
+                // Production: Redirect to S3/CDN
+                return reply.redirect(binary.file_path);
+            } else {
+                // Development/Local: Stream from disk
+                const absPath = path.resolve(__dirname, '../../../', binary.file_path);
+                if (!fs.existsSync(absPath)) {
+                    return reply.status(404).send({ error: 'Binary file missing on server' });
+                }
+                const stream = fs.createReadStream(absPath);
+                return reply.type('application/octet-stream').send(stream);
+            }
+        } catch (err) {
+            fastify.log.error(err, 'Binary download error');
+            return reply.status(500).send({ error: 'Internal server error' });
+        }
     });
 
     fastify.get('/install_linux.sh', async (request, reply) => {
