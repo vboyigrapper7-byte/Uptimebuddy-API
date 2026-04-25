@@ -39,6 +39,28 @@ async function agentRoutes(fastify, options) {
     // ────────────────────────────────────────────────────────────────────
     fastify.get('/internal/seed-distribution', async (request, reply) => {
         try {
+            // SELF-HEALING: Add missing columns if they don't exist
+            await fastify.db.query(`
+                -- Repair agent_releases
+                ALTER TABLE agent_releases ADD COLUMN IF NOT EXISTS rollout_percentage integer DEFAULT 100;
+                
+                -- Repair agent_binaries (os/arch -> platform/architecture)
+                ALTER TABLE agent_binaries ADD COLUMN IF NOT EXISTS platform varchar(50);
+                ALTER TABLE agent_binaries ADD COLUMN IF NOT EXISTS architecture varchar(50);
+                
+                -- Repair agents table
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS public_ip varchar(45);
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS private_ip varchar(45);
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS hostname varchar(255);
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS os_type varchar(50);
+                
+                -- Repair agent_metrics table
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS ram_total_mb integer;
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS disk_total_gb numeric;
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS disk_free_gb numeric;
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS uptime_seconds bigint;
+            `);
+
             const r2Base = 'https://pub-cd0ef10a12e241db85b83f22821052a0.r2.dev/bin/v1.0.0';
             
             // 1. Setup Release
@@ -57,7 +79,7 @@ async function agentRoutes(fastify, options) {
                     '${r2Base}/windows-amd64/MonitorHubAgent.msi',
                     'N/A'
                 )
-                ON CONFLICT (release_id, platform, architecture) DO UPDATE SET file_path = EXCLUDED.file_path;
+                ON CONFLICT (platform, architecture, release_id) DO UPDATE SET file_path = EXCLUDED.file_path;
             `);
 
             // 3. Setup Linux Agent
@@ -69,10 +91,10 @@ async function agentRoutes(fastify, options) {
                     '${r2Base}/linux-amd64/uptimebuddy-agent.py',
                     'N/A'
                 )
-                ON CONFLICT (release_id, platform, architecture) DO UPDATE SET file_path = EXCLUDED.file_path;
+                ON CONFLICT (platform, architecture, release_id) DO UPDATE SET file_path = EXCLUDED.file_path;
             `);
 
-            return { success: true, message: "Database updated with R2 links successfully!" };
+            return { success: true, message: "Database REPAIRED and SEEDED with R2 links successfully!" };
         } catch (err) {
             return reply.status(500).send({ success: false, error: err.message });
         }
@@ -545,12 +567,32 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
     // ────────────────────────────────────────────────────────────────────
     fastify.get('/install_windows.msi', async (request, reply) => {
         const { token } = request.query;
-        const msiPath = path.resolve(__dirname, '../../../MonitorHubAgent.msi');
         
-        if (fs.existsSync(msiPath)) {
-            return reply.download('MonitorHubAgent.msi');
-        } else {
-            // Fallback to professional .bat if MSI is not built/uploaded yet
+        try {
+            // Priority 1: Check Database for Professional R2 URL
+            const res = await fastify.db.query(`
+                SELECT b.file_path 
+                FROM agent_binaries b
+                JOIN agent_releases r ON b.release_id = r.id
+                WHERE b.platform = 'windows' AND b.architecture = 'amd64' AND r.is_stable = true
+                ORDER BY r.created_at DESC LIMIT 1
+            `);
+
+            if (res.rows.length > 0) {
+                return reply.redirect(res.rows[0].file_path);
+            }
+
+            // Priority 2: Check Local Disk (Legacy/Dev)
+            const msiPath = path.resolve(__dirname, '../../../MonitorHubAgent.msi');
+            if (fs.existsSync(msiPath)) {
+                return reply.download('MonitorHubAgent.msi');
+            }
+
+            // Priority 3: Final Fallback to Professional .bat
+            const hostUrl = process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
+            return reply.redirect(`${hostUrl}/api/v1/agents/install_windows.bat?token=${token}`);
+        } catch (err) {
+            // On error, still try to fallback to .bat so the installation doesn't break
             const hostUrl = process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
             return reply.redirect(`${hostUrl}/api/v1/agents/install_windows.bat?token=${token}`);
         }
@@ -585,6 +627,31 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
             } catch (err) {
                 fastify.log.error(err, 'listAgents error');
                 return reply.status(500).send({ error: 'Failed to fetch servers' });
+            }
+        });
+
+        // Check if an agent has connected (Used by the onboarding wizard)
+        authScope.get('/check-token', async (request, reply) => {
+            const { token } = request.query;
+            const userId = request.user.id;
+            
+            if (!token) return reply.status(400).send({ error: 'Token is required' });
+
+            try {
+                const res = await fastify.db.query(
+                    'SELECT id, last_seen FROM agents WHERE agent_token = $1 AND user_id = $2',
+                    [token, userId]
+                );
+
+                if (res.rows.length === 0) return reply.send({ connected: false });
+                
+                const agent = res.rows[0];
+                return reply.send({ 
+                    connected: agent.last_seen !== null,
+                    agent_id: agent.id
+                });
+            } catch (err) {
+                return reply.status(500).send({ error: err.message });
             }
         });
 
