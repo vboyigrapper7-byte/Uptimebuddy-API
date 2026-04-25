@@ -135,15 +135,31 @@ async function agentRoutes(fastify, options) {
                 await fastify.db.query("UPDATE agents SET last_seen = NOW(), status = 'active', agent_type = $2 WHERE id = $1", [agentId, agent_type]);
             }
 
-            // 4. Check for Updates (Optional feature for Go agent)
+            // 4. Check for Updates (Rollout-Aware)
             let update_available = null;
             if (agent_type === 'go' && agent_version) {
                 try {
-                    const latestRes = await fastify.db.query('SELECT version FROM agent_releases WHERE is_stable = true ORDER BY created_at DESC LIMIT 1');
-                    if (latestRes.rows.length > 0 && latestRes.rows[0].version !== agent_version) {
-                        update_available = latestRes.rows[0].version;
+                    const latestRes = await fastify.db.query('SELECT * FROM agent_releases WHERE is_stable = true ORDER BY created_at DESC LIMIT 1');
+                    if (latestRes.rows.length > 0) {
+                        const latest = latestRes.rows[0];
+                        if (latest.version !== agent_version) {
+                            // Determine if this specific agent is in the rollout group
+                            let inRolloutGroup = true;
+                            if (latest.rollout_percentage < 100) {
+                                const hash = crypto.createHash('md5').update(agent_token).digest('hex');
+                                const bucket = parseInt(hash.substring(0, 2), 16) % 100;
+                                inRolloutGroup = (bucket < latest.rollout_percentage);
+                            }
+
+                            if (inRolloutGroup) {
+                                update_available = latest.version;
+                                fastify.log.info({ agentId, agent_version, latest: latest.version }, 'Update signal sent to agent');
+                            }
+                        }
                     }
-                } catch (e) { /* ignore manifest errors */ }
+                } catch (e) { 
+                    fastify.log.error(e, 'Error checking for agent update');
+                }
             }
 
             return reply.send({ success: true, update_available });
@@ -223,42 +239,56 @@ if %errorLevel% neq 0 (
 )
 
 echo ========================================================
-echo  MonitorHub Enterprise Agent Setup (Windows)
+echo  MonitorHub Enterprise Agent Setup (Windows Native)
 echo ========================================================
 
 :: ── Directory Setup ────────────────────────────────────────────────────────
-mkdir "C:\\Program Files\\MonitorHub" 2>nul
-cd /d "C:\\Program Files\\MonitorHub"
+set "INSTALL_DIR=C:\\Program Files\\MonitorHub"
+mkdir "%INSTALL_DIR%" 2>nul
+cd /d "%INSTALL_DIR%"
 
-:: ── Download Go Agent ──────────────────────────────────────────────────────
-echo [INFO] Fetching latest Go Agent...
-set "DL_URL=${hostUrl}/api/v1/agents/bin/windows/amd64"
-curl.exe -f -s -L -o "monitorhub-agent.exe" "%DL_URL%"
+:: ── Download Native PowerShell Agent ────────────────────────────────────────
+echo [INFO] Downloading Native Pro Agent...
+curl.exe --ssl-no-revoke -f -s -L -o "monitorhub-agent.ps1" "${hostUrl}/api/v1/agents/scripts/windows"
 
 if %errorLevel% equ 0 (
-    echo [SUCCESS] Go Agent downloaded.
+    echo [SUCCESS] Native Agent downloaded.
     
-    :: Config
-    echo AGENT_TOKEN=${token}> .env
-    echo INGEST_URL=${hostUrl}/api/v1/agents/ingest>> .env
-    echo REPORT_INTERVAL_MS=30000>> .env
-    echo AGENT_TYPE=go>> .env
+    :: Create config
+    echo [INFO] Configuring Environment...
+    setx AGENT_TOKEN "${token}" /M >nul
+    setx INGEST_URL "${hostUrl}/api/v1/agents/ingest" /M >nul
 
-    :: Register Service
-    echo [INFO] Registering Windows Service...
-    sc.exe create MonitorHubAgent binPath= "\"%cd%\\monitorhub-agent.exe\"" start= auto
-    sc.exe description MonitorHubAgent "Monitor Hub Hardware Telemetry Agent"
-    sc.exe start MonitorHubAgent
+    :: Register as a Scheduled Task (Native Windows way to run in background)
+    echo [INFO] Registering System Background Task...
+    schtasks /create /tn "MonitorHubAgent" /tr "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File \\"%INSTALL_DIR%\\monitorhub-agent.ps1\\"" /sc onstart /ru SYSTEM /f
+    schtasks /run /tn "MonitorHubAgent"
     
     echo ========================================================
-    echo  [SUCCESS] Lightweight Go Agent installed!
+    echo  [SUCCESS] Native Enterprise Agent installed!
+    echo  Telemetry is now flowing in the background.
     echo ========================================================
     pause
     exit /b
 )
 
-echo [WARNING] Go binary download failed. Falling back to Node.js...
-:: ... existing node fallback logic would go here if desired ...
+:: ── Final Fallback to Node.js (Robust Legacy Path) ──────────────────────────
+echo [WARNING] Native Script Agent failed. Attempting Node.js Recovery...
+node -v >nul 2>&1
+if %errorLevel% equ 0 (
+    mkdir "%USERPROFILE%\\monitorhub-agent" 2>nul
+    cd /d "%USERPROFILE%\\monitorhub-agent"
+    echo AGENT_TOKEN=${token}> .env
+    echo INGEST_URL=${hostUrl}/api/v1/agents/ingest>> .env
+    call npm init -y >nul
+    call npm install axios dotenv systeminformation node-windows --quiet
+    curl.exe -s -L -o agent.js "${hostUrl}/api/v1/agents/script"
+    curl.exe -s -L -o service.js "${hostUrl}/api/v1/agents/windows-service.js"
+    node service.js
+    echo [SUCCESS] Legacy Node Agent installed successfully.
+) else (
+    echo [ERROR] No compatible runtime found.
+)
 pause`;
         return reply
             .type('application/octet-stream')
@@ -270,13 +300,14 @@ pause`;
     // PUBLIC — Agent Distribution (Go Agent)
     // ────────────────────────────────────────────────────────────────────
     
-    // 1. Version Manifest (Latest or Specific)
     fastify.get('/manifest/:version', {
         config: { rateLimit: { max: 100, timeWindow: '1 minute' } }
     }, async (request, reply) => {
         const { version } = request.params;
+        const agentToken = request.headers['x-agent-token'];
         
         try {
+            fastify.log.info({ version, agentToken: !!agentToken }, 'Manifest request received');
             let query = 'SELECT * FROM agent_releases WHERE is_stable = true ';
             let params = [];
             
@@ -358,16 +389,20 @@ pause`;
         
         try {
             const res = await fastify.db.query(`
-                SELECT b.file_path, b.id, b.sha256 
+                SELECT b.file_path, b.id, b.sha256, r.version 
                 FROM agent_binaries b
                 JOIN agent_releases r ON b.release_id = r.id
                 WHERE r.is_stable = true AND b.os = $1 AND b.arch = $2
                 ORDER BY r.created_at DESC LIMIT 1
             `, [os, arch]);
 
-            if (res.rows.length === 0) return reply.status(404).send({ error: 'Binary not found' });
+            if (res.rows.length === 0) {
+                fastify.log.warn({ os, arch }, 'Binary download failed - Not found');
+                return reply.status(404).send({ error: 'Binary not found' });
+            }
 
             const binary = res.rows[0];
+            fastify.log.info({ os, arch, version: binary.version, sha256: binary.sha256 }, 'Serving agent binary');
             
             // ── CDN Headers ───────────────────────────────────────────────────
             reply.header('Cache-Control', 'public, max-age=86400'); // 24 hours for immutable binaries
@@ -403,36 +438,30 @@ pause`;
 
         const hostUrl = host || process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
         
-        // Simplified Go-Agent Focused Installer
         const script = `#!/bin/bash
 set -e
 echo "========================================="
-echo " MonitorHub Enterprise Agent Setup (Linux)"
+echo " MonitorHub Enterprise Agent Setup (Linux Native)"
 echo "========================================="
 
-ARCH=$(uname -m)
-PLATFORM="linux-amd64"
-if [ "$ARCH" = "aarch64" ]; then PLATFORM="linux-arm64"; fi
-
-echo "[INFO] Downloading Lightweight Go Agent..."
-curl -s -f -L -o /usr/local/bin/monitorhub-agent "${hostUrl}/api/v1/agents/bin/\${PLATFORM}"
+echo "[INFO] Downloading Native Python Agent..."
+curl -s -f -L -o /usr/local/bin/monitorhub-agent "${hostUrl}/api/v1/agents/scripts/linux"
 chmod +x /usr/local/bin/monitorhub-agent
 
 mkdir -p /etc/monitorhub-agent
 echo "AGENT_TOKEN=${token}" > /etc/monitorhub-agent/.env
 echo "INGEST_URL=${hostUrl}/api/v1/agents/ingest" >> /etc/monitorhub-agent/.env
-echo "AGENT_TYPE=go" >> /etc/monitorhub-agent/.env
 
 # Create Systemd Service
 echo "[INFO] Creating systemd service..."
 cat <<EOF > /etc/systemd/system/monitorhub-agent.service
 [Unit]
-Description=MonitorHub Go Agent
+Description=MonitorHub Native Agent
 After=network.target
 
 [Service]
 EnvironmentFile=/etc/monitorhub-agent/.env
-ExecStart=/usr/local/bin/monitorhub-agent
+ExecStart=/usr/bin/python3 /usr/local/bin/monitorhub-agent
 Restart=always
 
 [Install]
@@ -443,12 +472,27 @@ systemctl daemon-reload
 systemctl enable monitorhub-agent
 systemctl restart monitorhub-agent
 
-echo "[SUCCESS] MonitorHub Agent is now active!"
+echo "[SUCCESS] Native MonitorHub Agent is now active!"
 `;
         return reply
             .type('application/octet-stream')
             .header('Content-Disposition', 'attachment; filename="setup_monitorhub_linux.sh"')
             .send(script);
+    });
+
+    // ────────────────────────────────────────────────────────────────────
+    // Serve the actual Native Script Files
+    // ────────────────────────────────────────────────────────────────────
+    fastify.get('/scripts/windows', async (request, reply) => {
+        const scriptPath = path.resolve(__dirname, '../../../uptimebuddy-agent.ps1');
+        const content = await fs.promises.readFile(scriptPath, 'utf-8');
+        return reply.type('text/plain').send(content);
+    });
+
+    fastify.get('/scripts/linux', async (request, reply) => {
+        const scriptPath = path.resolve(__dirname, '../../../uptimebuddy-agent.py');
+        const content = await fs.promises.readFile(scriptPath, 'utf-8');
+        return reply.type('text/plain').send(content);
     });
 
     // ────────────────────────────────────────────────────────────────────
