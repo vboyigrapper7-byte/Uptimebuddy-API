@@ -167,6 +167,11 @@ async function sendMetrics() {
             }
         }
 
+        const headers = {
+            'Content-Type': 'application/json',
+            'x-agent-token': AGENT_TOKEN
+        };
+
         await axios.post(INGEST_URL, data, { 
             timeout: 10000, 
             headers, 
