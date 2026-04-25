@@ -35,6 +35,50 @@ const { requireApiKey } = require('../auth/middleware');
 async function agentRoutes(fastify, options) {
 
     // ────────────────────────────────────────────────────────────────────
+    // ONE-TIME ACTIVATION ROUTE (Visit once to setup database)
+    // ────────────────────────────────────────────────────────────────────
+    fastify.get('/internal/seed-distribution', async (request, reply) => {
+        try {
+            const r2Base = 'https://pub-cd0ef10a12e241db85b83f22821052a0.r2.dev/bin/v1.0.0';
+            
+            // 1. Setup Release
+            await fastify.db.query(`
+                INSERT INTO agent_releases (version, is_stable, rollout_percentage)
+                VALUES ('1.0.0', true, 100)
+                ON CONFLICT (version) DO NOTHING;
+            `);
+
+            // 2. Setup Windows MSI
+            await fastify.db.query(`
+                INSERT INTO agent_binaries (release_id, platform, architecture, file_path, sha256)
+                VALUES (
+                    (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
+                    'windows', 'amd64',
+                    '${r2Base}/windows-amd64/MonitorHubAgent.msi',
+                    'N/A'
+                )
+                ON CONFLICT (release_id, platform, architecture) DO UPDATE SET file_path = EXCLUDED.file_path;
+            `);
+
+            // 3. Setup Linux Agent
+            await fastify.db.query(`
+                INSERT INTO agent_binaries (release_id, platform, architecture, file_path, sha256)
+                VALUES (
+                    (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
+                    'linux', 'amd64',
+                    '${r2Base}/linux-amd64/uptimebuddy-agent.py',
+                    'N/A'
+                )
+                ON CONFLICT (release_id, platform, architecture) DO UPDATE SET file_path = EXCLUDED.file_path;
+            `);
+
+            return { success: true, message: "Database updated with R2 links successfully!" };
+        } catch (err) {
+            return reply.status(500).send({ success: false, error: err.message });
+        }
+    });
+
+    // ────────────────────────────────────────────────────────────────────
     // PUBLIC — Agent ingest (uses agent_token as auth, not JWT)
     // ────────────────────────────────────────────────────────────────────
     fastify.post('/ingest', {
@@ -512,6 +556,7 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
         }
     });
 
+
     // ────────────────────────────────────────────────────────────────────
     // PROTECTED — Dashboard / Management Routes (Auth required)
     // ────────────────────────────────────────────────────────────────────
@@ -540,6 +585,31 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
             } catch (err) {
                 fastify.log.error(err, 'listAgents error');
                 return reply.status(500).send({ error: 'Failed to fetch servers' });
+            }
+        });
+
+        // Check if an agent has connected (Used by the onboarding wizard)
+        authScope.get('/check-token', async (request, reply) => {
+            const { token } = request.query;
+            const userId = request.user.id;
+            
+            if (!token) return reply.status(400).send({ error: 'Token is required' });
+
+            try {
+                const res = await fastify.db.query(
+                    'SELECT id, last_seen FROM agents WHERE agent_token = $1 AND user_id = $2',
+                    [token, userId]
+                );
+
+                if (res.rows.length === 0) return reply.send({ connected: false });
+                
+                const agent = res.rows[0];
+                return reply.send({ 
+                    connected: agent.last_seen !== null,
+                    agent_id: agent.id
+                });
+            } catch (err) {
+                return reply.status(500).send({ error: err.message });
             }
         });
 
