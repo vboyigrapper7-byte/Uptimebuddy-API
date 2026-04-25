@@ -35,6 +35,50 @@ const { requireApiKey } = require('../auth/middleware');
 async function agentRoutes(fastify, options) {
 
     // ────────────────────────────────────────────────────────────────────
+    // ONE-TIME ACTIVATION ROUTE (Visit once to setup database)
+    // ────────────────────────────────────────────────────────────────────
+    fastify.get('/internal/seed-distribution', async (request, reply) => {
+        try {
+            const r2Base = 'https://pub-cd0ef10a12e241db85b83f22821052a0.r2.dev/bin/v1.0.0';
+            
+            // 1. Setup Release
+            await fastify.db.query(`
+                INSERT INTO agent_releases (version, is_stable, rollout_percentage)
+                VALUES ('1.0.0', true, 100)
+                ON CONFLICT (version) DO NOTHING;
+            `);
+
+            // 2. Setup Windows MSI
+            await fastify.db.query(`
+                INSERT INTO agent_binaries (release_id, platform, architecture, file_path, sha256)
+                VALUES (
+                    (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
+                    'windows', 'amd64',
+                    '${r2Base}/windows-amd64/MonitorHubAgent.msi',
+                    'N/A'
+                )
+                ON CONFLICT (release_id, platform, architecture) DO UPDATE SET file_path = EXCLUDED.file_path;
+            `);
+
+            // 3. Setup Linux Agent
+            await fastify.db.query(`
+                INSERT INTO agent_binaries (release_id, platform, architecture, file_path, sha256)
+                VALUES (
+                    (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
+                    'linux', 'amd64',
+                    '${r2Base}/linux-amd64/uptimebuddy-agent.py',
+                    'N/A'
+                )
+                ON CONFLICT (release_id, platform, architecture) DO UPDATE SET file_path = EXCLUDED.file_path;
+            `);
+
+            return { success: true, message: "Database updated with R2 links successfully!" };
+        } catch (err) {
+            return reply.status(500).send({ success: false, error: err.message });
+        }
+    });
+
+    // ────────────────────────────────────────────────────────────────────
     // PUBLIC — Agent ingest (uses agent_token as auth, not JWT)
     // ────────────────────────────────────────────────────────────────────
     fastify.post('/ingest', {
@@ -49,6 +93,8 @@ async function agentRoutes(fastify, options) {
     }, async (request, reply) => {
         // Extract agent_token from header (preferred) or body (legacy)
         const agent_token = request.headers['x-agent-token'] || request.body?.agent_token;
+        const agent_type  = request.headers['x-agent-type']  || request.body?.agent_type || 'node';
+        const agent_version = request.headers['x-agent-version'] || request.body?.agent_version;
         const { metrics } = request.body || {};
 
         if (!agent_token || !metrics) {
@@ -103,16 +149,19 @@ async function agentRoutes(fastify, options) {
 
             // 3. Update Status (Resilient to missing SaaS columns)
             const { public_ip, private_ip, hostname, os_type } = request.body || {};
+            
             try {
                 const publicIpChanged  = public_ip && public_ip !== (existing.public_ip || '');
                 const privateIpChanged = private_ip && private_ip !== (existing.private_ip || '');
-                const metaChanged      = hostname || os_type;
+                const metaChanged      = hostname || os_type || agent_version;
 
-                if (publicIpChanged || privateIpChanged || metaChanged) {
+                if (metaChanged || publicIpChanged || privateIpChanged) {
                     await fastify.db.query(`
                         UPDATE agents SET 
                             last_seen = NOW(),
                             status = 'active',
+                            agent_type = $6,
+                            agent_version = COALESCE($7, agent_version),
                             public_ip = COALESCE($2, public_ip),
                             private_ip = COALESCE($3, private_ip),
                             prev_public_ip = CASE WHEN $2 IS NOT NULL AND $2 != COALESCE(public_ip, '') THEN public_ip ELSE prev_public_ip END,
@@ -121,17 +170,44 @@ async function agentRoutes(fastify, options) {
                             hostname = COALESCE($4, hostname),
                             os_type = COALESCE($5, os_type)
                         WHERE id = $1`, 
-                        [agentId, public_ip || null, private_ip || null, hostname || null, os_type || null]
+                        [agentId, public_ip || null, private_ip || null, hostname || null, os_type || null, agent_type, agent_version || null]
                     );
                 } else {
                     await fastify.db.query("UPDATE agents SET last_seen = NOW(), status = 'active' WHERE id = $1", [agentId]);
                 }
             } catch (err) {
                 // FINAL FALLBACK: Essential Heartbeat
-                await fastify.db.query("UPDATE agents SET last_seen = NOW(), status = 'active' WHERE id = $1", [agentId]);
+                await fastify.db.query("UPDATE agents SET last_seen = NOW(), status = 'active', agent_type = $2 WHERE id = $1", [agentId, agent_type]);
             }
 
-            return reply.send({ success: true });
+            // 4. Check for Updates (Rollout-Aware)
+            let update_available = null;
+            if (agent_type === 'go' && agent_version) {
+                try {
+                    const latestRes = await fastify.db.query('SELECT * FROM agent_releases WHERE is_stable = true ORDER BY created_at DESC LIMIT 1');
+                    if (latestRes.rows.length > 0) {
+                        const latest = latestRes.rows[0];
+                        if (latest.version !== agent_version) {
+                            // Determine if this specific agent is in the rollout group
+                            let inRolloutGroup = true;
+                            if (latest.rollout_percentage < 100) {
+                                const hash = crypto.createHash('md5').update(agent_token).digest('hex');
+                                const bucket = parseInt(hash.substring(0, 2), 16) % 100;
+                                inRolloutGroup = (bucket < latest.rollout_percentage);
+                            }
+
+                            if (inRolloutGroup) {
+                                update_available = latest.version;
+                                fastify.log.info({ agentId, agent_version, latest: latest.version }, 'Update signal sent to agent');
+                            }
+                        }
+                    }
+                } catch (e) { 
+                    fastify.log.error(e, 'Error checking for agent update');
+                }
+            }
+
+            return reply.send({ success: true, update_available });
         } catch (err) {
             fastify.log.error(err, 'Agent ingest fatal error');
             return reply.status(500).send({ error: 'Internal server error' });
@@ -199,164 +275,65 @@ svc.install();`;
         const script = `@echo off
 setlocal enabledelayedexpansion
 
-:: ── Elevation Check & Auto-Elevate ───────────────────────────────────────────
+:: ── Elevation Check ──────────────────────────────────────────────────────────
 net session >nul 2>&1
-if %errorLevel% equ 0 goto :elevated
+if %errorLevel% neq 0 (
+    echo [ERROR] Please run this script as Administrator.
+    pause
+    exit /b
+)
 
-echo [INFO] Requesting Administrative Privileges...
-echo Set UAC = CreateObject^("Shell.Application"^) > "%temp%\\getadmin.vbs"
-echo UAC.ShellExecute "%~s0", "", "", "runas", 1 >> "%temp%\\getadmin.vbs"
-cscript //nologo "%temp%\\getadmin.vbs"
-del "%temp%\\getadmin.vbs"
-exit /b
-
-:elevated
-echo.
 echo ========================================================
-echo  Monitor Hub Agent Setup
+echo  MonitorHub Enterprise Agent Setup (Windows Native)
 echo ========================================================
-echo [REQUIRED] Node.js is required to run this agent.
-echo [OFFICIAL] Download: https://nodejs.org/
-echo ========================================================
-echo.
 
 :: ── Directory Setup ────────────────────────────────────────────────────────
-mkdir "%USERPROFILE%\\monitorhub-agent" 2>nul
-cd /d "%USERPROFILE%\\monitorhub-agent"
+set "INSTALL_DIR=C:\\Program Files\\MonitorHub"
+mkdir "%INSTALL_DIR%" 2>nul
+cd /d "%INSTALL_DIR%"
 
-:: ── Node.js Discovery ───────────────────────────────────────────────────────
+:: ── Download Native PowerShell Agent ────────────────────────────────────────
+echo [INFO] Downloading Native Pro Agent...
+curl.exe --ssl-no-revoke -f -s -L -o "monitorhub-agent.ps1" "${hostUrl}/api/v1/agents/scripts/windows"
+
+if %errorLevel% equ 0 (
+    echo [SUCCESS] Native Agent downloaded.
+    
+    :: Create config
+    echo [INFO] Configuring Environment...
+    setx AGENT_TOKEN "${token}" /M >nul
+    setx INGEST_URL "${hostUrl}/api/v1/agents/ingest" /M >nul
+
+    :: Register as a Scheduled Task (Native Windows way to run in background)
+    echo [INFO] Registering System Background Task...
+    schtasks /create /tn "MonitorHubAgent" /tr "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File \\"%INSTALL_DIR%\\monitorhub-agent.ps1\\"" /sc onstart /ru SYSTEM /f
+    schtasks /run /tn "MonitorHubAgent"
+    
+    echo ========================================================
+    echo  [SUCCESS] Native Enterprise Agent installed!
+    echo  Telemetry is now flowing in the background.
+    echo ========================================================
+    pause
+    exit /b
+)
+
+:: ── Final Fallback to Node.js (Robust Legacy Path) ──────────────────────────
+echo [WARNING] Native Script Agent failed. Attempting Node.js Recovery...
 node -v >nul 2>&1
 if %errorLevel% equ 0 (
-    echo [SUCCESS] Node.js is already installed.
-    goto :dependencies
+    mkdir "%USERPROFILE%\\monitorhub-agent" 2>nul
+    cd /d "%USERPROFILE%\\monitorhub-agent"
+    echo AGENT_TOKEN=${token}> .env
+    echo INGEST_URL=${hostUrl}/api/v1/agents/ingest>> .env
+    call npm init -y >nul
+    call npm install axios dotenv systeminformation node-windows --quiet
+    curl.exe -s -L -o agent.js "${hostUrl}/api/v1/agents/script"
+    curl.exe -s -L -o service.js "${hostUrl}/api/v1/agents/windows-service.js"
+    node service.js
+    echo [SUCCESS] Legacy Node Agent installed successfully.
+) else (
+    echo [ERROR] No compatible runtime found.
 )
-
-echo [INFO] Node.js not detected. Starting automatic installation...
-
-:: ── Download Strategy ──────────────────────────────────────────────────────
-set "NODE_URL=https://nodejs.org/dist/v20.12.2/node-v20.12.2-x64.msi"
-set "NODE_MSI=%temp%\\nodejs.msi"
-
-echo [INFO] Attempting to download Node.js LTS...
-curl.exe -f -s -L -o "%NODE_MSI%" "%NODE_URL%"
-if %errorLevel% neq 0 (
-    echo [INFO] curl failed, attempting with --ssl-no-revoke fallback...
-    curl.exe --ssl-no-revoke -f -s -L -o "%NODE_MSI%" "%NODE_URL%"
-)
-if %errorLevel% neq 0 (
-    echo [INFO] curl fallback failed, attempting bitsadmin...
-    bitsadmin /transfer "NodeJSDownload" /priority FOREGROUND "%NODE_URL%" "%NODE_MSI%" >nul
-)
-
-if not exist "%NODE_MSI%" (
-    echo [ERROR] Failed to download Node.js installer.
-    echo [ERROR] Please install Node.js manually from: https://nodejs.org/
-    pause
-    exit /b 1
-)
-
-:: ── Silent Installation ────────────────────────────────────────────────────
-echo [INFO] Installing Node.js (this may take 1-2 minutes)...
-msiexec.exe /i "%NODE_MSI%" /qn /norestart
-if %errorLevel% neq 0 (
-    echo [ERROR] msiexec failed with error code %errorLevel%
-    pause
-    exit /b 1
-)
-del "%NODE_MSI%"
-
-:: ── Path Refresh (Robust Registry Sync) ──────────────────────────────────────
-echo [INFO] Refreshing environment variables...
-set "NEW_PATH="
-for /f "tokens=2*" %%A in ('reg query "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment" /v "Path" 2^>nul') do set "NEW_PATH=%%B"
-for /f "tokens=2*" %%A in ('reg query "HKCU\\Environment" /v "Path" 2^>nul') do (
-    if defined NEW_PATH (set "NEW_PATH=!NEW_PATH!;%%B") else (set "NEW_PATH=%%B")
-)
-
-:: Apply new path if successfully retrieved
-if defined NEW_PATH (
-    set "PATH=!NEW_PATH!"
-)
-
-:: CRITICAL: Always ensure essential Windows directories are in PATH
-:: This prevents "command not recognized" errors even if registry parsing fails
-echo !PATH! | findstr /i "system32" >nul || set "PATH=!PATH!;%SystemRoot%\\System32;%SystemRoot%;%SystemRoot%\\System32\\Wbem;%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\"
-
-:: ── Final Verification ─────────────────────────────────────────────────────
-node -v >nul 2>&1
-if %errorLevel% neq 0 (
-    echo [ERROR] Node.js was installed but is still not detected in PATH.
-    echo [ERROR] Please restart this command prompt and run the script again.
-    pause
-    exit /b 1
-)
-echo [SUCCESS] Node.js installed and verified.
-
-:dependencies
-:: ── Dependency Installation ────────────────────────────────────────────────
-echo [INFO] Initializing agent environment...
-call npm init -y >nul
-echo [INFO] Installing local dependencies...
-call npm install axios dotenv systeminformation node-windows https-proxy-agent --quiet
-
-:: ── Fetch Agent Script & Service Installer ─────────────────────────────────
-echo [INFO] Connecting to platform: ${hostUrl}
-
-:: ── Secure Download with Revocation, PowerShell & Bitsadmin Fallback ───────
-:: Agent Script
-curl.exe --connect-timeout 15 --max-time 30 -o agent.js "${hostUrl}/api/v1/agents/script"
-if %errorLevel% neq 0 (
-    echo [INFO] Curl failed. Retrying with --ssl-no-revoke...
-    curl.exe --ssl-no-revoke --retry 3 --connect-timeout 30 --max-time 120 -o agent.js "${hostUrl}/api/v1/agents/script"
-)
-if %errorLevel% neq 0 (
-    echo [INFO] Curl failed. Attempting PowerShell download...
-    powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object System.Net.WebClient).DownloadFile('${hostUrl}/api/v1/agents/script', 'agent.js')"
-)
-if %errorLevel% neq 0 (
-    echo [INFO] PowerShell failed. Attempting bitsadmin fallback...
-    bitsadmin /transfer "AgentDownload" /priority FOREGROUND "${hostUrl}/api/v1/agents/script" "%cd%\\agent.js" >nul
-)
-
-:: Service Installer
-curl.exe --connect-timeout 15 --max-time 30 -o service.js "${hostUrl}/api/v1/agents/windows-service.js"
-if %errorLevel% neq 0 (
-    echo [INFO] Curl failed. Retrying with --ssl-no-revoke...
-    curl.exe --ssl-no-revoke --retry 3 --connect-timeout 30 --max-time 120 -o service.js "${hostUrl}/api/v1/agents/windows-service.js"
-)
-if %errorLevel% neq 0 (
-    echo [INFO] Curl failed. Attempting PowerShell download...
-    powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object System.Net.WebClient).DownloadFile('${hostUrl}/api/v1/agents/windows-service.js', 'service.js')"
-)
-if %errorLevel% neq 0 (
-    echo [INFO] PowerShell failed. Attempting bitsadmin fallback...
-    bitsadmin /transfer "ServiceDownload" /priority FOREGROUND "${hostUrl}/api/v1/agents/windows-service.js" "%cd%\\service.js" >nul
-)
-
-if not exist "agent.js" (
-    echo.
-    echo [ERROR] CRITICAL: Could not download agent from Monitor Hub Platform!
-    echo [INFO] Target: ${hostUrl}
-    echo [HINT] Ensure your firewall allows outbound traffic to ${hostUrl}
-    pause
-    exit /b 1
-)
-
-:: ── Environment Setup ──────────────────────────────────────────────────────
-echo AGENT_TOKEN=${token}> .env
-echo INGEST_URL=${hostUrl}/api/v1/agents/ingest>> .env
-echo REPORT_INTERVAL_MS=30000>> .env
-
-:: ── Windows Service Management ─────────────────────────────────────────────
-echo [INFO] Registering as a Windows System Service...
-node service.js
-
-echo.
-echo ========================================================
-echo  [SUCCESS] Agent Configuration Complete!
-echo  Telemetry: Running natively as a Windows System Service
-echo ========================================================
-echo.
 pause`;
         return reply
             .type('application/octet-stream')
@@ -364,61 +341,221 @@ pause`;
             .send(script);
     });
 
+    // ────────────────────────────────────────────────────────────────────
+    // PUBLIC — Agent Distribution (Go Agent)
+    // ────────────────────────────────────────────────────────────────────
+    
+    fastify.get('/manifest/:version', {
+        config: { rateLimit: { max: 100, timeWindow: '1 minute' } }
+    }, async (request, reply) => {
+        const { version } = request.params;
+        const agentToken = request.headers['x-agent-token'];
+        
+        try {
+            fastify.log.info({ version, agentToken: !!agentToken }, 'Manifest request received');
+            let query = 'SELECT * FROM agent_releases WHERE is_stable = true ';
+            let params = [];
+            
+            if (version === 'latest') {
+                query += 'ORDER BY created_at DESC LIMIT 1';
+            } else {
+                query += 'AND version = $1 LIMIT 1';
+                params.push(version);
+            }
+
+            const releaseRes = await fastify.db.query(query, params);
+            if (releaseRes.rows.length === 0) return reply.status(404).send({ error: 'Release not found' });
+
+            const release = releaseRes.rows[0];
+            
+            // ── Rollout Control Logic ─────────────────────────────────────────
+            // If it's a 'latest' request and the release has a rollout percentage
+            if (version === 'latest' && release.rollout_percentage < 100) {
+                // Simple deterministic hash-based rollout (sticky per agent)
+                const agentToken = request.headers['x-agent-token'];
+                if (agentToken) {
+                    const hash = crypto.createHash('md5').update(agentToken).digest('hex');
+                    const bucket = parseInt(hash.substring(0, 2), 16) % 100;
+                    if (bucket >= release.rollout_percentage) {
+                        // Not in rollout group — find previous stable release
+                        const prevRes = await fastify.db.query(
+                            'SELECT * FROM agent_releases WHERE is_stable = true AND created_at < $1 ORDER BY created_at DESC LIMIT 1',
+                            [release.created_at]
+                        );
+                        if (prevRes.rows.length > 0) {
+                            return reply.send(await buildManifest(fastify, prevRes.rows[0]));
+                        }
+                    }
+                }
+            }
+
+            const manifest = await buildManifest(fastify, release);
+            
+            // ── CDN / Caching Headers ─────────────────────────────────────────
+            reply.header('Cache-Control', 'public, max-age=600'); // 10 mins
+            reply.header('ETag', `"${release.version}-${release.id}"`);
+
+            return reply.send(manifest);
+        } catch (err) {
+            fastify.log.error(err, 'Manifest error');
+            return reply.status(500).send({ error: 'Internal server error' });
+        }
+    });
+
+    // Alias for /manifest/latest
+    fastify.get('/manifest', (req, res) => res.redirect('/api/v1/agents/manifest/latest'));
+
+    async function buildManifest(fastify, release) {
+        const binaryRes = await fastify.db.query('SELECT os, arch, sha256 FROM agent_binaries WHERE release_id = $1', [release.id]);
+        const platforms = {};
+        binaryRes.rows.forEach(b => {
+            platforms[`${b.os}-${b.arch}`] = {
+                url: `/api/v1/agents/bin/${b.os}/${b.arch}?v=${release.version}`,
+                sha256: b.sha256
+            };
+        });
+        return {
+            version: release.version,
+            stable: release.is_stable,
+            release_notes: release.release_notes,
+            rollout: {
+                enabled: release.rollout_percentage < 100,
+                percentage: release.rollout_percentage || 100
+            },
+            platforms
+        };
+    }
+
+    // 2. Binary Download
+    fastify.get('/bin/:os/:arch', {
+        config: { rateLimit: { max: 20, timeWindow: '1 minute' } }
+    }, async (request, reply) => {
+        const { os, arch } = request.params;
+        
+        try {
+            const res = await fastify.db.query(`
+                SELECT b.file_path, b.id, b.sha256, r.version 
+                FROM agent_binaries b
+                JOIN agent_releases r ON b.release_id = r.id
+                WHERE r.is_stable = true AND b.os = $1 AND b.arch = $2
+                ORDER BY r.created_at DESC LIMIT 1
+            `, [os, arch]);
+
+            if (res.rows.length === 0) {
+                fastify.log.warn({ os, arch }, 'Binary download failed - Not found');
+                return reply.status(404).send({ error: 'Binary not found' });
+            }
+
+            const binary = res.rows[0];
+            fastify.log.info({ os, arch, version: binary.version, sha256: binary.sha256 }, 'Serving agent binary');
+            
+            // ── CDN Headers ───────────────────────────────────────────────────
+            reply.header('Cache-Control', 'public, max-age=86400'); // 24 hours for immutable binaries
+            reply.header('Content-Disposition', `attachment; filename="monitorhub-agent-${os}-${arch}"`);
+            
+            // Increment download count (async)
+            fastify.db.query('UPDATE agent_binaries SET download_count = download_count + 1 WHERE id = $1', [binary.id]).catch(() => {});
+
+            // Log download to audit (optional)
+            fastify.log.info(`[AgentDistribution] Download: ${os}/${arch}`);
+
+            if (binary.file_path.startsWith('http')) {
+                // Production: Redirect to S3/CDN
+                return reply.redirect(binary.file_path);
+            } else {
+                // Development/Local: Stream from disk
+                const absPath = path.resolve(__dirname, '../../../', binary.file_path);
+                if (!fs.existsSync(absPath)) {
+                    return reply.status(404).send({ error: 'Binary file missing on server' });
+                }
+                const stream = fs.createReadStream(absPath);
+                return reply.type('application/octet-stream').send(stream);
+            }
+        } catch (err) {
+            fastify.log.error(err, 'Binary download error');
+            return reply.status(500).send({ error: 'Internal server error' });
+        }
+    });
+
     fastify.get('/install_linux.sh', async (request, reply) => {
         const { token, host } = request.query;
         if (!token) return reply.status(400).send('Agent token is required');
 
         const hostUrl = host || process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
+        
         const script = `#!/bin/bash
 set -e
 echo "========================================="
-echo " Starting Monitor Hub Agent Setup..."
-echo " Node.js is required for this agent."
-echo " Official: https://nodejs.org/"
+echo " MonitorHub Enterprise Agent Setup (Linux Native)"
 echo "========================================="
 
-if ! command -v node &> /dev/null; then
-    echo "[INFO] Node.js not found. Installing Node.js v20..."
-    curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-    sudo apt-get install -y nodejs
-    if ! command -v node &> /dev/null; then
-        echo "[ERROR] Failed to install Node.js. Please install manually."
-        exit 1
-    fi
-fi
+echo "[INFO] Downloading Native Python Agent..."
+curl -s -f -L -o /usr/local/bin/monitorhub-agent "${hostUrl}/api/v1/agents/scripts/linux"
+chmod +x /usr/local/bin/monitorhub-agent
 
-mkdir -p ~/monitorhub-agent
-cd ~/monitorhub-agent
-npm init -y
-echo "Installing local dependencies..."
-npm install axios dotenv systeminformation
-echo "Installing PM2 globally..."
-npm install -g pm2
-echo "Connecting to platform: ${hostUrl}"
-curl --retry 5 --retry-delay 10 --retry-all-errors --connect-timeout 30 --max-time 120 -o agent.js "${hostUrl}/api/v1/agents/script" || \
-wget --tries=5 --waitretry=10 --timeout=30 -O agent.js "${hostUrl}/api/v1/agents/script"
-if [ ! -f "agent.js" ]; then
-    echo "[ERROR] Could not download agent from Monitor Hub Platform!"
-    echo "Ensure this server can reach ${hostUrl}"
-    exit 1
-fi
-echo "AGENT_TOKEN=${token}" > .env
-echo "INGEST_URL=${hostUrl}/api/v1/agents/ingest" >> .env
-echo "REPORT_INTERVAL_MS=30000" >> .env
-pm2 delete monitorhub-agent 2>/dev/null || true
-pm2 start agent.js --name monitorhub-agent
-pm2 save
-pm2 startup | tail -n 1 | bash
-echo ""
-echo "========================================="
-echo " Agent Configuration Upgraded!"
-echo " Using secure Header-based Auth."
-echo "========================================="`;
+mkdir -p /etc/monitorhub-agent
+echo "AGENT_TOKEN=${token}" > /etc/monitorhub-agent/.env
+echo "INGEST_URL=${hostUrl}/api/v1/agents/ingest" >> /etc/monitorhub-agent/.env
+
+# Create Systemd Service
+echo "[INFO] Creating systemd service..."
+cat <<EOF > /etc/systemd/system/monitorhub-agent.service
+[Unit]
+Description=MonitorHub Native Agent
+After=network.target
+
+[Service]
+EnvironmentFile=/etc/monitorhub-agent/.env
+ExecStart=/usr/bin/python3 /usr/local/bin/monitorhub-agent
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable monitorhub-agent
+systemctl restart monitorhub-agent
+
+echo "[SUCCESS] Native MonitorHub Agent is now active!"
+`;
         return reply
             .type('application/octet-stream')
             .header('Content-Disposition', 'attachment; filename="setup_monitorhub_linux.sh"')
             .send(script);
     });
+
+    // ────────────────────────────────────────────────────────────────────
+    // Serve the actual Native Script Files
+    // ────────────────────────────────────────────────────────────────────
+    fastify.get('/scripts/windows', async (request, reply) => {
+        const scriptPath = path.resolve(__dirname, '../../../uptimebuddy-agent.ps1');
+        const content = await fs.promises.readFile(scriptPath, 'utf-8');
+        return reply.type('text/plain').send(content);
+    });
+
+    fastify.get('/scripts/linux', async (request, reply) => {
+        const scriptPath = path.resolve(__dirname, '../../../uptimebuddy-agent.py');
+        const content = await fs.promises.readFile(scriptPath, 'utf-8');
+        return reply.type('text/plain').send(content);
+    });
+
+    // ────────────────────────────────────────────────────────────────────
+    // PROFESSIONAL MSI DISTRIBUTION
+    // ────────────────────────────────────────────────────────────────────
+    fastify.get('/install_windows.msi', async (request, reply) => {
+        const { token } = request.query;
+        const msiPath = path.resolve(__dirname, '../../../MonitorHubAgent.msi');
+        
+        if (fs.existsSync(msiPath)) {
+            return reply.download('MonitorHubAgent.msi');
+        } else {
+            // Fallback to professional .bat if MSI is not built/uploaded yet
+            const hostUrl = process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
+            return reply.redirect(`${hostUrl}/api/v1/agents/install_windows.bat?token=${token}`);
+        }
+    });
+
 
     // ────────────────────────────────────────────────────────────────────
     // PROTECTED — Dashboard / Management Routes (Auth required)
