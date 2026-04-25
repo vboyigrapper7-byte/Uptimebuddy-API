@@ -545,12 +545,32 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
     // ────────────────────────────────────────────────────────────────────
     fastify.get('/install_windows.msi', async (request, reply) => {
         const { token } = request.query;
-        const msiPath = path.resolve(__dirname, '../../../MonitorHubAgent.msi');
         
-        if (fs.existsSync(msiPath)) {
-            return reply.download('MonitorHubAgent.msi');
-        } else {
-            // Fallback to professional .bat if MSI is not built/uploaded yet
+        try {
+            // Priority 1: Check Database for Professional R2 URL
+            const res = await fastify.db.query(`
+                SELECT b.file_path 
+                FROM agent_binaries b
+                JOIN agent_releases r ON b.release_id = r.id
+                WHERE b.platform = 'windows' AND b.architecture = 'amd64' AND r.is_stable = true
+                ORDER BY r.created_at DESC LIMIT 1
+            `);
+
+            if (res.rows.length > 0) {
+                return reply.redirect(res.rows[0].file_path);
+            }
+
+            // Priority 2: Check Local Disk (Legacy/Dev)
+            const msiPath = path.resolve(__dirname, '../../../MonitorHubAgent.msi');
+            if (fs.existsSync(msiPath)) {
+                return reply.download('MonitorHubAgent.msi');
+            }
+
+            // Priority 3: Final Fallback to Professional .bat
+            const hostUrl = process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
+            return reply.redirect(`${hostUrl}/api/v1/agents/install_windows.bat?token=${token}`);
+        } catch (err) {
+            // On error, still try to fallback to .bat so the installation doesn't break
             const hostUrl = process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
             return reply.redirect(`${hostUrl}/api/v1/agents/install_windows.bat?token=${token}`);
         }
