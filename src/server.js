@@ -35,7 +35,9 @@ const getRoutesAndServices = () => {
         teamRoutes: require('./api/teams/routes'),
         auditRoutes: require('./api/audit/routes'),
         alertRoutes: require('./api/alerts/routes'),
-        pool: require('./core/db/pool')
+        pool: require('./core/db/pool'),
+        scheduler: require('./core/queue/scheduler'),
+        statsWorker: require('./workers/statsWorker')
     };
 };
 
@@ -48,6 +50,7 @@ const buildServer = async () => {
     const { authRoutes, agentRoutes, monitorRoutes, webhookRoutes, publicRoutes, billingRoutes, teamRoutes, auditRoutes, alertRoutes, pool } = getRoutesAndServices();
 
     const server = Fastify({
+        ignoreTrailingSlash: true,
         logger: {
             level: process.env.LOG_LEVEL || 'info',
             transport: process.env.NODE_ENV !== 'production'
@@ -153,6 +156,12 @@ const buildServer = async () => {
     server.register(teamRoutes,    { prefix: '/api/v1/teams' });
     server.register(auditRoutes,   { prefix: '/api/v1/audit' });
     server.register(alertRoutes,   { prefix: '/api/v1/alerts' });
+    
+    // ── Post-boot Initialization ─────────────────────────────────────────
+    // Sync monitors with queue after server starts (non-blocking)
+    const { scheduler, statsWorker } = getRoutesAndServices();
+    scheduler.syncMonitors().catch(err => logger.error(`[Startup] syncMonitors failed: ${err.message}`));
+    statsWorker.computeMonitorStats().catch(err => logger.error(`[Startup] computeMonitorStats failed: ${err.message}`));
 
     return server;
 };
