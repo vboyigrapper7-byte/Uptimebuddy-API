@@ -56,7 +56,7 @@ async function agentRoutes(fastify, options) {
                 ALTER TABLE agent_binaries ADD COLUMN IF NOT EXISTS platform varchar(50);
                 ALTER TABLE agent_binaries ADD COLUMN IF NOT EXISTS architecture varchar(50);
                 
-                -- DROP NOT NULL from legacy columns (This fixes the error you saw)
+                -- DROP NOT NULL from legacy columns
                 DO $$ 
                 BEGIN 
                     IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='agent_binaries' AND column_name='os') THEN
@@ -81,11 +81,18 @@ async function agentRoutes(fastify, options) {
                 ALTER TABLE agents ADD COLUMN IF NOT EXISTS hostname varchar(255);
                 ALTER TABLE agents ADD COLUMN IF NOT EXISTS os_type varchar(50);
                 
-                -- Repair agent_metrics table
+                -- Repair agent_metrics table (Comprehensive)
                 ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS ram_total_mb integer;
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS ram_percent numeric(5,2);
                 ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS disk_total_gb numeric;
                 ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS disk_free_gb numeric;
-                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS uptime_seconds bigint;
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS net_rx_mb numeric(8,3) DEFAULT 0;
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS net_tx_mb numeric(8,3) DEFAULT 0;
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS uptime_seconds bigint DEFAULT 0;
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS process_count integer DEFAULT 0;
+
+                -- Ensure performance indexes exist
+                CREATE INDEX IF NOT EXISTS idx_agent_metrics_compound ON agent_metrics (agent_id, recorded_at DESC);
             `);
 
             const releaseUrl = 'https://github.com/vboyigrapper7-byte/Uptimebuddy-API/releases/download/v1.0/MonitorHubAgent.msi';
@@ -216,19 +223,23 @@ async function agentRoutes(fastify, options) {
             // 2. Save Metrics (Hardware Aware for Accurate Dashboard Stats)
             const computed_ram_percent = metrics.ram_percent !== undefined ? metrics.ram_percent : (metrics.ram_total_mb ? (metrics.ram_mb / metrics.ram_total_mb) * 100 : 0);
             
-            await fastify.db.query(`
-                INSERT INTO agent_metrics (
-                    agent_id, recorded_at, cpu_percent, ram_mb, ram_percent, disk_percent, 
-                    net_rx_mb, net_tx_mb, process_count,
-                    ram_total_mb, disk_total_gb, disk_free_gb, uptime_seconds
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-                [
-                    agentId, recordedAt, 
-                    metrics.cpu_percent, metrics.ram_mb, computed_ram_percent, metrics.disk_percent,
-                    metrics.net_rx_mb || 0, metrics.net_tx_mb || 0, metrics.process_count || 0,
-                    metrics.ram_total_mb || null, metrics.disk_total_gb || null, metrics.disk_free_gb || null, metrics.uptime_seconds || 0
-                ]
-            );
+            try {
+                await fastify.db.query(`
+                    INSERT INTO agent_metrics (
+                        agent_id, recorded_at, cpu_percent, ram_mb, ram_percent, disk_percent, 
+                        net_rx_mb, net_tx_mb, process_count,
+                        ram_total_mb, disk_total_gb, disk_free_gb, uptime_seconds
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+                    [
+                        agentId, recordedAt, 
+                        metrics.cpu_percent, metrics.ram_mb, computed_ram_percent, metrics.disk_percent,
+                        metrics.net_rx_mb || 0, metrics.net_tx_mb || 0, metrics.process_count || 0,
+                        metrics.ram_total_mb || null, metrics.disk_total_gb || null, metrics.disk_free_gb || null, metrics.uptime_seconds || 0
+                    ]
+                );
+            } catch (metricErr) {
+                fastify.log.warn({ agentId, error: metricErr.message }, 'Metrics insertion failed - proceeding with heartbeat only');
+            }
 
             // 4. Alert Trigger (Up/Down Logic)
             if (prevStatus === 'down' || prevStatus === 'pending') {
@@ -639,10 +650,12 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
                     SELECT a.*, 
                            m.cpu_percent as cpu_usage, 
                            m.ram_percent, 
-                           m.recorded_at as metric_last_seen
+                           m.recorded_at as metric_last_seen,
+                           m.process_count,
+                           m.uptime_seconds
                     FROM agents a
                     LEFT JOIN LATERAL (
-                        SELECT cpu_percent, ram_percent, recorded_at
+                        SELECT cpu_percent, ram_percent, recorded_at, process_count, uptime_seconds
                         FROM agent_metrics
                         WHERE agent_id = a.id
                         ORDER BY recorded_at DESC
@@ -681,9 +694,12 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
                 let queryText;
                 let queryParams = [id];
 
-                if (duration === '24H') {
+                if (duration === '24H' || duration === '12H') {
+                    const interval = duration === '24H' ? '24 hours' : '12 hours';
+                    const bucketSize = duration === '24H' ? '15 minutes' : '5 minutes';
+                    
                     queryText = `
-                        SELECT TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'HH24:MI') AS time,
+                        SELECT TO_CHAR(bucket, 'HH24:MI') AS time,
                                AVG(cpu_percent)::numeric(5,2)  AS cpu,
                                AVG(ram_mb)::int                AS memory,
                                MAX(ram_total_mb)::int          AS memory_total,
@@ -692,31 +708,21 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
                                AVG(net_tx_mb)::numeric(8,3)    AS net_tx,
                                MAX(uptime_seconds)::bigint     AS uptime_seconds,
                                AVG(process_count)::int         AS process_count
-                        FROM agent_metrics WHERE agent_id = $1
-                        AND recorded_at >= NOW() - INTERVAL '24 hours'
-                        GROUP BY TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'HH24:MI')
-                        ORDER BY 1 ASC`;
-                } else if (duration === '12H') {
-                    queryText = `
-                        SELECT TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'HH24:MI') AS time,
-                               AVG(cpu_percent)::numeric(5,2)  AS cpu,
-                               AVG(ram_mb)::int                AS memory,
-                               MAX(ram_total_mb)::int          AS memory_total,
-                               AVG(disk_percent)::numeric(5,2) AS disk,
-                               AVG(net_rx_mb)::numeric(8,3)    AS net_rx,
-                               AVG(net_tx_mb)::numeric(8,3)    AS net_tx,
-                               MAX(uptime_seconds)::bigint     AS uptime_seconds,
-                               AVG(process_count)::int         AS process_count
-                        FROM agent_metrics WHERE agent_id = $1
-                        AND recorded_at >= NOW() - INTERVAL '12 hours'
-                        GROUP BY TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'HH24:MI')
-                        ORDER BY 1 ASC`;
+                        FROM (
+                            SELECT 
+                                date_trunc('minute', recorded_at) - (CAST(EXTRACT(minute FROM recorded_at) AS integer) % ${parseInt(bucketSize)}) * interval '1 minute' as bucket,
+                                *
+                            FROM agent_metrics 
+                            WHERE agent_id = $1 AND recorded_at >= NOW() - INTERVAL '${interval}'
+                        ) AS bucketed
+                        GROUP BY bucket
+                        ORDER BY bucket ASC`;
                 } else {
-                    // Default: last 60 raw data points (~10 min at 10s intervals)
+                    // Default: last 60 raw data points (~30 min at 30s intervals)
                     queryText = `
                         SELECT TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'HH24:MI:SS') AS time,
                                cpu_percent AS cpu, ram_mb AS memory, ram_total_mb AS memory_total,
-                               disk_percent AS disk, net_rx_mb AS net_rx, net_tx_mb AS net_tx,
+                               ram_percent, disk_percent AS disk, net_rx_mb AS net_rx, net_tx_mb AS net_tx,
                                uptime_seconds, process_count
                         FROM agent_metrics WHERE agent_id = $1
                         ORDER BY recorded_at DESC LIMIT 60`;

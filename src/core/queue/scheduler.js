@@ -1,4 +1,4 @@
-const { monitorQueue } = require('./setup');
+const { monitorQueue, statsQueue } = require('./setup');
 const pool = require('../db/pool');
 
 /**
@@ -96,6 +96,21 @@ async function syncMonitors() {
         }
 
         console.log(`[Scheduler] Synchronization complete. Balanced ${syncCount} monitors.`);
+
+        // 4. Schedule recurring maintenance tasks
+        // Every 5 minutes: Update monitor stats
+        await statsQueue.add('compute-stats', {}, {
+            repeat: { pattern: '*/5 * * * *' },
+            jobId: 'maintenance-stats'
+        });
+
+        // Every 24 hours: Prune old metrics
+        await statsQueue.add('prune-metrics', {}, {
+            repeat: { pattern: '0 0 * * *' },
+            jobId: 'maintenance-pruning'
+        });
+        
+        console.log('[Scheduler] Recurring maintenance tasks scheduled.');
     } catch (err) {
         console.error('[Scheduler] Sync failed:', err.message);
     }

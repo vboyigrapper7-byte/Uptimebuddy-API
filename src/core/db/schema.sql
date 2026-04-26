@@ -97,7 +97,11 @@ CREATE TABLE IF NOT EXISTS agents (
     server_group VARCHAR(255) DEFAULT 'Ungrouped',
     agent_token  VARCHAR(255) UNIQUE NOT NULL,
     status       VARCHAR(50)  DEFAULT 'pending',
-    last_seen    TIMESTAMP
+    last_seen    TIMESTAMP,
+    public_ip    VARCHAR(45),
+    private_ip   VARCHAR(45),
+    hostname     VARCHAR(255),
+    os_type      VARCHAR(50)
 );
 
 CREATE INDEX IF NOT EXISTS idx_agents_user_id     ON agents(user_id);
@@ -110,7 +114,14 @@ CREATE TABLE IF NOT EXISTS agent_metrics (
     cpu_percent  NUMERIC(5,2),
     ram_mb       INT,
     ram_total_mb INT,
+    ram_percent  NUMERIC(5,2),
     disk_percent NUMERIC(5,2),
+    disk_total_gb NUMERIC(10,2),
+    disk_free_gb  NUMERIC(10,2),
+    net_rx_mb     NUMERIC(8,3)    DEFAULT 0,
+    net_tx_mb     NUMERIC(8,3)    DEFAULT 0,
+    uptime_seconds BIGINT         DEFAULT 0,
+    process_count  INT            DEFAULT 0,
     PRIMARY KEY (agent_id, recorded_at)
 );
 

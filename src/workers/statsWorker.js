@@ -13,44 +13,79 @@ async function computeMonitorStats() {
     try {
         await client.query('BEGIN');
 
-        // Calculate 24h uptime and latency for ALL monitors
-        const statsRes = await client.query(`
-            WITH metrics_24h AS (
-                SELECT 
-                    monitor_id,
-                    status,
-                    response_time_ms
-                FROM monitor_metrics
-                WHERE recorded_at > NOW() - INTERVAL '24 hours'
-            )
+        // Calculate 24h uptime and latency for ALL monitors and UPSERT in one go
+        await client.query(`
+            INSERT INTO monitor_stats (monitor_id, uptime_24h, avg_latency_24h, last_updated_at)
             SELECT 
                 m.id as monitor_id,
-                ROUND(CAST(COUNT(met.status) FILTER (WHERE met.status IN ('up', 'warning')) AS NUMERIC) / GREATEST(COUNT(met.status), 1) * 100, 2) as uptime,
-                ROUND(AVG(met.response_time_ms)) as latency
+                COALESCE(ROUND(CAST(COUNT(met.status) FILTER (WHERE met.status IN ('up', 'warning')) AS NUMERIC) / GREATEST(COUNT(met.status), 1) * 100, 2), 100.00) as uptime,
+                COALESCE(ROUND(AVG(met.response_time_ms)), 0) as latency,
+                NOW()
             FROM monitors m
-            LEFT JOIN metrics_24h met ON m.id = met.monitor_id
+            LEFT JOIN monitor_metrics met ON m.id = met.monitor_id AND met.recorded_at > NOW() - INTERVAL '24 hours'
             GROUP BY m.id
+            ON CONFLICT (monitor_id) DO UPDATE SET
+                uptime_24h = EXCLUDED.uptime_24h,
+                avg_latency_24h = EXCLUDED.avg_latency_24h,
+                last_updated_at = NOW()
         `);
 
-        for (const row of statsRes.rows) {
-            await client.query(
-                `INSERT INTO monitor_stats (monitor_id, uptime_24h, avg_latency_24h, last_updated_at)
-                 VALUES ($1, $2, $3, NOW())
-                 ON CONFLICT (monitor_id) DO UPDATE SET
-                    uptime_24h = EXCLUDED.uptime_24h,
-                    avg_latency_24h = EXCLUDED.avg_latency_24h,
-                    last_updated_at = NOW()`,
-                [row.monitor_id, row.uptime || 100.00, row.latency || 0]
-            );
-        }
-
         await client.query('COMMIT');
-        console.log(`[StatsWorker] Successfully updated stats for ${statsRes.rowCount} monitors.`);
+        console.log(`[StatsWorker] Successfully updated all monitor stats in bulk.`);
     } catch (err) {
         await client.query('ROLLBACK');
         console.error('[StatsWorker] Critical failure during stats computation:', err);
     } finally {
         client.release();
+    }
+}
+
+/**
+ * Prune historical metrics older than 30 days to maintain performance.
+ */
+async function pruneMetrics() {
+    console.log('[StatsWorker] Starting tier-aware metrics pruning...');
+    try {
+        // This query deletes metrics based on the retentionDays of the user's tier.
+        // It uses a subquery to find the appropriate cutoff for each user.
+        await pool.query(`
+            -- Prune Monitor Metrics
+            DELETE FROM monitor_metrics
+            WHERE (monitor_id, recorded_at) IN (
+                SELECT mm.monitor_id, mm.recorded_at
+                FROM monitor_metrics mm
+                JOIN monitors m ON mm.monitor_id = m.id
+                JOIN users u ON m.user_id = u.id
+                WHERE mm.recorded_at < NOW() - (
+                    CASE 
+                        WHEN u.tier = 'business' THEN INTERVAL '365 days'
+                        WHEN u.tier = 'pro'      THEN INTERVAL '30 days'
+                        WHEN u.tier = 'starter'  THEN INTERVAL '7 days'
+                        ELSE INTERVAL '1 day'
+                    END
+                )
+            );
+
+            -- Prune Agent Metrics
+            DELETE FROM agent_metrics
+            WHERE (agent_id, recorded_at) IN (
+                SELECT am.agent_id, am.recorded_at
+                FROM agent_metrics am
+                JOIN agents a ON am.agent_id = a.id
+                JOIN users u ON a.user_id = u.id
+                WHERE am.recorded_at < NOW() - (
+                    CASE 
+                        WHEN u.tier = 'business' THEN INTERVAL '365 days'
+                        WHEN u.tier = 'pro'      THEN INTERVAL '30 days'
+                        WHEN u.tier = 'starter'  THEN INTERVAL '7 days'
+                        ELSE INTERVAL '1 day'
+                    END
+                )
+            );
+        `);
+        console.log('[StatsWorker] Tier-aware pruning complete.');
+    } catch (err) {
+        console.error('[StatsWorker] Pruning failed:', err.message);
     }
 }
 
@@ -60,6 +95,8 @@ const statsWorker = new Worker(
     async (job) => {
         if (job.name === 'compute-stats') {
             await computeMonitorStats();
+        } else if (job.name === 'prune-metrics') {
+            await pruneMetrics();
         }
     },
     { 
@@ -68,7 +105,7 @@ const statsWorker = new Worker(
     }
 );
 
-statsWorker.on('completed', (job) => console.log(`[StatsWorker] Job ${job.id} completed.`));
-statsWorker.on('failed', (job, err) => console.error(`[StatsWorker] Job ${job.id} failed:`, err));
+statsWorker.on('completed', (job) => console.log(`[StatsWorker] Job ${job.id} (${job.name}) completed.`));
+statsWorker.on('failed', (job, err) => console.error(`[StatsWorker] Job ${job.id} (${job.name}) failed:`, err));
 
-module.exports = { computeMonitorStats, statsWorker };
+module.exports = { computeMonitorStats, pruneMetrics, statsWorker };
