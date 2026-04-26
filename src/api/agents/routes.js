@@ -127,6 +127,30 @@ async function agentRoutes(fastify, options) {
         }
     });
 
+    // Check if an agent has connected (Used by the onboarding wizard)
+    fastify.get('/check-token', async (request, reply) => {
+        const { token } = request.query;
+        if (!token) return reply.status(400).send({ error: 'Token is required' });
+
+        try {
+            const res = await fastify.db.query(
+                'SELECT id, last_seen FROM agents WHERE agent_token = $1',
+                [token]
+            );
+
+            if (res.rows.length === 0) return reply.send({ success: true, connected: false });
+            
+            const agent = res.rows[0];
+            return reply.send({ 
+                success: true,
+                connected: agent.last_seen !== null,
+                agent_id: agent.id
+            });
+        } catch (err) {
+            return reply.status(500).send({ error: err.message });
+        }
+    });
+
     // ────────────────────────────────────────────────────────────────────
     // PUBLIC — Agent ingest (uses agent_token as auth, not JWT)
     // ────────────────────────────────────────────────────────────────────
@@ -143,7 +167,7 @@ async function agentRoutes(fastify, options) {
         // Extract agent_token from header (preferred) or body (legacy)
         const agent_token = request.headers['x-agent-token'] || request.body?.agent_token;
         const agent_type  = request.headers['x-agent-type']  || request.body?.agent_type || 'node';
-        const agent_version = request.headers['x-agent-version'] || request.body?.agent_version;
+        const agent_version = request.headers['x-agent-version'] || request.body?.agent_version || null;
         const { metrics } = request.body || {};
 
         if (!agent_token || !metrics) {
@@ -169,8 +193,8 @@ async function agentRoutes(fastify, options) {
             const agentId = agent.id;
             const userId  = agent.user_id;
             const prevStatus = agent.status;
-            const hostname = request.body?.hostname;
-            const os_type  = request.body?.os_type;
+            const hostname = request.body?.hostname || metrics?.hostname || null;
+            const os_type  = request.body?.os_type || metrics?.os || null;
             const public_ip = request.ip;
 
             const recordedAt = new Date();
@@ -190,17 +214,19 @@ async function agentRoutes(fastify, options) {
             );
 
             // 2. Save Metrics (Hardware Aware for Accurate Dashboard Stats)
+            const computed_ram_percent = metrics.ram_percent !== undefined ? metrics.ram_percent : (metrics.ram_total_mb ? (metrics.ram_mb / metrics.ram_total_mb) * 100 : 0);
+            
             await fastify.db.query(`
                 INSERT INTO agent_metrics (
                     agent_id, recorded_at, cpu_percent, ram_mb, ram_percent, disk_percent, 
                     net_rx_mb, net_tx_mb, process_count,
                     ram_total_mb, disk_total_gb, disk_free_gb, uptime_seconds
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
                 [
                     agentId, recordedAt, 
-                    metrics.cpu_percent, metrics.ram_mb, metrics.ram_percent, metrics.disk_percent,
+                    metrics.cpu_percent, metrics.ram_mb, computed_ram_percent, metrics.disk_percent,
                     metrics.net_rx_mb || 0, metrics.net_tx_mb || 0, metrics.process_count || 0,
-                    metrics.ram_total_mb, metrics.disk_total_gb, metrics.disk_free_gb, metrics.uptime_seconds
+                    metrics.ram_total_mb || null, metrics.disk_total_gb || null, metrics.disk_free_gb || null, metrics.uptime_seconds || 0
                 ]
             );
 
@@ -605,18 +631,28 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
         const { requireAuth } = require('../auth/middleware');
         authScope.addHook('onRequest', requireAuth);
 
-        // List all servers for user
+        // List all servers for user (With Live Metrics)
         authScope.get('/', async (request, reply) => {
             const userId = request.user.id;
             try {
-                const res = await fastify.db.query(
-                    `SELECT id, name, server_group, agent_token, last_seen, status, 
-                            public_ip, private_ip, hostname, os_type, ip_changed_at
-                     FROM agents WHERE user_id = $1 ORDER BY id DESC`,
+                const res = await fastify.db.query(`
+                    SELECT a.*, 
+                           m.cpu_percent as cpu_usage, 
+                           m.ram_percent, 
+                           m.recorded_at as metric_last_seen
+                    FROM agents a
+                    LEFT JOIN LATERAL (
+                        SELECT cpu_percent, ram_percent, recorded_at
+                        FROM agent_metrics
+                        WHERE agent_id = a.id
+                        ORDER BY recorded_at DESC
+                        LIMIT 1
+                    ) m ON true
+                    WHERE a.user_id = $1
+                    ORDER BY a.created_at DESC`, 
                     [userId]
                 );
 
-                const now = Date.now();
                 const mapped = res.rows.map(agent => ({
                     ...agent,
                     status: getDynamicAgentStatus(agent)
@@ -626,32 +662,6 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
             } catch (err) {
                 fastify.log.error(err, 'listAgents error');
                 return reply.status(500).send({ error: 'Failed to fetch servers' });
-            }
-        });
-
-        // Check if an agent has connected (Used by the onboarding wizard)
-        authScope.get('/check-token', async (request, reply) => {
-            const { token } = request.query;
-            const userId = request.user.id;
-            
-            if (!token) return reply.status(400).send({ error: 'Token is required' });
-
-            try {
-                const res = await fastify.db.query(
-                    'SELECT id, last_seen FROM agents WHERE agent_token = $1 AND user_id = $2',
-                    [token, userId]
-                );
-
-                if (res.rows.length === 0) return reply.send({ success: true, connected: false });
-                
-                const agent = res.rows[0];
-                return reply.send({ 
-                    success: true,
-                    connected: agent.last_seen !== null,
-                    agent_id: agent.id
-                });
-            } catch (err) {
-                return reply.status(500).send({ error: err.message });
             }
         });
 
