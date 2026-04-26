@@ -406,7 +406,7 @@ sc create MonitorHubAgent binPath= "powershell.exe" start= auto DisplayName= "Mo
 
 :: Phase 2: Configure
 echo [INFO] Applying service parameters...
-sc config MonitorHubAgent binPath= "powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File %AGENT_PATH%" || (
+sc config MonitorHubAgent binPath= "powershell.exe -ExecutionPolicy Bypass -NoProfile -NonInteractive -InputFormat None -WindowStyle Hidden -File %AGENT_PATH%" || (
     echo [ERROR] PHASE_2_FAILURE: binPath configuration failed.
     pause
     exit /b 1
@@ -429,6 +429,17 @@ if %errorLevel% neq 0 (
         goto retry_start
     )
     echo [ERROR] PHASE_4_FAILURE: Service failed to start.
+    
+    echo.
+    echo ─── DIAGNOSTIC LOG (Last 5 lines) ─────────────────
+    if exist "agent.log" (
+        powershell -Command "Get-Content agent.log -Tail 5"
+    ) else (
+        echo [INFO] agent.log not found. The process may not have even started.
+    )
+    echo ───────────────────────────────────────────────────
+    echo.
+    
     echo [INFO] Run "sc query MonitorHubAgent" to check status manually.
     pause
     exit /b 1

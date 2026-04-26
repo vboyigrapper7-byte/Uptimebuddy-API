@@ -32,8 +32,21 @@ if ($Url)   { $Url = $Url.Trim().Replace('"', '').Replace("'", "") }
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 [System.Net.ServicePointManager]::CheckCertificateRevocationList = $false 
 
+# 🛡️ DIAGNOSTIC ENGINE
+$LogFile = Join-Path $PSScriptRoot "agent.log"
+function Write-Log {
+    param($Message, $Type = "INFO")
+    $Stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    "[$Stamp] [$Type] $Message" | Out-File $LogFile -Append
+}
+
+Write-Log "Agent Process Starting..."
+Write-Log "Hostname: $env:COMPUTERNAME"
+Write-Log "Token Present: $(!!$Token)"
+Write-Log "URL: $Url"
+
 if (!$Token -or !$Url) {
-    Write-Error "CRITICAL: AGENT_TOKEN and INGEST_URL not found. Run installer again."
+    Write-Log "CRITICAL: Missing Token or URL" "ERROR"
     exit 1
 }
 
@@ -126,7 +139,9 @@ while ($true) {
         }
 
     } catch {
-        Write-Warning "Telemetry cycle failed: $($_.Exception.Message)"
+        $ErrorMsg = "Telemetry cycle failed: $($_.Exception.Message)"
+        Write-Warning $ErrorMsg
+        Write-Log $ErrorMsg "ERROR"
     }
 
     Start-Sleep -Seconds $Interval
