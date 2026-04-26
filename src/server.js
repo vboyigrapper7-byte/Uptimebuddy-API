@@ -122,6 +122,23 @@ const buildServer = async () => {
         }
     });
 
+    // ── Redis Pub/Sub Subscriber (Cross-process Real-time Sync) ───────────
+    const { makeRedisConnection } = require('./core/queue/setup');
+    const subscriber = makeRedisConnection();
+    
+    subscriber.subscribe('agent-updates', (err) => {
+        if (err) logger.error(`[Redis PubSub] Subscription error: ${err.message}`);
+    });
+
+    subscriber.on('message', (channel, message) => {
+        try {
+            const data = JSON.parse(message);
+            server.broadcast(data);
+        } catch (e) {
+            logger.warn(`[Redis PubSub] Failed to parse message: ${message}`);
+        }
+    });
+
     // ── Health check (Diagnostic Tool) ──────────────────────────────────
     server.get('/health', async (request, reply) => {
         const diagnostics = {

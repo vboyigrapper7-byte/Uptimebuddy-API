@@ -11,9 +11,10 @@ require('./alertWorker');
 require('./retentionWorker');
 require('./statsWorker');
 require('./reminderWorker');
+require('./agentWorker');
 
 const { syncMonitors } = require('../core/queue/scheduler');
-const { retentionQueue, statsQueue, reminderQueue } = require('../core/queue/setup');
+const { retentionQueue, statsQueue, reminderQueue, agentQueue } = require('../core/queue/setup');
 
 console.log('--- All Workers Initialized ---');
 
@@ -51,6 +52,16 @@ reminderQueue.add(
         jobId: 'system-reminder-job'
     }
 ).then(() => console.log('[Worker] Periodic reminder check job scheduled.'));
+
+// 5. Schedule Agent Health Checks (Runs every 1 minute)
+agentQueue.add(
+    'check-health',
+    {},
+    {
+        repeat: { every: 60 * 1000 },
+        jobId: 'system-agent-health-job'
+    }
+).then(() => console.log('[Worker] Periodic agent health check job scheduled.'));
 
 // 5. SELF-HEALING: Periodic Sync (Runs every hour)
 // This ensures that if Redis is ever wiped/restarted, the monitors are re-queued automatically.

@@ -52,5 +52,16 @@ const alertQueue     = new Queue('alert-webhooks',  { connection: redisConnectio
 const retentionQueue = new Queue('retention-tasks', { connection: redisConnection, defaultJobOptions: jobOptions });
 const statsQueue     = new Queue('stats-tasks',     { connection: redisConnection, defaultJobOptions: jobOptions });
 const reminderQueue  = new Queue('reminder-checks',  { connection: redisConnection, defaultJobOptions: jobOptions });
+const agentQueue     = new Queue('agent-tasks',     { connection: redisConnection, defaultJobOptions: jobOptions });
 
-module.exports = { redisConnection, workerRedisConnection, monitorQueue, alertQueue, retentionQueue, statsQueue, reminderQueue };
+module.exports = { 
+    redisConnection, 
+    workerRedisConnection, 
+    makeRedisConnection,
+    monitorQueue, 
+    alertQueue, 
+    retentionQueue, 
+    statsQueue, 
+    reminderQueue,
+    agentQueue
+};
