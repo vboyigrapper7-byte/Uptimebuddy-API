@@ -317,14 +317,10 @@ async function agentRoutes(fastify, options) {
             return reply.status(500).send({ error: 'Internal server error' });
         }
     });
-
-    // ────────────────────────────────────────────────────────────────────
     // PUBLIC — Agent script download
     // ────────────────────────────────────────────────────────────────────
     fastify.get('/script', async (request, reply) => {
-        // Primary: agent.js bundled inside the backend src directory (works on Render)
         const primaryPath  = path.resolve(__dirname, '../../agent.js');
-        // Fallback: monorepo sibling path (works locally)
         const fallbackPath = path.resolve(__dirname, '../../../../monitorhub-agent/agent.js');
         const scriptPath   = fs.existsSync(primaryPath) ? primaryPath : fallbackPath;
         try {
@@ -352,7 +348,6 @@ echo [INFO] Checking for Administrative privileges...
 net session >nul 2>&1
 if %errorLevel% neq 0 (
     echo [ERROR] This installer requires Administrator privileges.
-    echo [INFO] Please right-click and select "Run as Administrator".
     pause
     exit /b 1
 )
@@ -361,90 +356,73 @@ echo ========================================================
 echo  MonitorHub Enterprise Agent Setup (Windows)
 echo ========================================================
 
-:: ── Directory Setup ────────────────────────────────────────────────────────
+:: ── Directory Setup ──────────────────────────────────────
 set "INSTALL_DIR=%SystemDrive%\\Program Files\\MonitorHub"
 if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
 cd /d "%INSTALL_DIR%"
 
-:: ── Multi-Stage Download Engine ──────────────────────────────────────────
-echo [INFO] Downloading Agent Engine from ${hostUrl}...
+:: ── Download Engine ──────────────────────────────────────
+echo [INFO] Downloading Agent Engine...
 set "AGENT_URL=${hostUrl}/api/v1/agents/scripts/windows"
-
-:: Try Curl (Fastest)
 curl.exe --ssl-no-revoke -f -s -L -o "monitorhub-agent.ps1" "%AGENT_URL%"
 
-:: Try PowerShell Fallback
 if not exist "monitorhub-agent.ps1" (
-    echo [INFO] Curl failed. Trying PowerShell download...
     powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object System.Net.WebClient).DownloadFile('%AGENT_URL%', 'monitorhub-agent.ps1')"
 )
 
 if not exist "monitorhub-agent.ps1" (
-    echo [ERROR] Failed to download agent script. Check your internet connection.
+    echo [ERROR] Failed to download agent script.
     pause
     exit /b 1
 )
-
 echo [SUCCESS] Agent Engine downloaded.
 
 :: ── Configuration ────────────────────────────────────────
 echo [INFO] Configuring Agent Environment...
-
-:: Write local configuration for persistence (JSON)
 echo { "token": "${token}", "url": "${hostUrl}/api/v1/agents/ingest" } > "config.json"
-
-:: Set machine-level environment variables
-setx AGENT_TOKEN "${token}" /M >nul
-setx INGEST_URL "${hostUrl}/api/v1/agents/ingest" /M >nul
-
-:: Set for current session
+setx AGENT_TOKEN "${token}" /M >nul 2>&1
 set "AGENT_TOKEN=${token}"
-set "INGEST_URL=${hostUrl}/api/v1/agents/ingest"
 
-:: ── Service Registration ──────────────────────────────────────────────────
+:: ── Service Registration ──────────────────────────────────
 echo [INFO] Registering Windows Service...
 
-:: Resolve Short Path to avoid quoting nightmares with 'sc create'
+:: Short path resolution
 for %%I in ("%INSTALL_DIR%") do set "SHORT_DIR=%%~sI"
 set "AGENT_PATH=%SHORT_DIR%\\monitorhub-agent.ps1"
 
-:: Validate local engine exists
-if not exist "%AGENT_PATH%" (
-    echo [ERROR] Agent engine not found at: %AGENT_PATH%
-    pause
-    exit /b 1
-)
-
-:: Stop and Delete existing service
 echo [INFO] Cleaning up existing service...
 sc stop MonitorHubAgent >nul 2>&1
 sc delete MonitorHubAgent >nul 2>&1
 
-:: Create Service (Basic)
-echo [DEBUG] Resolved Path (Short): %AGENT_PATH%
-sc create MonitorHubAgent binPath= "powershell.exe" start= auto DisplayName= "MonitorHub Enterprise Agent"
+echo [DEBUG] Resolved Path: %AGENT_PATH%
 
+:: Phase 1: Create
+sc create MonitorHubAgent binPath= "powershell.exe" start= auto DisplayName= "MonitorHub Enterprise Agent"
 if %errorLevel% neq 0 (
-    echo [ERROR] Initial service creation failed.
-    echo [DEBUG] errorLevel: %errorLevel%
-    echo [INFO] Possible causes: Access Denied, Service Name Conflict, or Syntax Error.
+    echo [ERROR] PHASE_1_FAILURE: Service creation failed.
+    echo [INFO] Possible causes: Service exists but is locked, or insufficient permissions.
     pause
     exit /b 1
 )
 
-:: Apply Advanced Configuration (One setting at a time for maximum reliability)
-echo [INFO] Configuring service parameters...
+:: Phase 2: Configure
+echo [INFO] Applying service parameters...
 sc config MonitorHubAgent binPath= "powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File %AGENT_PATH%"
+if %errorLevel% neq 0 (
+    echo [ERROR] PHASE_2_FAILURE: binPath configuration failed.
+    pause
+    exit /b 1
+)
+
 sc description MonitorHubAgent "MonitorHub Enterprise Telemetry Agent"
 sc failure MonitorHubAgent reset= 86400 actions= restart/5000/restart/10000/restart/30000
-
 if %errorLevel% neq 0 (
-    echo [ERROR] Service configuration failed.
+    echo [ERROR] PHASE_3_FAILURE: Recovery parameters failed.
     pause
     exit /b 1
 )
 
-:: Start the service with retry mechanism
+:: Phase 3: Start
 echo [INFO] Starting MonitorHub Agent...
 set /a retry=0
 :retry_start
@@ -454,22 +432,19 @@ sc query MonitorHubAgent | find "RUNNING" >nul
 if %errorLevel% neq 0 (
     set /a retry+=1
     if !retry! lss 3 (
-        echo [WARNING] Service failed to start. Retry !retry!/3...
+        echo [WARNING] Service not running. Retry !retry!/3...
         goto retry_start
     )
-    echo [ERROR] Service failed to start after 3 attempts.
-    echo [INFO] Check event logs or permissions.
+    echo [ERROR] PHASE_4_FAILURE: Service failed to enter RUNNING state.
     pause
     exit /b 1
 )
 
 echo [SUCCESS] MonitorHub Agent is NOW RUNNING.
-
-echo ========================================================
-echo  Installation Complete!
 echo ========================================================
 pause
 exit /b 0`;
+
         return reply
             .type('application/octet-stream')
             .header('Content-Disposition', 'attachment; filename="setup_monitorhub_windows.bat"')
