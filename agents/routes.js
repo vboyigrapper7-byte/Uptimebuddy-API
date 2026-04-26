@@ -6,6 +6,7 @@ const { requireAuth, requireApiKey } = require('../auth/middleware');
 
 // ── SSRF / private‑IP guard ─────────────────────────────────────────────
 const PRIVATE_IP_RE = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|::1|0\.0\.0\.0)/i;
+const tokenCache = new Map(); // Phase 5: Fast token lookup cache
 
 // ── Metric range guard ───────────────────────────────────────────────────
 function validateMetrics(metrics) {
@@ -26,8 +27,8 @@ function getDynamicAgentStatus(agent) {
     const now = Date.now();
     const secondsSinceSeen = (now - new Date(agent.last_seen).getTime()) / 1000;
     
-    // If we've seen it recently, it's UP (overrides 'pending')
-    if (secondsSinceSeen < 90) return 'up';
+    // Phase 4: Tighten offline detection to 60s (was 90s)
+    if (secondsSinceSeen < 60) return 'up';
     
     // If it was pending but hasn't reported, stay pending
     if (agent.status === 'pending') return 'pending';
@@ -233,27 +234,27 @@ async function agentRoutes(fastify, options) {
         }
 
         try {
-            // 1. Initial Lookup (Find agent and check previous status for alerting)
-            const res = await fastify.db.query(
-                'SELECT id, user_id, status, name FROM agents WHERE agent_token = $1',
-                [agent_token]
-            );
-
-            if (res.rows.length === 0) {
-                return reply.status(404).send({ error: 'Agent not found' });
+            // 1. Token Validation (Optimized with Cache)
+            let agent = tokenCache.get(agent_token);
+            if (!agent) {
+                const res = await fastify.db.query(
+                    'SELECT id, user_id, status, name FROM agents WHERE agent_token = $1',
+                    [agent_token]
+                );
+                if (res.rows.length === 0) return reply.status(404).send({ error: 'Agent not found' });
+                agent = res.rows[0];
+                tokenCache.set(agent_token, agent);
             }
 
-            const agent = res.rows[0];
             const agentId = agent.id;
             const userId  = agent.user_id;
             const prevStatus = agent.status;
             const hostname = request.body?.hostname || metrics?.hostname || null;
             const os_type  = request.body?.os_type || metrics?.os || null;
             const public_ip = request.ip;
-
             const recordedAt = new Date();
 
-            // 1.5 Update Agent State (Heartbeat Priority - Ensures 'Online' Status)
+            // 1.5 Update Agent State (CRITICAL: Update status FIRST for accuracy)
             await fastify.db.query(`
                 UPDATE agents 
                 SET last_seen = NOW(), 
@@ -267,26 +268,34 @@ async function agentRoutes(fastify, options) {
                 [agentId, agent_type, agent_version, hostname, os_type, public_ip]
             );
 
-            // 2. Save Metrics (Hardware Aware for Accurate Dashboard Stats)
+            // Phase 3: Real-time broadcast
+            if (fastify.broadcast) {
+                fastify.broadcast({
+                    type: 'AGENT_UPDATE',
+                    agent_id: agentId,
+                    status: 'up',
+                    hostname: hostname || agent.hostname,
+                    metrics: metrics
+                });
+            }
+
+            // 2. Save Metrics (Non-blocking DB insert)
             const computed_ram_percent = metrics.ram_percent !== undefined ? metrics.ram_percent : (metrics.ram_total_mb ? (metrics.ram_mb / metrics.ram_total_mb) * 100 : 0);
             
-            try {
-                await fastify.db.query(`
-                    INSERT INTO agent_metrics (
-                        agent_id, recorded_at, cpu_percent, ram_mb, ram_percent, disk_percent, 
-                        net_rx_mb, net_tx_mb, process_count,
-                        ram_total_mb, disk_total_gb, disk_free_gb, uptime_seconds
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-                    [
-                        agentId, recordedAt, 
-                        metrics.cpu_percent, metrics.ram_mb, computed_ram_percent, metrics.disk_percent,
-                        metrics.net_rx_mb || 0, metrics.net_tx_mb || 0, metrics.process_count || 0,
-                        metrics.ram_total_mb || null, metrics.disk_total_gb || null, metrics.disk_free_gb || null, metrics.uptime_seconds || 0
-                    ]
-                );
-            } catch (metricErr) {
-                fastify.log.warn({ agentId, error: metricErr.message }, 'Metrics insertion failed - proceeding with heartbeat only');
-            }
+            // We don't await this to speed up the heartbeat response
+            fastify.db.query(`
+                INSERT INTO agent_metrics (
+                    agent_id, recorded_at, cpu_percent, ram_mb, ram_percent, disk_percent, 
+                    net_rx_mb, net_tx_mb, process_count,
+                    ram_total_mb, disk_total_gb, disk_free_gb, uptime_seconds
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+                [
+                    agentId, recordedAt, 
+                    metrics.cpu_percent, metrics.ram_mb, computed_ram_percent, metrics.disk_percent,
+                    metrics.net_rx_mb || 0, metrics.net_tx_mb || 0, metrics.process_count || 0,
+                    metrics.ram_total_mb || null, metrics.disk_total_gb || null, metrics.disk_free_gb || null, metrics.uptime_seconds || 0
+                ]
+            ).catch(err => fastify.log.warn({ agentId, error: err.message }, 'Metrics insertion failed'));
 
             // 4. Alert Trigger (Up/Down Logic)
             if (prevStatus === 'down' || prevStatus === 'pending') {
@@ -298,7 +307,6 @@ async function agentRoutes(fastify, options) {
                     [userId, null, 'server_status', `[${agent.name}] System Online: Server is now UP and reporting telemetry.`, 'critical']
                 );
                 
-                // Professional Audit Logging
                 if (teamId) {
                     await auditService.log(userId, teamId, 'server_recovered', { name: agent.name, id: agentId });
                 }
@@ -332,38 +340,6 @@ async function agentRoutes(fastify, options) {
     // ────────────────────────────────────────────────────────────────────
     // PUBLIC — Windows Native Service Installer Script
     // ────────────────────────────────────────────────────────────────────
-    fastify.get('/windows-service.js', async (request, reply) => {
-        const script = `
-const { Service } = require('node-windows');
-const path = require('path');
-
-const svc = new Service({
-  name: 'MonitorHubAgent',
-  description: 'Monitor Hub hardware telemetry agent',
-  script: path.join(__dirname, 'agent.js')
-});
-
-svc.on('install', () => {
-  console.log('[Service] Installed successfully into Windows SCM.');
-  svc.start();
-});
-
-svc.on('alreadyinstalled', () => {
-  console.log('[Service] Service already exists. Restarting...');
-  svc.restart();
-});
-
-svc.on('start', () => {
-  console.log('[Service] Monitor Hub Agent is now running in the background!');
-});
-
-svc.install();`;
-        return reply.type('application/javascript').send(script);
-    });
-
-    // ────────────────────────────────────────────────────────────────────
-    // PUBLIC — Installer script generators (token needed to download)
-    // ────────────────────────────────────────────────────────────────────
     fastify.get('/install_windows.bat', async (request, reply) => {
         const { token, host } = request.query;
         if (!token) return reply.status(400).send('Agent token is required');
@@ -373,83 +349,104 @@ svc.install();`;
 setlocal enabledelayedexpansion
 
 :: ── Elevation Check ──────────────────────────────────────────────────────────
+echo [INFO] Checking for Administrative privileges...
 net session >nul 2>&1
 if %errorLevel% neq 0 (
-    echo [ERROR] Please run this script as Administrator.
+    echo [ERROR] This installer requires Administrator privileges.
+    echo [INFO] Please right-click and select "Run as Administrator".
     pause
-    exit /b
+    exit /b 1
 )
 
 echo ========================================================
-echo  MonitorHub Enterprise Agent Setup (Windows Pro)
+echo  MonitorHub Enterprise Agent Setup (Windows)
 echo ========================================================
 
 :: ── Directory Setup ────────────────────────────────────────────────────────
-set "INSTALL_DIR=C:\\Program Files\\MonitorHub"
+set "INSTALL_DIR=%SystemDrive%\\Program Files\\MonitorHub"
 if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
 cd /d "%INSTALL_DIR%"
 
 :: ── Multi-Stage Download Engine ──────────────────────────────────────────
-echo [INFO] Downloading Agent Engine...
+echo [INFO] Downloading Agent Engine from ${hostUrl}...
 set "AGENT_URL=${hostUrl}/api/v1/agents/scripts/windows"
 
 :: Try Curl (Fastest)
 curl.exe --ssl-no-revoke -f -s -L -o "monitorhub-agent.ps1" "%AGENT_URL%"
 
-:: Try PowerShell Fallback (Most compatible)
+:: Try PowerShell Fallback
 if not exist "monitorhub-agent.ps1" (
-    echo [INFO] Curl failed. Trying PowerShell engine...
-    powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; [System.Net.ServicePointManager]::CheckCertificateRevocationList = $false; (New-Object System.Net.WebClient).DownloadFile('%AGENT_URL%', 'monitorhub-agent.ps1')"
+    echo [INFO] Curl failed. Trying PowerShell download...
+    powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object System.Net.WebClient).DownloadFile('%AGENT_URL%', 'monitorhub-agent.ps1')"
 )
 
-if exist "monitorhub-agent.ps1" (
-    echo [SUCCESS] Agent Engine downloaded.
-    
-    :: ── Configuration ────────────────────────────────────────
-    echo [INFO] Configuring Agent Environment...
-    
-    :: Write local configuration for persistence
-    echo { "token": "${token}", "url": "${hostUrl}/api/v1/agents/ingest" } > "config.json"
-    
-    :: Set machine-level env for legacy support
-    setx AGENT_TOKEN "${token}" /M >nul
-    setx INGEST_URL "${hostUrl}/api/v1/agents/ingest" /M >nul
-    
-    :: Set for current session
-    set "AGENT_TOKEN=${token}"
-    set "INGEST_URL=${hostUrl}/api/v1/agents/ingest"
-
-    :: ── Persistence Setup (Genuine Windows Service) ─────────────────────────
-    echo [INFO] Registering MonitorHub Enterprise Service...
-    
-    :: Stop and Delete old service/task if exists
-    sc stop MonitorHubAgent >nul 2>&1
-    sc delete MonitorHubAgent >nul 2>&1
-    schtasks /delete /tn "MonitorHubAgent" /f >nul 2>&1
-    
-    :: Create a professional Windows Service (Native SC command is more robust for spaces)
-    :: We use triple-escaped quotes to ensure the internal path is handled as one piece
-    sc create MonitorHubAgent binPath= "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File \\\"%INSTALL_DIR%\\monitorhub-agent.ps1\\\"" start= auto DisplayName= "MonitorHub Enterprise Agent"
-    
-    :: Set description
-    sc description MonitorHubAgent "MonitorHub Enterprise Telemetry Agent"
-    
-    :: Set recovery options (Restart on failure)
-    sc failure MonitorHubAgent reset= 86400 actions= restart/1000/restart/5000/restart/10000
-    
-    :: Start the service
-    sc start MonitorHubAgent
-    
-    echo ========================================================
-    echo  [SUCCESS] MonitorHub Enterprise Agent is NOW ACTIVE!
-    echo  Status: Running as a Windows Service.
-    echo ========================================================
+if not exist "monitorhub-agent.ps1" (
+    echo [ERROR] Failed to download agent script. Check your internet connection.
     pause
-    exit /b
+    exit /b 1
 )
 
-echo [ERROR] Could not download agent engine. Please check your internet connection and firewall.
-pause`;
+echo [SUCCESS] Agent Engine downloaded.
+
+:: ── Configuration ────────────────────────────────────────
+echo [INFO] Configuring Agent Environment...
+
+:: Write local configuration for persistence (JSON)
+echo { "token": "${token}", "url": "${hostUrl}/api/v1/agents/ingest" } > "config.json"
+
+:: Set machine-level environment variables
+setx AGENT_TOKEN "${token}" /M >nul
+setx INGEST_URL "${hostUrl}/api/v1/agents/ingest" /M >nul
+
+:: Set for current session
+set "AGENT_TOKEN=${token}"
+set "INGEST_URL=${hostUrl}/api/v1/agents/ingest"
+
+:: ── Service Registration ──────────────────────────────────────────────────
+echo [INFO] Registering Windows Service...
+
+:: Stop and Delete existing service
+sc stop MonitorHubAgent >nul 2>&1
+sc delete MonitorHubAgent >nul 2>&1
+
+:: Create Service (Single line is more robust for SC command)
+sc create MonitorHubAgent binPath= "powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File \"%INSTALL_DIR%\\monitorhub-agent.ps1\"" start= auto DisplayName= "MonitorHub Enterprise Agent"
+
+if %errorLevel% neq 0 (
+    echo [ERROR] Failed to create Windows Service.
+    pause
+    exit /b 1
+)
+
+sc description MonitorHubAgent "MonitorHub Enterprise Telemetry Agent"
+sc failure MonitorHubAgent reset= 86400 actions= restart/5000/restart/10000/restart/30000
+
+:: Start the service with retry mechanism
+echo [INFO] Starting MonitorHub Agent...
+set /a retry=0
+:retry_start
+sc start MonitorHubAgent >nul 2>&1
+timeout /t 5 /nobreak >nul
+sc query MonitorHubAgent | find "RUNNING" >nul
+if %errorLevel% neq 0 (
+    set /a retry+=1
+    if !retry! lss 3 (
+        echo [WARNING] Service failed to start. Retry !retry!/3...
+        goto retry_start
+    )
+    echo [ERROR] Service failed to start after 3 attempts.
+    echo [INFO] Check event logs or permissions.
+    pause
+    exit /b 1
+)
+
+echo [SUCCESS] MonitorHub Agent is NOW RUNNING.
+
+echo ========================================================
+echo  Installation Complete!
+echo ========================================================
+pause
+exit /b 0`;
         return reply
             .type('application/octet-stream')
             .header('Content-Disposition', 'attachment; filename="setup_monitorhub_windows.bat"')
@@ -697,7 +694,24 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
 
 
     // ────────────────────────────────────────────────────────────────────
-    // PROTECTED — Dashboard / Management Routes (Auth required)
+    // PUBLIC — WebSocket Real-time Feed
+    // ────────────────────────────────────────────────────────────────────
+    fastify.get('/ws', { websocket: true }, (connection, req) => {
+        fastify.log.info('[WS] Client connected for real-time updates');
+        
+        connection.socket.on('message', message => {
+            // Echo or handle client heartbeats if needed
+            try {
+                const data = JSON.parse(message);
+                if (data.type === 'PING') connection.socket.send(JSON.stringify({ type: 'PONG' }));
+            } catch (e) {}
+        });
+
+        connection.socket.on('close', () => {
+            fastify.log.info('[WS] Client disconnected');
+        });
+    });
+
     // ────────────────────────────────────────────────────────────────────
     fastify.register(async (authScope) => {
         authScope.addHook('onRequest', requireAuth);
