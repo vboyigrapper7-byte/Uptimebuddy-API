@@ -9,18 +9,14 @@ const PRIVATE_IP_RE = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])
 
 // ── Metric range guard ───────────────────────────────────────────────────
 function validateMetrics(metrics) {
-    const { cpu_percent, ram_mb, disk_percent } = metrics;
-    if (typeof cpu_percent   !== 'number' || cpu_percent   < 0 || cpu_percent   > 100) return false;
-    if (typeof disk_percent  !== 'number' || disk_percent  < 0 || disk_percent  > 100) return false;
-    if (typeof ram_mb        !== 'number' || ram_mb        < 0 || ram_mb        > 4194304) return false;
-    if (metrics.ram_total_mb  !== undefined && (typeof metrics.ram_total_mb  !== 'number' || metrics.ram_total_mb  < 0)) return false;
-    // Add validation for new disk metrics
-    if (metrics.disk_total_gb !== undefined && (typeof metrics.disk_total_gb !== 'number')) return false;
-    if (metrics.disk_free_gb  !== undefined && (typeof metrics.disk_free_gb  !== 'number')) return false;
-    if (metrics.net_rx_mb     !== undefined && (typeof metrics.net_rx_mb     !== 'number' || metrics.net_rx_mb    < 0)) return false;
-    if (metrics.net_tx_mb     !== undefined && (typeof metrics.net_tx_mb     !== 'number' || metrics.net_tx_mb    < 0)) return false;
-    if (metrics.uptime_seconds !== undefined && (typeof metrics.uptime_seconds !== 'number' || metrics.uptime_seconds < 0)) return false;
-    if (metrics.process_count  !== undefined && (typeof metrics.process_count  !== 'number' || metrics.process_count  < 0)) return false;
+    // Robust parsing for case where metrics arrive as strings
+    const cpu = Number(metrics.cpu_percent);
+    const ram = Number(metrics.ram_mb);
+    const disk = Number(metrics.disk_percent);
+
+    if (isNaN(cpu) || cpu < 0 || cpu > 100) return false;
+    if (isNaN(disk) || disk < 0 || disk > 100) return false;
+    if (isNaN(ram) || ram < 0 || ram > 4194304) return false;
     return true;
 }
 
@@ -417,7 +413,7 @@ if exist "monitorhub-agent.ps1" (
     schtasks /delete /tn "MonitorHubAgent" /f >nul 2>&1
     
     :: Create new High-Privilege task (Pass token directly to avoid env latency)
-    set "TASK_CMD=powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File \\"%INSTALL_DIR%\\uptimebuddy-agent.ps1\\" -Token \\"${token}\\" -Url \\"${hostUrl}/api/v1/agents/ingest\\""
+    set "TASK_CMD=powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File \\"%INSTALL_DIR%\\monitorhub-agent.ps1\\" -Token \\"${token}\\" -Url \\"${hostUrl}/api/v1/agents/ingest\\""
     schtasks /create /tn "MonitorHubAgent" /tr "!TASK_CMD!" /sc onstart /ru SYSTEM /f /rl HIGHEST
     
     :: Start it immediately
