@@ -335,7 +335,7 @@ async function agentRoutes(fastify, options) {
     // ────────────────────────────────────────────────────────────────────
     // PUBLIC — Windows Native Service Installer Script
     // ────────────────────────────────────────────────────────────────────
-    fastify.get('/install_windows.bat', async (request, reply) => {
+    fastify.get('/install_v2.bat', async (request, reply) => {
         const { token, host } = request.query;
         if (!token) return reply.status(400).send('Agent token is required');
 
@@ -343,50 +343,46 @@ async function agentRoutes(fastify, options) {
         const script = `@echo off
 setlocal enabledelayedexpansion
 
-:: ── Elevation Check ──────────────────────────────────────────────────────────
+:: ========================================================
+:: MonitorHub Enterprise Agent Installer (Bulletproof v2)
+:: ========================================================
+
+:: ── Elevation Check
 echo [INFO] Checking for Administrative privileges...
 net session >nul 2>&1
-if %errorLevel% neq 0 (
-    echo [ERROR] This installer requires Administrator privileges.
-    pause
-    exit /b 1
-)
+if errorlevel 1 goto NO_ADMIN
 
 echo ========================================================
 echo  MonitorHub Enterprise Agent Setup (Windows)
 echo ========================================================
 
-:: ── Directory Setup ──────────────────────────────────────
+:: ── Directory Setup
 set "INSTALL_DIR=%SystemDrive%\\Program Files\\MonitorHub"
 if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
 cd /d "%INSTALL_DIR%"
 
-:: ── Download Engine ──────────────────────────────────────
+:: ── Download Engine
 echo [INFO] Downloading Agent Engine...
 set "AGENT_URL=${hostUrl}/api/v1/agents/scripts/windows"
 curl.exe --ssl-no-revoke -f -s -L -o "monitorhub-agent.ps1" "%AGENT_URL%"
 
-if not exist "monitorhub-agent.ps1" (
-    powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object System.Net.WebClient).DownloadFile('%AGENT_URL%', 'monitorhub-agent.ps1')"
-)
+if exist "monitorhub-agent.ps1" goto DOWNLOAD_OK
+powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object System.Net.WebClient).DownloadFile('%AGENT_URL%', 'monitorhub-agent.ps1')"
 
-if not exist "monitorhub-agent.ps1" (
-    echo [ERROR] Failed to download agent script.
-    pause
-    exit /b 1
-)
+:DOWNLOAD_OK
+if not exist "monitorhub-agent.ps1" goto DOWNLOAD_FAILED
 echo [SUCCESS] Agent Engine downloaded.
 
-:: ── Configuration ────────────────────────────────────────
+:: ── Configuration
 echo [INFO] Configuring Agent Environment...
 echo { "token": "${token}", "url": "${hostUrl}/api/v1/agents/ingest" } > "config.json"
 setx AGENT_TOKEN "${token}" /M >nul 2>&1
 set "AGENT_TOKEN=${token}"
 
-:: ── Service Registration ──────────────────────────────────
+:: ── Service Registration
 echo [INFO] Registering Windows Service...
 
-:: Short path resolution
+:: Short path resolution for reliability
 for %%I in ("%INSTALL_DIR%") do set "SHORT_DIR=%%~sI"
 set "AGENT_PATH=%SHORT_DIR%\\monitorhub-agent.ps1"
 
@@ -397,47 +393,75 @@ sc delete MonitorHubAgent >nul 2>&1
 echo [DEBUG] Resolved Path: %AGENT_PATH%
 
 :: Phase 1: Create
-sc create MonitorHubAgent binPath= "powershell.exe" start= auto DisplayName= "MonitorHub Enterprise Agent" || (
-    echo [ERROR] PHASE_1_FAILURE: Service creation failed.
-    echo [INFO] Check for existing service or permission blocks.
-    pause
-    exit /b 1
-)
+echo [INFO] Creating service...
+sc create MonitorHubAgent binPath= "powershell.exe" start= auto DisplayName= "MonitorHub Enterprise Agent"
+if errorlevel 1 goto PHASE_1_FAILED
 
 :: Phase 2: Configure
 echo [INFO] Applying service parameters...
-sc config MonitorHubAgent binPath= "powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File %AGENT_PATH%" || (
-    echo [ERROR] PHASE_2_FAILURE: binPath configuration failed.
-    pause
-    exit /b 1
-)
+sc config MonitorHubAgent binPath= "powershell.exe -ExecutionPolicy Bypass -NoProfile -NonInteractive -InputFormat None -WindowStyle Hidden -File %AGENT_PATH%"
+if errorlevel 1 goto PHASE_2_FAILED
 
-sc description MonitorHubAgent "MonitorHub Enterprise Telemetry Agent" || echo [WARNING] Description failed.
-sc failure MonitorHubAgent reset= 86400 actions= restart/5000/restart/10000/restart/30000 || echo [WARNING] Failure policy failed.
+sc description MonitorHubAgent "MonitorHub Enterprise Telemetry Agent"
+sc failure MonitorHubAgent reset= 86400 actions= restart/5000/restart/10000/restart/30000
 
 :: Phase 3: Start
 echo [INFO] Starting MonitorHub Agent...
 set /a retry=0
-:retry_start
+
+:RETRY_START
 sc start MonitorHubAgent >nul 2>&1
 timeout /t 5 /nobreak >nul
 sc query MonitorHubAgent | find "RUNNING" >nul
-if %errorLevel% neq 0 (
-    set /a retry+=1
-    if !retry! lss 3 (
-        echo [WARNING] Service not running. Retry !retry!/3...
-        goto retry_start
-    )
-    echo [ERROR] PHASE_4_FAILURE: Service failed to start.
-    echo [INFO] Run "sc query MonitorHubAgent" to check status manually.
-    pause
-    exit /b 1
-)
+if not errorlevel 1 goto START_SUCCESS
 
+set /a retry+=1
+if %retry% LSS 3 (
+    echo [WARNING] Service not running. Retry %retry%/3...
+    goto RETRY_START
+)
+goto PHASE_4_FAILED
+
+:START_SUCCESS
 echo [SUCCESS] MonitorHub Agent is NOW RUNNING.
 echo ========================================================
 pause
-exit /b 0`;
+exit /b 0
+
+:: ── Error Handlers
+:NO_ADMIN
+echo [ERROR] This installer requires Administrator privileges.
+pause
+exit /b 1
+
+:DOWNLOAD_FAILED
+echo [ERROR] Failed to download agent script.
+pause
+exit /b 1
+
+:PHASE_1_FAILED
+echo [ERROR] PHASE_1_FAILURE: Service creation failed.
+pause
+exit /b 1
+
+:PHASE_2_FAILED
+echo [ERROR] PHASE_2_FAILURE: binPath configuration failed.
+pause
+exit /b 1
+
+:PHASE_4_FAILED
+echo [ERROR] PHASE_4_FAILURE: Service failed to start.
+echo.
+echo --- DIAGNOSTIC LOG (Last 5 lines) ---
+if exist "agent.log" (
+    powershell -Command "Get-Content agent.log -Tail 5"
+) else (
+    echo [INFO] agent.log not found. The process may not have even started.
+)
+echo -------------------------------------
+echo.
+pause
+exit /b 1`;
 
         return reply
             .type('application/octet-stream')
@@ -679,11 +703,11 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
 
             // Priority 3: Final Fallback to Professional .bat
             const hostUrl = process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
-            return reply.redirect(`${hostUrl}/api/v1/agents/install_windows.bat?token=${token}`);
+            return reply.redirect(`${hostUrl}/api/v1/agents/install_v2.bat?token=${token}`);
         } catch (err) {
             // On error, still try to fallback to .bat so the installation doesn't break
             const hostUrl = process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
-            return reply.redirect(`${hostUrl}/api/v1/agents/install_windows.bat?token=${token}`);
+            return reply.redirect(`${hostUrl}/api/v1/agents/install_v2.bat?token=${token}`);
         }
     });
 
