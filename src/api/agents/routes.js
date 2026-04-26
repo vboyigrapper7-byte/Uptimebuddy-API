@@ -171,19 +171,28 @@ async function agentRoutes(fastify, options) {
 
         try {
             const res = await fastify.db.query(
-                'SELECT id, last_seen FROM agents WHERE agent_token = $1',
+                'SELECT id, last_seen, status, hostname, public_ip FROM agents WHERE agent_token = $1',
                 [token]
             );
 
-            if (res.rows.length === 0) return reply.send({ success: true, connected: false });
+            if (res.rows.length === 0) {
+                return reply.send({ success: true, connected: false, message: 'Token not found in database' });
+            }
             
             const agent = res.rows[0];
+            const isConnected = agent.last_seen !== null;
+            
             return reply.send({ 
                 success: true,
-                connected: agent.last_seen !== null,
-                agent_id: agent.id
+                connected: isConnected,
+                status: isConnected ? 'up' : 'pending',
+                agent_id: agent.id,
+                hostname: agent.hostname,
+                public_ip: agent.public_ip,
+                last_seen: agent.last_seen
             });
         } catch (err) {
+            fastify.log.error(err, 'check-token error');
             return reply.status(500).send({ error: err.message });
         }
     });
@@ -389,11 +398,16 @@ if exist "monitorhub-agent.ps1" (
     echo [SUCCESS] Agent Engine downloaded.
     
     :: ── Configuration ────────────────────────────────────────
-    echo [INFO] Configuring Environment...
+    echo [INFO] Configuring Agent Environment...
+    
+    :: Write local configuration for persistence
+    echo { "token": "${token}", "url": "${hostUrl}/api/v1/agents/ingest" } > "config.json"
+    
+    :: Set machine-level env for legacy support
     setx AGENT_TOKEN "${token}" /M >nul
     setx INGEST_URL "${hostUrl}/api/v1/agents/ingest" /M >nul
     
-    :: Set for current session too
+    :: Set for current session
     set "AGENT_TOKEN=${token}"
     set "INGEST_URL=${hostUrl}/api/v1/agents/ingest"
 
@@ -403,15 +417,16 @@ if exist "monitorhub-agent.ps1" (
     :: Delete old task if exists
     schtasks /delete /tn "MonitorHubAgent" /f >nul 2>&1
     
-    :: Create new High-Privilege task (System level, no window)
-    schtasks /create /tn "MonitorHubAgent" /tr "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File \\"%INSTALL_DIR%\\monitorhub-agent.ps1\\"" /sc onstart /ru SYSTEM /f /rl HIGHEST
+    :: Create new High-Privilege task (Pass token directly to avoid env latency)
+    set "TASK_CMD=powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File \\"%INSTALL_DIR%\\uptimebuddy-agent.ps1\\" -Token \\"${token}\\" -Url \\"${hostUrl}/api/v1/agents/ingest\\""
+    schtasks /create /tn "MonitorHubAgent" /tr "!TASK_CMD!" /sc onstart /ru SYSTEM /f /rl HIGHEST
     
     :: Start it immediately
     schtasks /run /tn "MonitorHubAgent"
     
     echo ========================================================
     echo  [SUCCESS] MonitorHub Enterprise Agent is ACTIVE!
-    echo  Check your dashboard in 30 seconds.
+    echo  Check your dashboard in 10 seconds.
     echo ========================================================
     pause
     exit /b

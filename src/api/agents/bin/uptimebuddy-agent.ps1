@@ -3,16 +3,29 @@
 # Resilience: Triple-Fallback Network Engine
 # ========================================================
 
-$Token = $env:AGENT_TOKEN
-$Url = $env:INGEST_URL
-$Interval = 30 # Seconds
+# 🛡️ CONFIGURATION ENGINE (Multi-Source Discovery)
+param(
+    [string]$Token = $env:AGENT_TOKEN,
+    [string]$Url = $env:INGEST_URL,
+    [int]$Interval = 30
+)
+
+# Fallback: Try to load from local config file if env/params are missing
+$ConfigPath = Join-Path $PSScriptRoot "config.json"
+if ((!$Token -or !$Url) -and (Test-Path $ConfigPath)) {
+    try {
+        $Config = Get-Content $ConfigPath | ConvertFrom-Json
+        if (!$Token) { $Token = $Config.token }
+        if (!$Url) { $Url = $Config.url }
+    } catch {}
+}
 
 # 🛡️ NETWORK HARDENING (Essential for Data Centers)
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 [System.Net.ServicePointManager]::CheckCertificateRevocationList = $false # Bypass CRL check for offline/restricted networks
 
 if (!$Token -or !$Url) {
-    Write-Error "AGENT_TOKEN and INGEST_URL environment variables are required."
+    Write-Error "AGENT_TOKEN and INGEST_URL are required (via Param, Env, or config.json)."
     exit 1
 }
 
