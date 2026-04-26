@@ -428,10 +428,10 @@ if exist "monitorhub-agent.ps1" (
     schtasks /delete /tn "MonitorHubAgent" /f >nul 2>&1
     
     :: Create a professional Windows Service
-    set "SVC_DESC=MonitorHub Enterprise Telemetry Agent"
-    set "BIN_PATH=powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File \\"%INSTALL_DIR%\\monitorhub-agent.ps1\\""
+    :: We use single quotes for the path to handle spaces safely in PowerShell
+    set "SVC_BIN=powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File '%INSTALL_DIR%\\monitorhub-agent.ps1'"
     
-    powershell -Command "New-Service -Name 'MonitorHubAgent' -BinaryPathName '!BIN_PATH!' -DisplayName 'MonitorHub Enterprise Agent' -Description '%SVC_DESC%' -StartupType Automatic"
+    powershell -Command "New-Service -Name 'MonitorHubAgent' -BinaryPathName '!SVC_BIN!' -DisplayName 'MonitorHub Enterprise Agent' -Description 'MonitorHub Enterprise Telemetry Agent' -StartupType Automatic"
     
     :: Set recovery options (Restart on failure)
     sc failure MonitorHubAgent reset= 86400 actions= restart/1000/restart/5000/restart/10000
@@ -440,8 +440,8 @@ if exist "monitorhub-agent.ps1" (
     sc start MonitorHubAgent
     
     echo ========================================================
-    echo  [SUCCESS] MonitorHub Enterprise Agent is ACTIVE!
-    echo  Check your dashboard in 10 seconds.
+    echo  [SUCCESS] MonitorHub Enterprise Agent is NOW ACTIVE!
+    echo  Status: Running as a Windows Service.
     echo ========================================================
     pause
     exit /b
