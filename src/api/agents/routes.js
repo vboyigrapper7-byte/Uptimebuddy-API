@@ -1,6 +1,7 @@
 const crypto = require('crypto');
 const path   = require('path');
 const fs     = require('fs');
+const auditService = require('../../core/auth/auditService');
 
 // ── SSRF / private‑IP guard ─────────────────────────────────────────────
 const PRIVATE_IP_RE = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|::1|0\.0\.0\.0)/i;
@@ -48,7 +49,18 @@ async function agentRoutes(fastify, options) {
                 ALTER TABLE agent_binaries ADD COLUMN IF NOT EXISTS platform varchar(50);
                 ALTER TABLE agent_binaries ADD COLUMN IF NOT EXISTS architecture varchar(50);
                 
-                -- ADD UNIQUE CONSTRAINT (Critical for ON CONFLICT to work)
+                -- DROP NOT NULL from legacy columns (This fixes the error you saw)
+                DO $$ 
+                BEGIN 
+                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='agent_binaries' AND column_name='os') THEN
+                        ALTER TABLE agent_binaries ALTER COLUMN os DROP NOT NULL;
+                    END IF;
+                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='agent_binaries' AND column_name='arch') THEN
+                        ALTER TABLE agent_binaries ALTER COLUMN arch DROP NOT NULL;
+                    END IF;
+                END $$;
+
+                -- ADD UNIQUE CONSTRAINT
                 DO $$ 
                 BEGIN 
                     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'unique_platform_arch_release') THEN
@@ -78,24 +90,24 @@ async function agentRoutes(fastify, options) {
                 ON CONFLICT (version) DO NOTHING;
             `);
 
-            // 2. Setup Windows MSI (GitHub Release)
+            // 2. Setup Windows MSI (Dual-Column Support)
             await fastify.db.query(`
-                INSERT INTO agent_binaries (release_id, platform, architecture, file_path, sha256)
+                INSERT INTO agent_binaries (release_id, platform, os, architecture, arch, file_path, sha256)
                 VALUES (
                     (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
-                    'windows', 'amd64',
+                    'windows', 'windows', 'amd64', 'amd64',
                     '${releaseUrl}',
                     'N/A'
                 )
                 ON CONFLICT ON CONSTRAINT unique_platform_arch_release DO UPDATE SET file_path = EXCLUDED.file_path;
             `);
 
-            // 3. Setup Linux Agent (Fallthrough to backend serve)
+            // 3. Setup Linux Agent (Dual-Column Support)
             await fastify.db.query(`
-                INSERT INTO agent_binaries (release_id, platform, architecture, file_path, sha256)
+                INSERT INTO agent_binaries (release_id, platform, os, architecture, arch, file_path, sha256)
                 VALUES (
                     (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
-                    'linux', 'amd64',
+                    'linux', 'linux', 'amd64', 'amd64',
                     '/api/v1/agents/scripts/linux',
                     'N/A'
                 )
@@ -136,108 +148,73 @@ async function agentRoutes(fastify, options) {
         }
 
         try {
-            // 1. Initial Lookup (Resilient to missing IP columns)
-            let agentId, existing;
-            try {
-                const res = await fastify.db.query('SELECT id, public_ip, private_ip FROM agents WHERE agent_token = $1', [agent_token]);
-                if (res.rows.length === 0) return reply.status(401).send({ error: 'Invalid agent token' });
-                agentId  = res.rows[0].id;
-                existing = res.rows[0];
-            } catch (err) {
-                // FALLBACK: If columns don't exist yet
-                const res = await fastify.db.query('SELECT id FROM agents WHERE agent_token = $1', [agent_token]);
-                if (res.rows.length === 0) return reply.status(401).send({ error: 'Invalid agent token' });
-                agentId  = res.rows[0].id;
-                existing = { id: agentId }; // No IP history available
+            // 1. Initial Lookup (Find agent and check previous status for alerting)
+            const res = await fastify.db.query(
+                'SELECT id, user_id, status, name FROM agents WHERE agent_token = $1',
+                [agent_token]
+            );
+
+            if (res.rows.length === 0) {
+                return reply.status(404).send({ error: 'Agent not found' });
             }
+
+            const agent = res.rows[0];
+            const agentId = agent.id;
+            const userId  = agent.user_id;
+            const prevStatus = agent.status;
+            const hostname = request.body?.hostname;
+            const os_type  = request.body?.os_type;
+            const public_ip = request.ip;
 
             const recordedAt = new Date();
 
-            // 2. Log Metrics (Resilient to missing columns)
-            try {
+            // 2. Save Metrics (Hardware Aware for Accurate Dashboard Stats)
+            await fastify.db.query(`
+                INSERT INTO agent_metrics (
+                    agent_id, recorded_at, cpu_percent, ram_mb, ram_percent, disk_percent, 
+                    net_rx_mb, net_tx_mb, process_count,
+                    ram_total_mb, disk_total_gb, disk_free_gb, uptime_seconds
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+                [
+                    agentId, recordedAt, 
+                    metrics.cpu_percent, metrics.ram_mb, metrics.ram_percent, metrics.disk_percent,
+                    metrics.net_rx_mb || 0, metrics.net_tx_mb || 0, metrics.process_count || 0,
+                    metrics.ram_total_mb, metrics.disk_total_gb, metrics.disk_free_gb, metrics.uptime_seconds
+                ]
+            );
+
+            // 3. Update Agent State
+            const newStatus = 'up';
+            await fastify.db.query(`
+                UPDATE agents 
+                SET last_seen = NOW(), 
+                    status = $2, 
+                    agent_type = $3, 
+                    agent_version = $4,
+                    hostname = COALESCE($5, hostname),
+                    os_type = COALESCE($6, os_type),
+                    public_ip = $7
+                WHERE id = $1`, 
+                [agentId, newStatus, agent_type, agent_version, hostname, os_type, public_ip]
+            );
+
+            // 4. Alert Trigger (Up/Down Logic)
+            if (prevStatus === 'down' || prevStatus === 'pending') {
+                const teamRes = await fastify.db.query('SELECT team_id FROM team_members WHERE user_id = $1 LIMIT 1', [userId]);
+                const teamId = teamRes.rows[0]?.team_id;
+
                 await fastify.db.query(
-                    `INSERT INTO agent_metrics
-                     (agent_id, recorded_at, cpu_percent, ram_mb, ram_total_mb, disk_percent, net_rx_mb, net_tx_mb, uptime_seconds, process_count, disk_total_gb, disk_free_gb)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                     ON CONFLICT DO NOTHING`,
-                    [
-                        agentId, recordedAt,
-                        metrics.cpu_percent, metrics.ram_mb, metrics.ram_total_mb ?? null,
-                        metrics.disk_percent,
-                        metrics.net_rx_mb ?? null, metrics.net_tx_mb ?? null,
-                        metrics.uptime_seconds ?? null, metrics.process_count ?? null,
-                        metrics.disk_total_gb ?? null, metrics.disk_free_gb ?? null
-                    ]
+                    'INSERT INTO alert_history (user_id, monitor_id, type, message, severity) VALUES ($1, $2, $3, $4, $5)',
+                    [userId, null, 'server_status', `[${agent.name}] System Online: Server is now UP and reporting telemetry.`, 'critical']
                 );
-            } catch (err) {
-                // FALLBACK: Basic metrics only
-                await fastify.db.query(
-                    `INSERT INTO agent_metrics (agent_id, recorded_at, cpu_percent, ram_mb, disk_percent) VALUES ($1, $2, $3, $4, $5)`,
-                    [agentId, recordedAt, metrics.cpu_percent, metrics.ram_mb, metrics.disk_percent]
-                );
-            }
-
-            // 3. Update Status (Resilient to missing SaaS columns)
-            const { public_ip, private_ip, hostname, os_type } = request.body || {};
-            
-            try {
-                const publicIpChanged  = public_ip && public_ip !== (existing.public_ip || '');
-                const privateIpChanged = private_ip && private_ip !== (existing.private_ip || '');
-                const metaChanged      = hostname || os_type || agent_version;
-
-                if (metaChanged || publicIpChanged || privateIpChanged) {
-                    await fastify.db.query(`
-                        UPDATE agents SET 
-                            last_seen = NOW(),
-                            status = 'active',
-                            agent_type = $6,
-                            agent_version = COALESCE($7, agent_version),
-                            public_ip = COALESCE($2, public_ip),
-                            private_ip = COALESCE($3, private_ip),
-                            prev_public_ip = CASE WHEN $2 IS NOT NULL AND $2 != COALESCE(public_ip, '') THEN public_ip ELSE prev_public_ip END,
-                            prev_private_ip = CASE WHEN $3 IS NOT NULL AND $3 != COALESCE(private_ip, '') THEN private_ip ELSE prev_private_ip END,
-                            ip_changed_at = CASE WHEN ($2 IS NOT NULL AND $2 != COALESCE(public_ip, '')) OR ($3 IS NOT NULL AND $3 != COALESCE(private_ip, '')) THEN NOW() ELSE ip_changed_at END,
-                            hostname = COALESCE($4, hostname),
-                            os_type = COALESCE($5, os_type)
-                        WHERE id = $1`, 
-                        [agentId, public_ip || null, private_ip || null, hostname || null, os_type || null, agent_type, agent_version || null]
-                    );
-                } else {
-                    await fastify.db.query("UPDATE agents SET last_seen = NOW(), status = 'active' WHERE id = $1", [agentId]);
-                }
-            } catch (err) {
-                // FINAL FALLBACK: Essential Heartbeat
-                await fastify.db.query("UPDATE agents SET last_seen = NOW(), status = 'active', agent_type = $2 WHERE id = $1", [agentId, agent_type]);
-            }
-
-            // 4. Check for Updates (Rollout-Aware)
-            let update_available = null;
-            if (agent_type === 'go' && agent_version) {
-                try {
-                    const latestRes = await fastify.db.query('SELECT * FROM agent_releases WHERE is_stable = true ORDER BY created_at DESC LIMIT 1');
-                    if (latestRes.rows.length > 0) {
-                        const latest = latestRes.rows[0];
-                        if (latest.version !== agent_version) {
-                            // Determine if this specific agent is in the rollout group
-                            let inRolloutGroup = true;
-                            if (latest.rollout_percentage < 100) {
-                                const hash = crypto.createHash('md5').update(agent_token).digest('hex');
-                                const bucket = parseInt(hash.substring(0, 2), 16) % 100;
-                                inRolloutGroup = (bucket < latest.rollout_percentage);
-                            }
-
-                            if (inRolloutGroup) {
-                                update_available = latest.version;
-                                fastify.log.info({ agentId, agent_version, latest: latest.version }, 'Update signal sent to agent');
-                            }
-                        }
-                    }
-                } catch (e) { 
-                    fastify.log.error(e, 'Error checking for agent update');
+                
+                // Professional Audit Logging
+                if (teamId) {
+                    await auditService.log(userId, teamId, 'server_recovered', { name: agent.name, id: agentId });
                 }
             }
 
-            return reply.send({ success: true, update_available });
+            return reply.send({ success: true });
         } catch (err) {
             fastify.log.error(err, 'Agent ingest fatal error');
             return reply.status(500).send({ error: 'Internal server error' });
@@ -577,16 +554,18 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
         const { token } = request.query;
         
         try {
-            // Priority 1: Check Database for Professional R2 URL
+            // Priority 1: Check Database (Harden for all column naming versions)
             const res = await fastify.db.query(`
                 SELECT b.file_path 
                 FROM agent_binaries b
                 JOIN agent_releases r ON b.release_id = r.id
-                WHERE b.platform = 'windows' AND b.architecture = 'amd64' AND r.is_stable = true
+                WHERE (b.platform = 'windows' OR b.os = 'windows') 
+                  AND (b.architecture = 'amd64' OR b.arch = 'amd64')
+                  AND r.is_stable = true
                 ORDER BY r.created_at DESC LIMIT 1
             `);
 
-            if (res.rows.length > 0) {
+            if (res.rows.length > 0 && res.rows[0].file_path) {
                 return reply.redirect(res.rows[0].file_path);
             }
 
@@ -791,6 +770,13 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
                     [name || null, server_group !== undefined ? server_group : null, id, userId]
                 );
                 if (res.rows.length === 0) return reply.code(404).send({ error: 'Server not found' });
+                
+                // Professional Audit Log
+                const teamRes = await fastify.db.query('SELECT team_id FROM team_members WHERE user_id = $1 LIMIT 1', [userId]);
+                if (teamRes.rows.length > 0) {
+                    await auditService.log(userId, teamRes.rows[0].team_id, 'server_updated', { name: res.rows[0].name, group: server_group });
+                }
+
                 return reply.send(res.rows[0]);
             } catch (err) {
                 fastify.log.error(err, 'updateAgent error');
@@ -806,13 +792,21 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
             try {
                 // Ownership check
                 const verify = await fastify.db.query(
-                    'SELECT id FROM agents WHERE id = $1 AND user_id = $2', [id, userId]
+                    'SELECT id, name FROM agents WHERE id = $1 AND user_id = $2', [id, userId]
                 );
                 if (verify.rows.length === 0) return reply.code(404).send({ error: 'Server not found' });
+
+                const serverName = verify.rows[0].name;
 
                 // agent_metrics has ON DELETE CASCADE — but we also delete explicitly to be safe
                 await fastify.db.query('DELETE FROM agent_metrics WHERE agent_id = $1', [id]);
                 await fastify.db.query('DELETE FROM agents WHERE id = $1', [id]);
+
+                // Professional Audit Log
+                const teamRes = await fastify.db.query('SELECT team_id FROM team_members WHERE user_id = $1 LIMIT 1', [userId]);
+                if (teamRes.rows.length > 0) {
+                    await auditService.log(userId, teamRes.rows[0].team_id, 'server_deleted', { name: serverName, id });
+                }
 
                 return reply.send({ success: true });
             } catch (err) {
@@ -821,6 +815,41 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
             }
         });
     });
+
+    // ────────────────────────────────────────────────────────────────────
+    // BACKGROUND HEALTH CHECKER (Enterprise Pulse Monitor)
+    // ────────────────────────────────────────────────────────────────────
+    setInterval(async () => {
+        try {
+            // Find agents that haven't reported in 90 seconds but are still marked as 'up'
+            const staleRes = await fastify.db.query(`
+                SELECT id, user_id, name FROM agents 
+                WHERE status = 'up' 
+                AND last_seen < NOW() - INTERVAL '90 seconds'
+            `);
+
+            for (const agent of staleRes.rows) {
+                // 1. Mark as Down
+                await fastify.db.query("UPDATE agents SET status = 'down' WHERE id = $1", [agent.id]);
+                
+                // 2. Trigger Alert
+                await fastify.db.query(
+                    'INSERT INTO alert_history (user_id, monitor_id, type, message, severity) VALUES ($1, $2, $3, $4, $5)',
+                    [agent.user_id, null, 'server_status', `[${agent.name}] System Offline: No heartbeat detected for 90s.`, 'critical']
+                );
+
+                // 3. Log to Audit (Team Scope)
+                const teamRes = await fastify.db.query('SELECT team_id FROM team_members WHERE user_id = $1 LIMIT 1', [agent.user_id]);
+                if (teamRes.rows.length > 0) {
+                    await auditService.log(agent.user_id, teamRes.rows[0].team_id, 'server_down', { name: agent.name, id: agent.id });
+                }
+                
+                fastify.log.warn({ agentId: agent.id }, 'Agent marked DOWN due to inactivity');
+            }
+        } catch (err) {
+            fastify.log.error(err, 'Health checker failed');
+        }
+    }, 60000); // Check every 60 seconds
 }
 
 module.exports = agentRoutes;

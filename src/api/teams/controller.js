@@ -1,4 +1,5 @@
 const pool = require('../../core/db/pool');
+const auditService = require('../../core/auth/auditService');
 
 const getMembers = async (request, reply) => {
     try {
@@ -30,6 +31,9 @@ const inviteMember = async (request, reply) => {
             'INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
             [teamId, userId, role || 'member']
         );
+
+        // Audit Log
+        await auditService.log(request.user.id, teamId, 'member_invited', { invited_email: email, role });
 
         return reply.send({ success: true });
     } catch (err) {
