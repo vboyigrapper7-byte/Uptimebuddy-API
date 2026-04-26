@@ -25,10 +25,17 @@ function validateMetrics(metrics) {
 
 // ── Agent dynamic status helper ───────────────────────────────────────────
 function getDynamicAgentStatus(agent) {
-    if (!agent.last_seen || agent.status === 'pending') return agent.status;
+    if (!agent.last_seen) return agent.status;
     const now = Date.now();
     const secondsSinceSeen = (now - new Date(agent.last_seen).getTime()) / 1000;
-    return secondsSinceSeen < 90 ? 'up' : 'down';
+    
+    // If we've seen it recently, it's UP (overrides 'pending')
+    if (secondsSinceSeen < 90) return 'up';
+    
+    // If it was pending but hasn't reported, stay pending
+    if (agent.status === 'pending') return 'pending';
+    
+    return 'down';
 }
 
 const { requireApiKey } = require('../auth/middleware');
@@ -168,6 +175,20 @@ async function agentRoutes(fastify, options) {
 
             const recordedAt = new Date();
 
+            // 1.5 Update Agent State (Heartbeat Priority - Ensures 'Online' Status)
+            await fastify.db.query(`
+                UPDATE agents 
+                SET last_seen = NOW(), 
+                    status = 'up', 
+                    agent_type = $2, 
+                    agent_version = $3,
+                    hostname = COALESCE($4, hostname),
+                    os_type = COALESCE($5, os_type),
+                    public_ip = $6
+                WHERE id = $1`, 
+                [agentId, agent_type, agent_version, hostname, os_type, public_ip]
+            );
+
             // 2. Save Metrics (Hardware Aware for Accurate Dashboard Stats)
             await fastify.db.query(`
                 INSERT INTO agent_metrics (
@@ -181,21 +202,6 @@ async function agentRoutes(fastify, options) {
                     metrics.net_rx_mb || 0, metrics.net_tx_mb || 0, metrics.process_count || 0,
                     metrics.ram_total_mb, metrics.disk_total_gb, metrics.disk_free_gb, metrics.uptime_seconds
                 ]
-            );
-
-            // 3. Update Agent State
-            const newStatus = 'up';
-            await fastify.db.query(`
-                UPDATE agents 
-                SET last_seen = NOW(), 
-                    status = $2, 
-                    agent_type = $3, 
-                    agent_version = $4,
-                    hostname = COALESCE($5, hostname),
-                    os_type = COALESCE($6, os_type),
-                    public_ip = $7
-                WHERE id = $1`, 
-                [agentId, newStatus, agent_type, agent_version, hostname, os_type, public_ip]
             );
 
             // 4. Alert Trigger (Up/Down Logic)
@@ -540,13 +546,15 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
     // Serve the actual Native Script Files
     // ────────────────────────────────────────────────────────────────────
     fastify.get('/scripts/windows', async (request, reply) => {
-        const scriptPath = path.resolve(__dirname, '../../../uptimebuddy-agent.ps1');
+        const scriptPath = path.resolve(__dirname, './bin/uptimebuddy-agent.ps1');
+        if (!fs.existsSync(scriptPath)) return reply.status(404).send('Agent script not found');
         const content = await fs.promises.readFile(scriptPath, 'utf-8');
         return reply.type('text/plain').send(content);
     });
 
     fastify.get('/scripts/linux', async (request, reply) => {
-        const scriptPath = path.resolve(__dirname, '../../../uptimebuddy-agent.py');
+        const scriptPath = path.resolve(__dirname, './bin/uptimebuddy-agent.py');
+        if (!fs.existsSync(scriptPath)) return reply.status(404).send('Agent script not found');
         const content = await fs.promises.readFile(scriptPath, 'utf-8');
         return reply.type('text/plain').send(content);
     });
@@ -634,10 +642,11 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
                     [token, userId]
                 );
 
-                if (res.rows.length === 0) return reply.send({ connected: false });
+                if (res.rows.length === 0) return reply.send({ success: true, connected: false });
                 
                 const agent = res.rows[0];
                 return reply.send({ 
+                    success: true,
                     connected: agent.last_seen !== null,
                     agent_id: agent.id
                 });
