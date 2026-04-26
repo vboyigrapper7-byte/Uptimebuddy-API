@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const path   = require('path');
 const fs     = require('fs');
 const auditService = require('../../core/auth/auditService');
+const { requireAuth, requireApiKey } = require('../auth/middleware');
 
 // ── SSRF / private‑IP guard ─────────────────────────────────────────────
 const PRIVATE_IP_RE = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|::1|0\.0\.0\.0)/i;
@@ -684,7 +685,6 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
     // PROTECTED — Dashboard / Management Routes (Auth required)
     // ────────────────────────────────────────────────────────────────────
     fastify.register(async (authScope) => {
-        const { requireAuth } = require('../auth/middleware');
         authScope.addHook('onRequest', requireAuth);
 
         // List all servers for user (With Live Metrics)

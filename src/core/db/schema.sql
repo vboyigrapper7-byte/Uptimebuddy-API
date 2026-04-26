@@ -124,7 +124,9 @@ CREATE TABLE IF NOT EXISTS agents (
     public_ip    VARCHAR(45),
     private_ip   VARCHAR(45),
     hostname     VARCHAR(255),
-    os_type      VARCHAR(50)
+    os_type      VARCHAR(50),
+    agent_type   VARCHAR(50)  DEFAULT 'node',
+    agent_version VARCHAR(20)
 );
 
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
