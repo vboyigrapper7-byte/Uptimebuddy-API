@@ -8,11 +8,26 @@ CREATE TABLE IF NOT EXISTS users (
     id            SERIAL PRIMARY KEY,
     email         VARCHAR(255) UNIQUE NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
+    name          VARCHAR(255),
     tier          VARCHAR(50)  DEFAULT 'free',
     role          VARCHAR(20)  DEFAULT 'customer',
     api_key_hash  VARCHAR(255),
+    status_slug   VARCHAR(50),
+    plan_id       VARCHAR(50),
+    plan_expiry   TIMESTAMP,
+    trial_ends_at TIMESTAMP,
+    subscription_id VARCHAR(255),
+    provider      VARCHAR(50) DEFAULT 'email',
     created_at    TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
 );
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS name VARCHAR(255);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS status_slug VARCHAR(50);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_id VARCHAR(50);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_expiry TIMESTAMP;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMP;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_id VARCHAR(255);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS provider VARCHAR(50) DEFAULT 'email';
 
 -- ── Refresh Tokens (Server-side session management) ──────────────────────────
 CREATE TABLE IF NOT EXISTS refresh_tokens (

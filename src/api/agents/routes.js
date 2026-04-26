@@ -48,6 +48,15 @@ async function agentRoutes(fastify, options) {
     fastify.get('/internal/seed-distribution', async (request, reply) => {
         try {
             await fastify.db.query(`
+                -- 0. Repair users table (Crucial for Auth)
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS name VARCHAR(255);
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS status_slug VARCHAR(50);
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_id VARCHAR(50);
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_expiry TIMESTAMP;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMP;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_id VARCHAR(255);
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS provider VARCHAR(50) DEFAULT 'email';
+
                 -- 1. Repair monitors table
                 ALTER TABLE monitors ADD COLUMN IF NOT EXISTS last_checked TIMESTAMP;
                 ALTER TABLE monitors ADD COLUMN IF NOT EXISTS last_alert_at TIMESTAMP;
