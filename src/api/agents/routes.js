@@ -39,8 +39,6 @@ function getDynamicAgentStatus(agent) {
     return 'down';
 }
 
-const { requireApiKey } = require('../auth/middleware');
-
 async function agentRoutes(fastify, options) {
 
     // ────────────────────────────────────────────────────────────────────

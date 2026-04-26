@@ -222,3 +222,55 @@ CREATE TABLE IF NOT EXISTS otps (
 
 CREATE INDEX IF NOT EXISTS idx_otps_email ON otps(email);
 
+-- ── Agent Software Management (Release & Binary Tracking) ───────────────────
+CREATE TABLE IF NOT EXISTS agent_releases (
+    id           SERIAL PRIMARY KEY,
+    version      VARCHAR(50) UNIQUE NOT NULL,
+    is_stable    BOOLEAN DEFAULT FALSE,
+    rollout_percentage INT DEFAULT 100,
+    release_notes TEXT,
+    created_at   TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS agent_binaries (
+    id           SERIAL PRIMARY KEY,
+    release_id   INT REFERENCES agent_releases(id) ON DELETE CASCADE,
+    platform     VARCHAR(20), -- 'windows', 'linux', 'darwin'
+    architecture VARCHAR(20), -- 'amd64', 'arm64'
+    file_path    TEXT NOT NULL,
+    sha256       VARCHAR(64),
+    download_count INT DEFAULT 0,
+    created_at   TIMESTAMP DEFAULT NOW(),
+    -- Compatibility columns for legacy code
+    os           VARCHAR(20),
+    arch         VARCHAR(20)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_binaries_release ON agent_binaries(release_id);
+
+-- ── Team Management (Collaboration) ──────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS teams (
+    id          SERIAL PRIMARY KEY,
+    name        VARCHAR(100) NOT NULL,
+    owner_id    INT REFERENCES users(id) ON DELETE CASCADE,
+    created_at  TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS team_members (
+    team_id     INT REFERENCES teams(id) ON DELETE CASCADE,
+    user_id     INT REFERENCES users(id) ON DELETE CASCADE,
+    role        VARCHAR(20) DEFAULT 'member', -- 'owner', 'admin', 'member', 'viewer'
+    joined_at   TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (team_id, user_id)
+);
+
+-- ── FINAL SYSTEM INTEGRITY REPAIRS (Safe for re-run) ──────────────────────────
+-- These ensure that even if a table existed, it has the latest professional columns.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS tier VARCHAR(50) DEFAULT 'free';
+ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) DEFAULT 'customer';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_type VARCHAR(50) DEFAULT 'node';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_version VARCHAR(20);
+ALTER TABLE monitor_metrics ADD COLUMN IF NOT EXISTS status_code INT;
+ALTER TABLE monitor_metrics ADD COLUMN IF NOT EXISTS error_message TEXT;
+
+
