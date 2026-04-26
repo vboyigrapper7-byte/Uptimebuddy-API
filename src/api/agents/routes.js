@@ -168,6 +168,20 @@ async function agentRoutes(fastify, options) {
 
             const recordedAt = new Date();
 
+            // 1.5 Update Agent State (Heartbeat Priority - Ensures 'Online' Status)
+            await fastify.db.query(`
+                UPDATE agents 
+                SET last_seen = NOW(), 
+                    status = 'up', 
+                    agent_type = $2, 
+                    agent_version = $3,
+                    hostname = COALESCE($4, hostname),
+                    os_type = COALESCE($5, os_type),
+                    public_ip = $6
+                WHERE id = $1`, 
+                [agentId, agent_type, agent_version, hostname, os_type, public_ip]
+            );
+
             // 2. Save Metrics (Hardware Aware for Accurate Dashboard Stats)
             await fastify.db.query(`
                 INSERT INTO agent_metrics (
@@ -181,21 +195,6 @@ async function agentRoutes(fastify, options) {
                     metrics.net_rx_mb || 0, metrics.net_tx_mb || 0, metrics.process_count || 0,
                     metrics.ram_total_mb, metrics.disk_total_gb, metrics.disk_free_gb, metrics.uptime_seconds
                 ]
-            );
-
-            // 3. Update Agent State
-            const newStatus = 'up';
-            await fastify.db.query(`
-                UPDATE agents 
-                SET last_seen = NOW(), 
-                    status = $2, 
-                    agent_type = $3, 
-                    agent_version = $4,
-                    hostname = COALESCE($5, hostname),
-                    os_type = COALESCE($6, os_type),
-                    public_ip = $7
-                WHERE id = $1`, 
-                [agentId, newStatus, agent_type, agent_version, hostname, os_type, public_ip]
             );
 
             // 4. Alert Trigger (Up/Down Logic)
@@ -291,56 +290,60 @@ if %errorLevel% neq 0 (
 )
 
 echo ========================================================
-echo  MonitorHub Enterprise Agent Setup (Windows Native)
+echo  MonitorHub Enterprise Agent Setup (Windows Pro)
 echo ========================================================
 
 :: ── Directory Setup ────────────────────────────────────────────────────────
 set "INSTALL_DIR=C:\\Program Files\\MonitorHub"
-mkdir "%INSTALL_DIR%" 2>nul
+if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
 cd /d "%INSTALL_DIR%"
 
-:: ── Download Native PowerShell Agent ────────────────────────────────────────
-echo [INFO] Downloading Native Pro Agent...
-curl.exe --ssl-no-revoke -f -s -L -o "monitorhub-agent.ps1" "${hostUrl}/api/v1/agents/scripts/windows"
+:: ── Multi-Stage Download Engine ──────────────────────────────────────────
+echo [INFO] Downloading Agent Engine...
+set "AGENT_URL=${hostUrl}/api/v1/agents/scripts/windows"
 
-if %errorLevel% equ 0 (
-    echo [SUCCESS] Native Agent downloaded.
+:: Try Curl (Fastest)
+curl.exe --ssl-no-revoke -f -s -L -o "monitorhub-agent.ps1" "%AGENT_URL%"
+
+:: Try PowerShell Fallback (Most compatible)
+if not exist "monitorhub-agent.ps1" (
+    echo [INFO] Curl failed. Trying PowerShell engine...
+    powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; [System.Net.ServicePointManager]::CheckCertificateRevocationList = $false; (New-Object System.Net.WebClient).DownloadFile('%AGENT_URL%', 'monitorhub-agent.ps1')"
+)
+
+if exist "monitorhub-agent.ps1" (
+    echo [SUCCESS] Agent Engine downloaded.
     
-    :: Create config
+    :: ── Configuration ────────────────────────────────────────
     echo [INFO] Configuring Environment...
     setx AGENT_TOKEN "${token}" /M >nul
     setx INGEST_URL "${hostUrl}/api/v1/agents/ingest" /M >nul
+    
+    :: Set for current session too
+    set "AGENT_TOKEN=${token}"
+    set "INGEST_URL=${hostUrl}/api/v1/agents/ingest"
 
-    :: Register as a Scheduled Task (Native Windows way to run in background)
-    echo [INFO] Registering System Background Task...
-    schtasks /create /tn "MonitorHubAgent" /tr "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File \\"%INSTALL_DIR%\\monitorhub-agent.ps1\\"" /sc onstart /ru SYSTEM /f
+    :: ── Persistence Setup ─────────────────────────────────────
+    echo [INFO] Registering System Background Service...
+    
+    :: Delete old task if exists
+    schtasks /delete /tn "MonitorHubAgent" /f >nul 2>&1
+    
+    :: Create new High-Privilege task (System level, no window)
+    schtasks /create /tn "MonitorHubAgent" /tr "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File \\"%INSTALL_DIR%\\monitorhub-agent.ps1\\"" /sc onstart /ru SYSTEM /f /rl HIGHEST
+    
+    :: Start it immediately
     schtasks /run /tn "MonitorHubAgent"
     
     echo ========================================================
-    echo  [SUCCESS] Native Enterprise Agent installed!
-    echo  Telemetry is now flowing in the background.
+    echo  [SUCCESS] MonitorHub Enterprise Agent is ACTIVE!
+    echo  Check your dashboard in 30 seconds.
     echo ========================================================
     pause
     exit /b
 )
 
-:: ── Final Fallback to Node.js (Robust Legacy Path) ──────────────────────────
-echo [WARNING] Native Script Agent failed. Attempting Node.js Recovery...
-node -v >nul 2>&1
-if %errorLevel% equ 0 (
-    mkdir "%USERPROFILE%\\monitorhub-agent" 2>nul
-    cd /d "%USERPROFILE%\\monitorhub-agent"
-    echo AGENT_TOKEN=${token}> .env
-    echo INGEST_URL=${hostUrl}/api/v1/agents/ingest>> .env
-    call npm init -y >nul
-    call npm install axios dotenv systeminformation node-windows --quiet
-    curl.exe -s -L -o agent.js "${hostUrl}/api/v1/agents/script"
-    curl.exe -s -L -o service.js "${hostUrl}/api/v1/agents/windows-service.js"
-    node service.js
-    echo [SUCCESS] Legacy Node Agent installed successfully.
-) else (
-    echo [ERROR] No compatible runtime found.
-)
+echo [ERROR] Could not download agent engine. Please check your internet connection and firewall.
 pause`;
         return reply
             .type('application/octet-stream')
@@ -536,13 +539,15 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
     // Serve the actual Native Script Files
     // ────────────────────────────────────────────────────────────────────
     fastify.get('/scripts/windows', async (request, reply) => {
-        const scriptPath = path.resolve(__dirname, '../../../uptimebuddy-agent.ps1');
+        const scriptPath = path.resolve(__dirname, './bin/uptimebuddy-agent.ps1');
+        if (!fs.existsSync(scriptPath)) return reply.status(404).send('Agent script not found');
         const content = await fs.promises.readFile(scriptPath, 'utf-8');
         return reply.type('text/plain').send(content);
     });
 
     fastify.get('/scripts/linux', async (request, reply) => {
-        const scriptPath = path.resolve(__dirname, '../../../uptimebuddy-agent.py');
+        const scriptPath = path.resolve(__dirname, './bin/uptimebuddy-agent.py');
+        if (!fs.existsSync(scriptPath)) return reply.status(404).send('Agent script not found');
         const content = await fs.promises.readFile(scriptPath, 'utf-8');
         return reply.type('text/plain').send(content);
     });
