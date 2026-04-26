@@ -63,6 +63,8 @@ ALTER TABLE monitors ADD COLUMN IF NOT EXISTS region VARCHAR(50) DEFAULT 'Global
 ALTER TABLE monitors ADD COLUMN IF NOT EXISTS priority VARCHAR(20) DEFAULT 'medium';
 ALTER TABLE monitors ADD COLUMN IF NOT EXISTS assertion_config JSONB;
 ALTER TABLE monitors ADD COLUMN IF NOT EXISTS escalation_state JSONB DEFAULT '{"step": 0, "last_trigger": null}';
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS last_checked TIMESTAMP;
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS last_alert_at TIMESTAMP;
 
 CREATE INDEX IF NOT EXISTS idx_monitors_user_id    ON monitors(user_id);
 CREATE INDEX IF NOT EXISTS idx_monitors_status      ON monitors(status);
@@ -73,8 +75,13 @@ CREATE TABLE IF NOT EXISTS monitor_metrics (
     recorded_at      TIMESTAMP    NOT NULL,
     response_time_ms INT,
     status           VARCHAR(50),
+    status_code      INT,
+    error_message    TEXT,
     PRIMARY KEY (monitor_id, recorded_at)
 );
+
+ALTER TABLE monitor_metrics ADD COLUMN IF NOT EXISTS status_code INT;
+ALTER TABLE monitor_metrics ADD COLUMN IF NOT EXISTS error_message TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_monitor_metrics_time ON monitor_metrics(monitor_id, recorded_at DESC);
 

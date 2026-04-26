@@ -47,16 +47,25 @@ async function agentRoutes(fastify, options) {
     // ────────────────────────────────────────────────────────────────────
     fastify.get('/internal/seed-distribution', async (request, reply) => {
         try {
-            // SELF-HEALING: Add missing columns AND Unique Constraints
             await fastify.db.query(`
-                -- Repair agents table
+                -- 1. Repair monitors table
+                ALTER TABLE monitors ADD COLUMN IF NOT EXISTS last_checked TIMESTAMP;
+                ALTER TABLE monitors ADD COLUMN IF NOT EXISTS last_alert_at TIMESTAMP;
+                ALTER TABLE monitors ADD COLUMN IF NOT EXISTS category VARCHAR(20) DEFAULT 'uptime';
+                ALTER TABLE monitors ADD COLUMN IF NOT EXISTS assertion_config JSONB;
+
+                -- 2. Repair monitor_metrics
+                ALTER TABLE monitor_metrics ADD COLUMN IF NOT EXISTS status_code INT;
+                ALTER TABLE monitor_metrics ADD COLUMN IF NOT EXISTS error_message TEXT;
+
+                -- 3. Repair agents table
                 ALTER TABLE agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
                 ALTER TABLE agents ADD COLUMN IF NOT EXISTS public_ip varchar(45);
                 ALTER TABLE agents ADD COLUMN IF NOT EXISTS private_ip varchar(45);
                 ALTER TABLE agents ADD COLUMN IF NOT EXISTS hostname varchar(255);
                 ALTER TABLE agents ADD COLUMN IF NOT EXISTS os_type varchar(50);
 
-                -- Repair monitor_stats (Critical for Dashboard)
+                -- 4. Repair monitor_stats
                 CREATE TABLE IF NOT EXISTS monitor_stats (
                     monitor_id      INT PRIMARY KEY REFERENCES monitors(id) ON DELETE CASCADE,
                     uptime_24h      NUMERIC(5,2) DEFAULT 100.00,
@@ -64,33 +73,7 @@ async function agentRoutes(fastify, options) {
                     last_updated_at TIMESTAMP DEFAULT NOW()
                 );
                 
-                -- Repair agent_releases
-                ALTER TABLE agent_releases ADD COLUMN IF NOT EXISTS rollout_percentage integer DEFAULT 100;
-                
-                -- Repair agent_binaries (os/arch -> platform/architecture)
-                ALTER TABLE agent_binaries ADD COLUMN IF NOT EXISTS platform varchar(50);
-                ALTER TABLE agent_binaries ADD COLUMN IF NOT EXISTS architecture varchar(50);
-                
-                -- DROP NOT NULL from legacy columns
-                DO $$ 
-                BEGIN 
-                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='agent_binaries' AND column_name='os') THEN
-                        ALTER TABLE agent_binaries ALTER COLUMN os DROP NOT NULL;
-                    END IF;
-                    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='agent_binaries' AND column_name='arch') THEN
-                        ALTER TABLE agent_binaries ALTER COLUMN arch DROP NOT NULL;
-                    END IF;
-                END $$;
-
-                -- ADD UNIQUE CONSTRAINT
-                DO $$ 
-                BEGIN 
-                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'unique_platform_arch_release') THEN
-                        ALTER TABLE agent_binaries ADD CONSTRAINT unique_platform_arch_release UNIQUE (platform, architecture, release_id);
-                    END IF;
-                END $$;
-                
-                -- Repair agent_metrics table (Comprehensive)
+                -- 5. Repair agent_metrics
                 ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS ram_total_mb integer;
                 ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS ram_percent numeric(5,2);
                 ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS disk_total_gb numeric;
@@ -100,8 +83,10 @@ async function agentRoutes(fastify, options) {
                 ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS uptime_seconds bigint DEFAULT 0;
                 ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS process_count integer DEFAULT 0;
 
-                -- Ensure performance indexes exist
+                -- 6. Indexes
                 CREATE INDEX IF NOT EXISTS idx_agent_metrics_compound ON agent_metrics (agent_id, recorded_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_monitors_status ON monitors(status);
+                CREATE INDEX IF NOT EXISTS idx_monitor_metrics_time ON monitor_metrics(monitor_id, recorded_at DESC);
             `);
 
             const releaseUrl = 'https://github.com/vboyigrapper7-byte/Uptimebuddy-API/releases/download/v1.0/MonitorHubAgent.msi';
