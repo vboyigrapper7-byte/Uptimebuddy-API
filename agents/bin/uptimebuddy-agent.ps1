@@ -3,22 +3,44 @@
 # Resilience: Triple-Fallback Network Engine
 # ========================================================
 
-$Token = $env:AGENT_TOKEN
-$Url = $env:INGEST_URL
-$Interval = 30 # Seconds
+# 🛡️ CONFIGURATION ENGINE (Multi-Source Discovery)
+param(
+    [string]$Token = $null,
+    [string]$Url = $null,
+    [int]$Interval = 30
+)
+
+# Load from Environment if parameters are empty
+if (!$Token) { $Token = $env:AGENT_TOKEN }
+if (!$Url)   { $Url = $env:INGEST_URL }
+
+# Fallback: Try to load from local config file
+$ConfigPath = Join-Path $PSScriptRoot "config.json"
+if ((!$Token -or !$Url) -and (Test-Path $ConfigPath)) {
+    try {
+        $Config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
+        if (!$Token) { $Token = $Config.token }
+        if (!$Url) { $Url = $Config.url }
+    } catch {}
+}
+
+# 🛡️ DEEP CLEANING (Crucial for Windows reliability)
+if ($Token) { $Token = $Token.Trim().Replace('"', '').Replace("'", "") }
+if ($Url)   { $Url = $Url.Trim().Replace('"', '').Replace("'", "") }
 
 # 🛡️ NETWORK HARDENING (Essential for Data Centers)
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
-[System.Net.ServicePointManager]::CheckCertificateRevocationList = $false # Bypass CRL check for offline/restricted networks
+[System.Net.ServicePointManager]::CheckCertificateRevocationList = $false 
 
 if (!$Token -or !$Url) {
-    Write-Error "AGENT_TOKEN and INGEST_URL environment variables are required."
+    Write-Error "CRITICAL: AGENT_TOKEN and INGEST_URL not found. Run installer again."
     exit 1
 }
 
 Write-Host "===============================================" -ForegroundColor Cyan
 Write-Host " MonitorHub Enterprise Agent is Online" -ForegroundColor Cyan
-Write-Host " Reporting to: $Url" -ForegroundColor Gray
+Write-Host " Hostname: $env:COMPUTERNAME" -ForegroundColor Gray
+Write-Host " URL: $Url" -ForegroundColor Gray
 Write-Host "===============================================" -ForegroundColor Cyan
 
 function Send-Telemetry {
@@ -45,23 +67,36 @@ function Send-Telemetry {
 
 while ($true) {
     try {
-        # 1. Hardware Telemetry (High Performance CIM)
-        $OS = Get-CimInstance Win32_OperatingSystem
-        $CPU = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+        # 🛡️ COMPATIBILITY ENGINE (CIM vs WMI Fallback)
+        $HasCim = Get-Command Get-CimInstance -ErrorAction SilentlyContinue
         
-        $RAM_Total = [math]::Round($OS.TotalVisibleMemorySize / 1024, 0)
-        $RAM_Free = [math]::Round($OS.FreePhysicalMemory / 1024, 0)
+        if ($HasCim) {
+            $OS = Get-CimInstance Win32_OperatingSystem
+            $CPU = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+            $RAM_Total = [math]::Round($OS.TotalVisibleMemorySize / 1024, 0)
+            $RAM_Free = [math]::Round($OS.FreePhysicalMemory / 1024, 0)
+            $Disks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3"
+            $LastBoot = $OS.LastBootUpTime
+        } else {
+            # Legacy WMI Support (Windows Server 2008 / WMF 2.0)
+            $OS = Get-WmiObject Win32_OperatingSystem
+            $CPU = (Get-WmiObject Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+            $RAM_Total = [math]::Round($OS.TotalVisibleMemorySize / 1024, 0)
+            $RAM_Free = [math]::Round($OS.FreePhysicalMemory / 1024, 0)
+            $Disks = Get-WmiObject Win32_LogicalDisk -Filter "DriveType=3"
+            $LastBoot = $OS.ConvertToDateTime($OS.LastBootUpTime)
+        }
+
         $RAM_Used = $RAM_Total - $RAM_Free
         $RAM_Percent = [math]::Round(($RAM_Used / $RAM_Total) * 100, 2)
 
         # Get aggregate disk stats
-        $Disks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3"
         $Disk_Total = ($Disks | Measure-Object -Property Size -Sum).Sum / 1GB
         $Disk_Free = ($Disks | Measure-Object -Property FreeSpace -Sum).Sum / 1GB
         $Disk_Used = $Disk_Total - $Disk_Free
-        $Disk_Percent = [math]::Round(($Disk_Used / $Disk_Total) * 100, 2)
+        $Disk_Percent = if ($Disk_Total -gt 0) { [math]::Round(($Disk_Used / $Disk_Total) * 100, 2) } else { 0 }
 
-        $Uptime = [math]::Round((Get-Date) - $OS.LastBootUpTime).TotalSeconds
+        $Uptime = [math]::Round((Get-Date) - $LastBoot).TotalSeconds
         $ProcCount = (Get-Process).Count
 
         # 2. Build Professional Payload
