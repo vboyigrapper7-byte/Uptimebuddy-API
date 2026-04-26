@@ -405,15 +405,30 @@ set "INGEST_URL=${hostUrl}/api/v1/agents/ingest"
 :: ── Service Registration ──────────────────────────────────────────────────
 echo [INFO] Registering Windows Service...
 
+:: Validate local engine exists
+set "AGENT_PATH=%INSTALL_DIR%\\monitorhub-agent.ps1"
+if not exist "%AGENT_PATH%" (
+    echo [ERROR] Agent engine not found at: %AGENT_PATH%
+    pause
+    exit /b 1
+)
+
 :: Stop and Delete existing service
+echo [INFO] Cleaning up existing service...
 sc stop MonitorHubAgent >nul 2>&1
 sc delete MonitorHubAgent >nul 2>&1
 
-:: Create Service (Single line with escaped internal quotes)
-sc create MonitorHubAgent binPath= \"powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File \\\"%INSTALL_DIR%\\monitorhub-agent.ps1\\\"\" start= auto DisplayName= \"MonitorHub Enterprise Agent\"
+:: Create Service
+echo [DEBUG] Resolved AGENT_PATH: "%AGENT_PATH%"
+set "SC_COMMAND=sc create MonitorHubAgent binPath= \"powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File '%AGENT_PATH%'\" start= auto DisplayName= \"MonitorHub Enterprise Agent\""
+echo [DEBUG] Command: %SC_COMMAND%
+
+%SC_COMMAND%
 
 if %errorLevel% neq 0 (
     echo [ERROR] Failed to create Windows Service.
+    echo [DEBUG] errorLevel: %errorLevel%
+    echo [INFO] Possible causes: Access Denied, Service Name Conflict, or Syntax Error.
     pause
     exit /b 1
 )
