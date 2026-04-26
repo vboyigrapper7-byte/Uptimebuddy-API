@@ -39,7 +39,37 @@ async function agentRoutes(fastify, options) {
     // ────────────────────────────────────────────────────────────────────
     fastify.get('/internal/seed-distribution', async (request, reply) => {
         try {
-            const r2Base = 'https://pub-cd0ef10a12e241db85b83f22821052a0.r2.dev/bin/v1.0.0';
+            // SELF-HEALING: Add missing columns AND Unique Constraints
+            await fastify.db.query(`
+                -- Repair agent_releases
+                ALTER TABLE agent_releases ADD COLUMN IF NOT EXISTS rollout_percentage integer DEFAULT 100;
+                
+                -- Repair agent_binaries (os/arch -> platform/architecture)
+                ALTER TABLE agent_binaries ADD COLUMN IF NOT EXISTS platform varchar(50);
+                ALTER TABLE agent_binaries ADD COLUMN IF NOT EXISTS architecture varchar(50);
+                
+                -- ADD UNIQUE CONSTRAINT (Critical for ON CONFLICT to work)
+                DO $$ 
+                BEGIN 
+                    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'unique_platform_arch_release') THEN
+                        ALTER TABLE agent_binaries ADD CONSTRAINT unique_platform_arch_release UNIQUE (platform, architecture, release_id);
+                    END IF;
+                END $$;
+
+                -- Repair agents table
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS public_ip varchar(45);
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS private_ip varchar(45);
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS hostname varchar(255);
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS os_type varchar(50);
+                
+                -- Repair agent_metrics table
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS ram_total_mb integer;
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS disk_total_gb numeric;
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS disk_free_gb numeric;
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS uptime_seconds bigint;
+            `);
+
+            const releaseUrl = 'https://github.com/vboyigrapper7-byte/Uptimebuddy-API/releases/download/v1.0/MonitorHubAgent.msi';
             
             // 1. Setup Release
             await fastify.db.query(`
@@ -48,31 +78,31 @@ async function agentRoutes(fastify, options) {
                 ON CONFLICT (version) DO NOTHING;
             `);
 
-            // 2. Setup Windows MSI
+            // 2. Setup Windows MSI (GitHub Release)
             await fastify.db.query(`
                 INSERT INTO agent_binaries (release_id, platform, architecture, file_path, sha256)
                 VALUES (
                     (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
                     'windows', 'amd64',
-                    '${r2Base}/windows-amd64/MonitorHubAgent.msi',
+                    '${releaseUrl}',
                     'N/A'
                 )
-                ON CONFLICT (release_id, platform, architecture) DO UPDATE SET file_path = EXCLUDED.file_path;
+                ON CONFLICT ON CONSTRAINT unique_platform_arch_release DO UPDATE SET file_path = EXCLUDED.file_path;
             `);
 
-            // 3. Setup Linux Agent
+            // 3. Setup Linux Agent (Fallthrough to backend serve)
             await fastify.db.query(`
                 INSERT INTO agent_binaries (release_id, platform, architecture, file_path, sha256)
                 VALUES (
                     (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
                     'linux', 'amd64',
-                    '${r2Base}/linux-amd64/uptimebuddy-agent.py',
+                    '/api/v1/agents/scripts/linux',
                     'N/A'
                 )
-                ON CONFLICT (release_id, platform, architecture) DO UPDATE SET file_path = EXCLUDED.file_path;
+                ON CONFLICT ON CONSTRAINT unique_platform_arch_release DO UPDATE SET file_path = EXCLUDED.file_path;
             `);
 
-            return { success: true, message: "Database updated with R2 links successfully!" };
+            return { success: true, message: "Database REPAIRED and MAPPED to GitHub successfully!" };
         } catch (err) {
             return reply.status(500).send({ success: false, error: err.message });
         }
