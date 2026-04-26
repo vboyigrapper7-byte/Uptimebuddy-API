@@ -264,6 +264,23 @@ CREATE TABLE IF NOT EXISTS team_members (
     PRIMARY KEY (team_id, user_id)
 );
 
+-- ── Audit Logs (System Events) ────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id          SERIAL PRIMARY KEY,
+    user_id     INT REFERENCES users(id) ON DELETE CASCADE,
+    team_id     INT REFERENCES teams(id) ON DELETE CASCADE,
+    action      VARCHAR(100) NOT NULL,
+    metadata    JSONB DEFAULT '{}',
+    created_at  TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_team_id ON audit_logs(team_id);
+
+-- ── Constraints for Agent Management ──────────────────────────────────────────
+ALTER TABLE agent_binaries DROP CONSTRAINT IF EXISTS unique_platform_arch_release;
+ALTER TABLE agent_binaries ADD CONSTRAINT unique_platform_arch_release UNIQUE (release_id, platform, architecture);
+
 -- ── FINAL SYSTEM INTEGRITY REPAIRS (Safe for re-run) ──────────────────────────
 -- These ensure that even if a table existed, it has the latest professional columns.
 ALTER TABLE users ADD COLUMN IF NOT EXISTS tier VARCHAR(50) DEFAULT 'free';

@@ -113,7 +113,20 @@ async function agentRoutes(fastify, options) {
                     delivered_at TIMESTAMP DEFAULT NOW()
                 );
 
-                -- 7. Indexes
+                -- 7. Audit Logs (System Events)
+                CREATE TABLE IF NOT EXISTS audit_logs (
+                    id          SERIAL PRIMARY KEY,
+                    user_id     INT REFERENCES users(id) ON DELETE CASCADE,
+                    team_id     INT REFERENCES teams(id) ON DELETE CASCADE,
+                    action      VARCHAR(100) NOT NULL,
+                    metadata    JSONB DEFAULT '{}',
+                    created_at  TIMESTAMP DEFAULT NOW()
+                );
+
+                -- 8. Constraints
+                ALTER TABLE agent_binaries DROP CONSTRAINT IF EXISTS unique_platform_arch_release;
+                ALTER TABLE agent_binaries ADD CONSTRAINT unique_platform_arch_release UNIQUE (release_id, platform, architecture);
+
                 CREATE INDEX IF NOT EXISTS idx_agent_metrics_compound ON agent_metrics (agent_id, recorded_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_monitors_status ON monitors(status);
                 CREATE INDEX IF NOT EXISTS idx_monitor_metrics_time ON monitor_metrics(monitor_id, recorded_at DESC);
@@ -412,8 +425,8 @@ if exist "monitorhub-agent.ps1" (
     :: Delete old task if exists
     schtasks /delete /tn "MonitorHubAgent" /f >nul 2>&1
     
-    :: Create new High-Privilege task (Pass token directly to avoid env latency)
-    set "TASK_CMD=powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File \\"%INSTALL_DIR%\\monitorhub-agent.ps1\\" -Token \\"${token}\\" -Url \\"${hostUrl}/api/v1/agents/ingest\\""
+    :: Create new High-Privilege task (Reads config from local file to avoid command-line truncation)
+    set "TASK_CMD=powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File \\"%INSTALL_DIR%\\monitorhub-agent.ps1\\""
     schtasks /create /tn "MonitorHubAgent" /tr "!TASK_CMD!" /sc onstart /ru SYSTEM /f /rl HIGHEST
     
     :: Start it immediately

@@ -5,33 +5,42 @@
 
 # 🛡️ CONFIGURATION ENGINE (Multi-Source Discovery)
 param(
-    [string]$Token = $env:AGENT_TOKEN,
-    [string]$Url = $env:INGEST_URL,
+    [string]$Token = $null,
+    [string]$Url = $null,
     [int]$Interval = 30
 )
 
-# Fallback: Try to load from local config file if env/params are missing
+# Load from Environment if parameters are empty
+if (!$Token) { $Token = $env:AGENT_TOKEN }
+if (!$Url)   { $Url = $env:INGEST_URL }
+
+# Fallback: Try to load from local config file
 $ConfigPath = Join-Path $PSScriptRoot "config.json"
 if ((!$Token -or !$Url) -and (Test-Path $ConfigPath)) {
     try {
-        $Config = Get-Content $ConfigPath | ConvertFrom-Json
+        $Config = Get-Content $ConfigPath -Raw | ConvertFrom-Json
         if (!$Token) { $Token = $Config.token }
         if (!$Url) { $Url = $Config.url }
     } catch {}
 }
 
+# 🛡️ DEEP CLEANING (Crucial for Windows reliability)
+if ($Token) { $Token = $Token.Trim().Replace('"', '').Replace("'", "") }
+if ($Url)   { $Url = $Url.Trim().Replace('"', '').Replace("'", "") }
+
 # 🛡️ NETWORK HARDENING (Essential for Data Centers)
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
-[System.Net.ServicePointManager]::CheckCertificateRevocationList = $false # Bypass CRL check for offline/restricted networks
+[System.Net.ServicePointManager]::CheckCertificateRevocationList = $false 
 
 if (!$Token -or !$Url) {
-    Write-Error "AGENT_TOKEN and INGEST_URL are required (via Param, Env, or config.json)."
+    Write-Error "CRITICAL: AGENT_TOKEN and INGEST_URL not found. Run installer again."
     exit 1
 }
 
 Write-Host "===============================================" -ForegroundColor Cyan
 Write-Host " MonitorHub Enterprise Agent is Online" -ForegroundColor Cyan
-Write-Host " Reporting to: $Url" -ForegroundColor Gray
+Write-Host " Hostname: $env:COMPUTERNAME" -ForegroundColor Gray
+Write-Host " URL: $Url" -ForegroundColor Gray
 Write-Host "===============================================" -ForegroundColor Cyan
 
 function Send-Telemetry {
