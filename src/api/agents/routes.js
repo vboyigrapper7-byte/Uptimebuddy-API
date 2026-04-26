@@ -25,10 +25,17 @@ function validateMetrics(metrics) {
 
 // ── Agent dynamic status helper ───────────────────────────────────────────
 function getDynamicAgentStatus(agent) {
-    if (!agent.last_seen || agent.status === 'pending') return agent.status;
+    if (!agent.last_seen) return agent.status;
     const now = Date.now();
     const secondsSinceSeen = (now - new Date(agent.last_seen).getTime()) / 1000;
-    return secondsSinceSeen < 90 ? 'up' : 'down';
+    
+    // If we've seen it recently, it's UP (overrides 'pending')
+    if (secondsSinceSeen < 90) return 'up';
+    
+    // If it was pending but hasn't reported, stay pending
+    if (agent.status === 'pending') return 'pending';
+    
+    return 'down';
 }
 
 const { requireApiKey } = require('../auth/middleware');
@@ -635,10 +642,11 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
                     [token, userId]
                 );
 
-                if (res.rows.length === 0) return reply.send({ connected: false });
+                if (res.rows.length === 0) return reply.send({ success: true, connected: false });
                 
                 const agent = res.rows[0];
                 return reply.send({ 
+                    success: true,
                     connected: agent.last_seen !== null,
                     agent_id: agent.id
                 });
