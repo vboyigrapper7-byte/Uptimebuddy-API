@@ -268,16 +268,15 @@ async function agentRoutes(fastify, options) {
                 [agentId, agent_type, agent_version, hostname, os_type, public_ip]
             );
 
-            // Phase 3: Real-time broadcast
-            if (fastify.broadcast) {
-                fastify.broadcast({
-                    type: 'AGENT_UPDATE',
-                    agent_id: agentId,
-                    status: 'up',
-                    hostname: hostname || agent.hostname,
-                    metrics: metrics
-                });
-            }
+            // Phase 3: Real-time broadcast via Redis Pub/Sub
+            const { redisConnection } = require('../../core/queue/setup');
+            redisConnection.publish('agent-updates', JSON.stringify({
+                type: 'AGENT_UPDATE',
+                agent_id: agentId,
+                status: 'up',
+                hostname: hostname || agent.hostname,
+                metrics: metrics
+            }));
 
             // 2. Save Metrics (Non-blocking DB insert)
             const computed_ram_percent = metrics.ram_percent !== undefined ? metrics.ram_percent : (metrics.ram_total_mb ? (metrics.ram_mb / metrics.ram_total_mb) * 100 : 0);
@@ -405,8 +404,11 @@ set "INGEST_URL=${hostUrl}/api/v1/agents/ingest"
 :: ── Service Registration ──────────────────────────────────────────────────
 echo [INFO] Registering Windows Service...
 
+:: Resolve Short Path to avoid quoting nightmares with 'sc create'
+for %%I in ("%INSTALL_DIR%") do set "SHORT_DIR=%%~sI"
+set "AGENT_PATH=%SHORT_DIR%\\monitorhub-agent.ps1"
+
 :: Validate local engine exists
-set "AGENT_PATH=%INSTALL_DIR%\\monitorhub-agent.ps1"
 if not exist "%AGENT_PATH%" (
     echo [ERROR] Agent engine not found at: %AGENT_PATH%
     pause
@@ -418,23 +420,29 @@ echo [INFO] Cleaning up existing service...
 sc stop MonitorHubAgent >nul 2>&1
 sc delete MonitorHubAgent >nul 2>&1
 
-:: Create Service
-echo [DEBUG] Resolved AGENT_PATH: "%AGENT_PATH%"
-set "SC_COMMAND=sc create MonitorHubAgent binPath= \"powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File '%AGENT_PATH%'\" start= auto DisplayName= \"MonitorHub Enterprise Agent\""
-echo [DEBUG] Command: %SC_COMMAND%
-
-%SC_COMMAND%
+:: Create Service (Basic)
+echo [DEBUG] Resolved Path (Short): %AGENT_PATH%
+sc create MonitorHubAgent binPath= "powershell.exe" start= auto DisplayName= "MonitorHub Enterprise Agent"
 
 if %errorLevel% neq 0 (
-    echo [ERROR] Failed to create Windows Service.
+    echo [ERROR] Initial service creation failed.
     echo [DEBUG] errorLevel: %errorLevel%
     echo [INFO] Possible causes: Access Denied, Service Name Conflict, or Syntax Error.
     pause
     exit /b 1
 )
 
+:: Apply Advanced Configuration (One setting at a time for maximum reliability)
+echo [INFO] Configuring service parameters...
+sc config MonitorHubAgent binPath= "powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File %AGENT_PATH%"
 sc description MonitorHubAgent "MonitorHub Enterprise Telemetry Agent"
 sc failure MonitorHubAgent reset= 86400 actions= restart/5000/restart/10000/restart/30000
+
+if %errorLevel% neq 0 (
+    echo [ERROR] Service configuration failed.
+    pause
+    exit /b 1
+)
 
 :: Start the service with retry mechanism
 echo [INFO] Starting MonitorHub Agent...
