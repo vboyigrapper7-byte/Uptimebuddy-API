@@ -98,10 +98,21 @@ CREATE TABLE IF NOT EXISTS agents (
     agent_token  VARCHAR(255) UNIQUE NOT NULL,
     status       VARCHAR(50)  DEFAULT 'pending',
     last_seen    TIMESTAMP,
+    created_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
     public_ip    VARCHAR(45),
     private_ip   VARCHAR(45),
     hostname     VARCHAR(255),
     os_type      VARCHAR(50)
+);
+
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+
+-- ── Monitor Stats (Precomputed for Performance) ───────────────────────────
+CREATE TABLE IF NOT EXISTS monitor_stats (
+    monitor_id      INT PRIMARY KEY REFERENCES monitors(id) ON DELETE CASCADE,
+    uptime_24h      NUMERIC(5,2) DEFAULT 100.00,
+    avg_latency_24h INTEGER DEFAULT 0,
+    last_updated_at TIMESTAMP DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_agents_user_id     ON agents(user_id);

@@ -49,6 +49,21 @@ async function agentRoutes(fastify, options) {
         try {
             // SELF-HEALING: Add missing columns AND Unique Constraints
             await fastify.db.query(`
+                -- Repair agents table
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS public_ip varchar(45);
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS private_ip varchar(45);
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS hostname varchar(255);
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS os_type varchar(50);
+
+                -- Repair monitor_stats (Critical for Dashboard)
+                CREATE TABLE IF NOT EXISTS monitor_stats (
+                    monitor_id      INT PRIMARY KEY REFERENCES monitors(id) ON DELETE CASCADE,
+                    uptime_24h      NUMERIC(5,2) DEFAULT 100.00,
+                    avg_latency_24h INTEGER DEFAULT 0,
+                    last_updated_at TIMESTAMP DEFAULT NOW()
+                );
+                
                 -- Repair agent_releases
                 ALTER TABLE agent_releases ADD COLUMN IF NOT EXISTS rollout_percentage integer DEFAULT 100;
                 
@@ -74,12 +89,6 @@ async function agentRoutes(fastify, options) {
                         ALTER TABLE agent_binaries ADD CONSTRAINT unique_platform_arch_release UNIQUE (platform, architecture, release_id);
                     END IF;
                 END $$;
-
-                -- Repair agents table
-                ALTER TABLE agents ADD COLUMN IF NOT EXISTS public_ip varchar(45);
-                ALTER TABLE agents ADD COLUMN IF NOT EXISTS private_ip varchar(45);
-                ALTER TABLE agents ADD COLUMN IF NOT EXISTS hostname varchar(255);
-                ALTER TABLE agents ADD COLUMN IF NOT EXISTS os_type varchar(50);
                 
                 -- Repair agent_metrics table (Comprehensive)
                 ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS ram_total_mb integer;
