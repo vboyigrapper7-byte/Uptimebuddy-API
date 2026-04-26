@@ -93,9 +93,9 @@ const getAlertLogs = async (request, reply) => {
 
     try {
         const result = await pool.query(
-            `SELECT l.*, m.name as monitor_name
-             FROM alert_logs l
-             JOIN monitors m ON l.monitor_id = m.id
+            `SELECT l.*, COALESCE(m.name, 'System/Server') as monitor_name
+             FROM alert_history l
+             LEFT JOIN monitors m ON l.monitor_id = m.id
              WHERE l.user_id = $1
              ORDER BY l.delivered_at DESC
              LIMIT $2 OFFSET $3`,
@@ -105,7 +105,7 @@ const getAlertLogs = async (request, reply) => {
         return reply.send(result.rows);
     } catch (err) {
         request.log.error(err);
-        reply.code(500).send({ error: 'Failed to fetch alert logs' });
+        return reply.code(500).send({ error: 'Failed to fetch alert history' });
     }
 };
 

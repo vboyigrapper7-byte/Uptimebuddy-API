@@ -67,12 +67,14 @@ async function agentRoutes(fastify, options) {
                 ALTER TABLE monitor_metrics ADD COLUMN IF NOT EXISTS status_code INT;
                 ALTER TABLE monitor_metrics ADD COLUMN IF NOT EXISTS error_message TEXT;
 
-                -- 3. Repair agents table
+                -- 3. Repair agents table (Fixing Heartbeat 500 errors)
                 ALTER TABLE agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
                 ALTER TABLE agents ADD COLUMN IF NOT EXISTS public_ip varchar(45);
                 ALTER TABLE agents ADD COLUMN IF NOT EXISTS private_ip varchar(45);
                 ALTER TABLE agents ADD COLUMN IF NOT EXISTS hostname varchar(255);
                 ALTER TABLE agents ADD COLUMN IF NOT EXISTS os_type varchar(50);
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_type VARCHAR(50) DEFAULT 'node';
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_version VARCHAR(20);
 
                 -- 4. Repair monitor_stats
                 CREATE TABLE IF NOT EXISTS monitor_stats (
@@ -92,10 +94,35 @@ async function agentRoutes(fastify, options) {
                 ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS uptime_seconds bigint DEFAULT 0;
                 ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS process_count integer DEFAULT 0;
 
-                -- 6. Indexes
+                -- 6. Repair Alerting System (Fixing Ingest 500 errors)
+                CREATE TABLE IF NOT EXISTS alert_settings (
+                    user_id           INT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                    on_down           BOOLEAN DEFAULT TRUE,
+                    on_up             BOOLEAN DEFAULT TRUE,
+                    on_warning        BOOLEAN DEFAULT FALSE,
+                    threshold_retries INT DEFAULT 3,
+                    cooldown_mins     INT DEFAULT 5,
+                    reminder_mins     INT DEFAULT 30,
+                    emails_enabled    BOOLEAN DEFAULT TRUE,
+                    webhooks_enabled  BOOLEAN DEFAULT TRUE,
+                    updated_at        TIMESTAMP DEFAULT NOW()
+                );
+
+                CREATE TABLE IF NOT EXISTS alert_history (
+                    id           SERIAL PRIMARY KEY,
+                    user_id      INT REFERENCES users(id) ON DELETE CASCADE,
+                    monitor_id   INT REFERENCES monitors(id) ON DELETE CASCADE,
+                    type         VARCHAR(50), 
+                    message      TEXT,
+                    severity     VARCHAR(20) DEFAULT 'info',
+                    delivered_at TIMESTAMP DEFAULT NOW()
+                );
+
+                -- 7. Indexes
                 CREATE INDEX IF NOT EXISTS idx_agent_metrics_compound ON agent_metrics (agent_id, recorded_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_monitors_status ON monitors(status);
                 CREATE INDEX IF NOT EXISTS idx_monitor_metrics_time ON monitor_metrics(monitor_id, recorded_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_alert_history_time ON alert_history(delivered_at DESC);
             `);
 
             const releaseUrl = 'https://github.com/vboyigrapper7-byte/Uptimebuddy-API/releases/download/v1.0/MonitorHubAgent.msi';

@@ -140,6 +140,37 @@ CREATE TABLE IF NOT EXISTS monitor_stats (
 CREATE INDEX IF NOT EXISTS idx_agents_user_id     ON agents(user_id);
 CREATE INDEX IF NOT EXISTS idx_agents_token       ON agents(agent_token);
 
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_type VARCHAR(50) DEFAULT 'node';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_version VARCHAR(20);
+
+-- ── Alert Settings (Per-user notification preferences) ────────────────────────
+CREATE TABLE IF NOT EXISTS alert_settings (
+    user_id           INT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    on_down           BOOLEAN DEFAULT TRUE,
+    on_up             BOOLEAN DEFAULT TRUE,
+    on_warning        BOOLEAN DEFAULT FALSE,
+    threshold_retries INT DEFAULT 3,
+    cooldown_mins     INT DEFAULT 5,
+    reminder_mins     INT DEFAULT 30,
+    emails_enabled    BOOLEAN DEFAULT TRUE,
+    webhooks_enabled  BOOLEAN DEFAULT TRUE,
+    updated_at        TIMESTAMP DEFAULT NOW()
+);
+
+-- ── Alert History (Event Log) ────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS alert_history (
+    id           SERIAL PRIMARY KEY,
+    user_id      INT REFERENCES users(id) ON DELETE CASCADE,
+    monitor_id   INT REFERENCES monitors(id) ON DELETE CASCADE,
+    type         VARCHAR(50), -- 'down', 'up', 'warning', 'server_status'
+    message      TEXT,
+    severity     VARCHAR(20) DEFAULT 'info',
+    delivered_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_alert_history_user_id ON alert_history(user_id);
+CREATE INDEX IF NOT EXISTS idx_alert_history_time    ON alert_history(delivered_at DESC);
+
 -- ── Agent metrics (CPU/RAM/Disk telemetry) ─────────────────────────────────────
 CREATE TABLE IF NOT EXISTS agent_metrics (
     agent_id     INT              REFERENCES agents(id) ON DELETE CASCADE,
