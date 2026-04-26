@@ -10,6 +10,7 @@ const rateLimit = require('@fastify/rate-limit');
 const helmet = require('@fastify/helmet');
 const winston = require('winston');
 const axios = require('axios');
+const fastifyWebsocket = require('@fastify/websocket');
 
 const logger = winston.createLogger({
     level: process.env.LOG_LEVEL || 'info',
@@ -107,6 +108,18 @@ const buildServer = async () => {
     // ── DB decorator ─────────────────────────────────────────────────────
     server.decorate('db', {
         query: (text, params) => pool.query(text, params),
+    });
+
+    // ── WebSocket Support & Real-time Broadcast ──────────────────────────
+    await server.register(fastifyWebsocket);
+    
+    server.decorate('broadcast', (data) => {
+        const message = JSON.stringify(data);
+        for (const client of server.websocketServer.clients) {
+            if (client.readyState === 1) { // Open
+                client.send(message);
+            }
+        }
     });
 
     // ── Health check (Diagnostic Tool) ──────────────────────────────────
