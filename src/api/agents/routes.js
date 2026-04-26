@@ -427,11 +427,12 @@ if exist "monitorhub-agent.ps1" (
     sc delete MonitorHubAgent >nul 2>&1
     schtasks /delete /tn "MonitorHubAgent" /f >nul 2>&1
     
-    :: Create a professional Windows Service
-    :: We use single quotes for the path to handle spaces safely in PowerShell
-    set "SVC_BIN=powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File '%INSTALL_DIR%\\monitorhub-agent.ps1'"
+    :: Create a professional Windows Service (Native SC command is more robust for spaces)
+    :: Note: The space after '=' in sc commands is REQUIRED by Windows.
+    sc create MonitorHubAgent binPath= "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File \"%INSTALL_DIR%\\monitorhub-agent.ps1\"" start= auto DisplayName= "MonitorHub Enterprise Agent"
     
-    powershell -Command "New-Service -Name 'MonitorHubAgent' -BinaryPathName '!SVC_BIN!' -DisplayName 'MonitorHub Enterprise Agent' -Description 'MonitorHub Enterprise Telemetry Agent' -StartupType Automatic"
+    :: Set description
+    sc description MonitorHubAgent "MonitorHub Enterprise Telemetry Agent"
     
     :: Set recovery options (Restart on failure)
     sc failure MonitorHubAgent reset= 86400 actions= restart/1000/restart/5000/restart/10000
