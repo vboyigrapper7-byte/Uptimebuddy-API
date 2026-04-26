@@ -397,30 +397,23 @@ sc delete MonitorHubAgent >nul 2>&1
 echo [DEBUG] Resolved Path: %AGENT_PATH%
 
 :: Phase 1: Create
-sc create MonitorHubAgent binPath= "powershell.exe" start= auto DisplayName= "MonitorHub Enterprise Agent"
-if %errorLevel% neq 0 (
+sc create MonitorHubAgent binPath= "powershell.exe" start= auto DisplayName= "MonitorHub Enterprise Agent" || (
     echo [ERROR] PHASE_1_FAILURE: Service creation failed.
-    echo [INFO] Possible causes: Service exists but is locked, or insufficient permissions.
+    echo [INFO] Check for existing service or permission blocks.
     pause
     exit /b 1
 )
 
 :: Phase 2: Configure
 echo [INFO] Applying service parameters...
-sc config MonitorHubAgent binPath= "powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File %AGENT_PATH%"
-if %errorLevel% neq 0 (
+sc config MonitorHubAgent binPath= "powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File %AGENT_PATH%" || (
     echo [ERROR] PHASE_2_FAILURE: binPath configuration failed.
     pause
     exit /b 1
 )
 
-sc description MonitorHubAgent "MonitorHub Enterprise Telemetry Agent"
-sc failure MonitorHubAgent reset= 86400 actions= restart/5000/restart/10000/restart/30000
-if %errorLevel% neq 0 (
-    echo [ERROR] PHASE_3_FAILURE: Recovery parameters failed.
-    pause
-    exit /b 1
-)
+sc description MonitorHubAgent "MonitorHub Enterprise Telemetry Agent" || echo [WARNING] Description failed.
+sc failure MonitorHubAgent reset= 86400 actions= restart/5000/restart/10000/restart/30000 || echo [WARNING] Failure policy failed.
 
 :: Phase 3: Start
 echo [INFO] Starting MonitorHub Agent...
@@ -435,7 +428,8 @@ if %errorLevel% neq 0 (
         echo [WARNING] Service not running. Retry !retry!/3...
         goto retry_start
     )
-    echo [ERROR] PHASE_4_FAILURE: Service failed to enter RUNNING state.
+    echo [ERROR] PHASE_4_FAILURE: Service failed to start.
+    echo [INFO] Run "sc query MonitorHubAgent" to check status manually.
     pause
     exit /b 1
 )
@@ -448,6 +442,9 @@ exit /b 0`;
         return reply
             .type('application/octet-stream')
             .header('Content-Disposition', 'attachment; filename="setup_monitorhub_windows.bat"')
+            .header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate')
+            .header('Pragma', 'no-cache')
+            .header('Expires', '0')
             .send(script);
     });
 
@@ -917,40 +914,6 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
         });
     });
 
-    // ────────────────────────────────────────────────────────────────────
-    // BACKGROUND HEALTH CHECKER (Enterprise Pulse Monitor)
-    // ────────────────────────────────────────────────────────────────────
-    setInterval(async () => {
-        try {
-            // Find agents that haven't reported in 90 seconds but are still marked as 'up'
-            const staleRes = await fastify.db.query(`
-                SELECT id, user_id, name FROM agents 
-                WHERE status = 'up' 
-                AND last_seen < NOW() - INTERVAL '90 seconds'
-            `);
-
-            for (const agent of staleRes.rows) {
-                // 1. Mark as Down
-                await fastify.db.query("UPDATE agents SET status = 'down' WHERE id = $1", [agent.id]);
-                
-                // 2. Trigger Alert
-                await fastify.db.query(
-                    'INSERT INTO alert_history (user_id, monitor_id, type, message, severity) VALUES ($1, $2, $3, $4, $5)',
-                    [agent.user_id, null, 'server_status', `[${agent.name}] System Offline: No heartbeat detected for 90s.`, 'critical']
-                );
-
-                // 3. Log to Audit (Team Scope)
-                const teamRes = await fastify.db.query('SELECT team_id FROM team_members WHERE user_id = $1 LIMIT 1', [agent.user_id]);
-                if (teamRes.rows.length > 0) {
-                    await auditService.log(agent.user_id, teamRes.rows[0].team_id, 'server_down', { name: agent.name, id: agent.id });
-                }
-                
-                fastify.log.warn({ agentId: agent.id }, 'Agent marked DOWN due to inactivity');
-            }
-        } catch (err) {
-            fastify.log.error(err, 'Health checker failed');
-        }
-    }, 60000); // Check every 60 seconds
 }
 
 module.exports = agentRoutes;
