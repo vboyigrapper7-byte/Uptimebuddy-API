@@ -409,8 +409,8 @@ echo [INFO] Registering Windows Service...
 sc stop MonitorHubAgent >nul 2>&1
 sc delete MonitorHubAgent >nul 2>&1
 
-:: Create Service (Single line is more robust for SC command)
-sc create MonitorHubAgent binPath= "powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File \"%INSTALL_DIR%\\monitorhub-agent.ps1\"" start= auto DisplayName= "MonitorHub Enterprise Agent"
+:: Create Service (Single line with escaped internal quotes)
+sc create MonitorHubAgent binPath= \"powershell.exe -ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -File \\\"%INSTALL_DIR%\\monitorhub-agent.ps1\\\"\" start= auto DisplayName= \"MonitorHub Enterprise Agent\"
 
 if %errorLevel% neq 0 (
     echo [ERROR] Failed to create Windows Service.
