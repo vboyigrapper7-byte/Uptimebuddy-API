@@ -67,23 +67,36 @@ function Send-Telemetry {
 
 while ($true) {
     try {
-        # 1. Hardware Telemetry (High Performance CIM)
-        $OS = Get-CimInstance Win32_OperatingSystem
-        $CPU = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+        # 🛡️ COMPATIBILITY ENGINE (CIM vs WMI Fallback)
+        $HasCim = Get-Command Get-CimInstance -ErrorAction SilentlyContinue
         
-        $RAM_Total = [math]::Round($OS.TotalVisibleMemorySize / 1024, 0)
-        $RAM_Free = [math]::Round($OS.FreePhysicalMemory / 1024, 0)
+        if ($HasCim) {
+            $OS = Get-CimInstance Win32_OperatingSystem
+            $CPU = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+            $RAM_Total = [math]::Round($OS.TotalVisibleMemorySize / 1024, 0)
+            $RAM_Free = [math]::Round($OS.FreePhysicalMemory / 1024, 0)
+            $Disks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3"
+            $LastBoot = $OS.LastBootUpTime
+        } else {
+            # Legacy WMI Support (Windows Server 2008 / WMF 2.0)
+            $OS = Get-WmiObject Win32_OperatingSystem
+            $CPU = (Get-WmiObject Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+            $RAM_Total = [math]::Round($OS.TotalVisibleMemorySize / 1024, 0)
+            $RAM_Free = [math]::Round($OS.FreePhysicalMemory / 1024, 0)
+            $Disks = Get-WmiObject Win32_LogicalDisk -Filter "DriveType=3"
+            $LastBoot = $OS.ConvertToDateTime($OS.LastBootUpTime)
+        }
+
         $RAM_Used = $RAM_Total - $RAM_Free
         $RAM_Percent = [math]::Round(($RAM_Used / $RAM_Total) * 100, 2)
 
         # Get aggregate disk stats
-        $Disks = Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3"
         $Disk_Total = ($Disks | Measure-Object -Property Size -Sum).Sum / 1GB
         $Disk_Free = ($Disks | Measure-Object -Property FreeSpace -Sum).Sum / 1GB
         $Disk_Used = $Disk_Total - $Disk_Free
-        $Disk_Percent = [math]::Round(($Disk_Used / $Disk_Total) * 100, 2)
+        $Disk_Percent = if ($Disk_Total -gt 0) { [math]::Round(($Disk_Used / $Disk_Total) * 100, 2) } else { 0 }
 
-        $Uptime = [math]::Round((Get-Date) - $OS.LastBootUpTime).TotalSeconds
+        $Uptime = [math]::Round((Get-Date) - $LastBoot).TotalSeconds
         $ProcCount = (Get-Process).Count
 
         # 2. Build Professional Payload

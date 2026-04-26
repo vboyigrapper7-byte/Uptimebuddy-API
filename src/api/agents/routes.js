@@ -419,18 +419,25 @@ if exist "monitorhub-agent.ps1" (
     set "AGENT_TOKEN=${token}"
     set "INGEST_URL=${hostUrl}/api/v1/agents/ingest"
 
-    :: ── Persistence Setup ─────────────────────────────────────
-    echo [INFO] Registering System Background Service...
+    :: ── Persistence Setup (Genuine Windows Service) ─────────────────────────
+    echo [INFO] Registering MonitorHub Enterprise Service...
     
-    :: Delete old task if exists
+    :: Stop and Delete old service/task if exists
+    sc stop MonitorHubAgent >nul 2>&1
+    sc delete MonitorHubAgent >nul 2>&1
     schtasks /delete /tn "MonitorHubAgent" /f >nul 2>&1
     
-    :: Create new High-Privilege task (Reads config from local file to avoid command-line truncation)
-    set "TASK_CMD=powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File \\"%INSTALL_DIR%\\monitorhub-agent.ps1\\""
-    schtasks /create /tn "MonitorHubAgent" /tr "!TASK_CMD!" /sc onstart /ru SYSTEM /f /rl HIGHEST
+    :: Create a professional Windows Service
+    set "SVC_DESC=MonitorHub Enterprise Telemetry Agent"
+    set "BIN_PATH=powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File \\"%INSTALL_DIR%\\monitorhub-agent.ps1\\""
     
-    :: Start it immediately
-    schtasks /run /tn "MonitorHubAgent"
+    powershell -Command "New-Service -Name 'MonitorHubAgent' -BinaryPathName '!BIN_PATH!' -DisplayName 'MonitorHub Enterprise Agent' -Description '%SVC_DESC%' -StartupType Automatic"
+    
+    :: Set recovery options (Restart on failure)
+    sc failure MonitorHubAgent reset= 86400 actions= restart/1000/restart/5000/restart/10000
+    
+    :: Start the service
+    sc start MonitorHubAgent
     
     echo ========================================================
     echo  [SUCCESS] MonitorHub Enterprise Agent is ACTIVE!
