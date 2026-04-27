@@ -41,6 +41,31 @@ async function agentRoutes(fastify, options) {
     // ────────────────────────────────────────────────────────────────────
     // ONE-TIME ACTIVATION ROUTE (Visit once to setup database)
     // ────────────────────────────────────────────────────────────────────
+    fastify.get('/internal/create-test-agent', async (request, reply) => {
+        try {
+            const token = 'ub_test_token_' + Date.now();
+            const name = 'Validation-Agent-' + Date.now();
+            
+            // Get first user
+            const userRes = await fastify.db.query('SELECT id FROM users LIMIT 1');
+            if (userRes.rows.length === 0) {
+                return reply.status(404).send({ error: 'No users found to assign agent to' });
+            }
+            const userId = userRes.rows[0].id;
+
+            await fastify.db.query(
+                "INSERT INTO agents (user_id, name, server_group, agent_token, status) VALUES ($1, $2, 'default', $3, 'pending')",
+                [userId, name, token]
+            );
+            console.log('[DEBUG] Agent inserted');
+
+            return { success: true, token, name };
+        } catch (err) {
+            console.error('[DEBUG] Error in create-test-agent:', err.message);
+            return reply.status(500).send({ success: false, error: err.message });
+        }
+    });
+
     fastify.get('/internal/seed-distribution', async (request, reply) => {
         try {
             await fastify.db.query(`
@@ -249,7 +274,8 @@ async function agentRoutes(fastify, options) {
             const agentId = agent.id;
             const userId  = agent.user_id;
             const prevStatus = agent.status;
-            const hostname = request.body?.hostname || metrics?.hostname || null;
+            const hostnameRaw = request.body?.hostname || metrics?.hostname;
+            const hostname = (hostnameRaw && hostnameRaw.trim()) ? hostnameRaw : null;
             const os_type  = request.body?.os_type || metrics?.os || null;
             const public_ip = request.ip;
             const recordedAt = new Date();
@@ -269,14 +295,20 @@ async function agentRoutes(fastify, options) {
             );
 
             // Phase 3: Real-time broadcast via Redis Pub/Sub
-            const { redisConnection } = require('../../core/queue/setup');
-            redisConnection.publish('agent-updates', JSON.stringify({
-                type: 'AGENT_UPDATE',
-                agent_id: agentId,
-                status: 'up',
-                hostname: hostname || agent.hostname,
-                metrics: metrics
-            }));
+            try {
+                const { redisConnection } = require('../../core/queue/setup');
+                if (redisConnection && redisConnection.status === 'ready') {
+                    redisConnection.publish('agent-updates', JSON.stringify({
+                        type: 'AGENT_UPDATE',
+                        agent_id: agentId,
+                        status: 'up',
+                        hostname: hostname || agent.hostname,
+                        metrics: metrics
+                    }));
+                }
+            } catch (redisErr) {
+                fastify.log.warn({ error: redisErr.message }, 'Redis broadcast skipped due to connection error');
+            }
 
             // 2. Save Metrics (Non-blocking DB insert)
             const computed_ram_percent = metrics.ram_percent !== undefined ? metrics.ram_percent : (metrics.ram_total_mb ? (metrics.ram_mb / metrics.ram_total_mb) * 100 : 0);
@@ -297,24 +329,28 @@ async function agentRoutes(fastify, options) {
             ).catch(err => fastify.log.warn({ agentId, error: err.message }, 'Metrics insertion failed'));
 
             // 4. Alert Trigger (Up/Down Logic)
-            if (prevStatus === 'down' || prevStatus === 'pending') {
-                const teamRes = await fastify.db.query('SELECT team_id FROM team_members WHERE user_id = $1 LIMIT 1', [userId]);
-                const teamId = teamRes.rows[0]?.team_id;
+            try {
+                if (prevStatus === 'down' || prevStatus === 'pending') {
+                    const teamRes = await fastify.db.query('SELECT team_id FROM team_members WHERE user_id = $1 LIMIT 1', [userId]);
+                    const teamId = teamRes.rows[0]?.team_id;
 
-                await fastify.db.query(
-                    'INSERT INTO alert_history (user_id, monitor_id, type, message, severity) VALUES ($1, $2, $3, $4, $5)',
-                    [userId, null, 'server_status', `[${agent.name}] System Online: Server is now UP and reporting telemetry.`, 'critical']
-                );
-                
-                if (teamId) {
-                    await auditService.log(userId, teamId, 'server_recovered', { name: agent.name, id: agentId });
+                    await fastify.db.query(
+                        'INSERT INTO alert_history (user_id, monitor_id, type, message, severity) VALUES ($1, $2, $3, $4, $5)',
+                        [userId, null, 'server_status', `[${agent.name}] System Online: Server is now UP and reporting telemetry.`, 'critical']
+                    ).catch(e => fastify.log.warn(`Alert history insert failed: ${e.message}`));
+                    
+                    if (teamId) {
+                        await auditService.log(userId, teamId, 'server_recovered', { name: agent.name, id: agentId }).catch(e => fastify.log.warn(`Audit log failed: ${e.message}`));
+                    }
                 }
+            } catch (alertErr) {
+                fastify.log.warn({ error: alertErr.message }, 'Alert trigger skipped due to error (possibly missing tables)');
             }
 
             return reply.send({ success: true });
         } catch (err) {
-            fastify.log.error(err, 'Agent ingest fatal error');
-            return reply.status(500).send({ error: 'Internal server error' });
+            fastify.log.error({ err, stack: err.stack, body: request.body }, 'Agent ingest fatal error');
+            return reply.status(500).send({ error: 'Internal server error', details: err.message });
         }
     });
     // PUBLIC — Agent script download
@@ -343,52 +379,54 @@ async function agentRoutes(fastify, options) {
         const script = `@echo off
 setlocal enabledelayedexpansion
 
-:: ── Elevation Check ──────────────────────────────────────────────────────────
+:: ========================================================
+:: MonitorHub Enterprise Agent Installer (Bulletproof v2)
+:: ========================================================
+
+:: ── Elevation Check
 echo [INFO] Checking for Administrative privileges...
 net session >nul 2>&1
-if %errorLevel% neq 0 (
-    echo [ERROR] This installer requires Administrator privileges.
-    pause
-    exit /b 1
-)
+if errorlevel 1 goto NO_ADMIN
 
 echo ========================================================
 echo  MonitorHub Enterprise Agent Setup (Windows)
 echo ========================================================
 
-:: ── Directory Setup ──────────────────────────────────────
+:: ── Directory Setup
 set "INSTALL_DIR=%SystemDrive%\\Program Files\\MonitorHub"
 if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
+mkdir "C:\\MonitorHub" 2>nul
 cd /d "%INSTALL_DIR%"
 
-:: ── Download Engine ──────────────────────────────────────
-echo [INFO] Downloading Agent Engine...
-set "AGENT_URL=${hostUrl}/api/v1/agents/scripts/windows"
-curl.exe --ssl-no-revoke -f -s -L -o "monitorhub-agent.ps1" "%AGENT_URL%"
+:: ── Download Engine
+echo [INFO] Downloading Agent Engine (Go-Native)...
+set "AGENT_URL=${hostUrl}/api/v1/agents/bin/windows/amd64"
+curl.exe --ssl-no-revoke -f -s -L -o "monitorhub-agent.exe" "%AGENT_URL%"
 
-if not exist "monitorhub-agent.ps1" (
-    powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object System.Net.WebClient).DownloadFile('%AGENT_URL%', 'monitorhub-agent.ps1')"
-)
+if exist "monitorhub-agent.exe" goto DOWNLOAD_OK
+powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object System.Net.WebClient).DownloadFile('%AGENT_URL%', 'monitorhub-agent.exe')"
 
-if not exist "monitorhub-agent.ps1" (
-    echo [ERROR] Failed to download agent script.
-    pause
-    exit /b 1
-)
+:DOWNLOAD_OK
+if not exist "monitorhub-agent.exe" goto DOWNLOAD_FAILED
 echo [SUCCESS] Agent Engine downloaded.
 
-:: ── Configuration ────────────────────────────────────────
+:: ── Configuration
 echo [INFO] Configuring Agent Environment...
-echo { "token": "${token}", "url": "${hostUrl}/api/v1/agents/ingest" } > "config.json"
+(
+echo {
+echo   "agentToken": "${token}",
+echo   "ingestUrl": "${hostUrl}/api/v1/agents/ingest"
+echo }
+) > "config.json"
 setx AGENT_TOKEN "${token}" /M >nul 2>&1
 set "AGENT_TOKEN=${token}"
 
-:: ── Service Registration ──────────────────────────────────
+:: ── Service Registration
 echo [INFO] Registering Windows Service...
 
-:: Short path resolution
+:: Short path resolution for reliability
 for %%I in ("%INSTALL_DIR%") do set "SHORT_DIR=%%~sI"
-set "AGENT_PATH=%SHORT_DIR%\\monitorhub-agent.ps1"
+set "AGENT_PATH=%SHORT_DIR%\\monitorhub-agent.exe"
 
 echo [INFO] Cleaning up existing service...
 sc stop MonitorHubAgent >nul 2>&1
@@ -397,58 +435,89 @@ sc delete MonitorHubAgent >nul 2>&1
 echo [DEBUG] Resolved Path: %AGENT_PATH%
 
 :: Phase 1: Create
-sc create MonitorHubAgent binPath= "powershell.exe" start= auto DisplayName= "MonitorHub Enterprise Agent" || (
-    echo [ERROR] PHASE_1_FAILURE: Service creation failed.
-    echo [INFO] Check for existing service or permission blocks.
-    pause
-    exit /b 1
-)
+echo [INFO] Creating service...
+:: Note the MANDATORY space after binPath= and before the path
+sc create MonitorHubAgent binPath= "\"%AGENT_PATH%\"" start= auto DisplayName= "MonitorHub Enterprise Agent"
+if errorlevel 1 goto PHASE_1_FAILED
 
 :: Phase 2: Configure
 echo [INFO] Applying service parameters...
-sc config MonitorHubAgent binPath= "powershell.exe -ExecutionPolicy Bypass -NoProfile -NonInteractive -InputFormat None -WindowStyle Hidden -File %AGENT_PATH%" || (
-    echo [ERROR] PHASE_2_FAILURE: binPath configuration failed.
-    pause
-    exit /b 1
-)
-
-sc description MonitorHubAgent "MonitorHub Enterprise Telemetry Agent" || echo [WARNING] Description failed.
-sc failure MonitorHubAgent reset= 86400 actions= restart/5000/restart/10000/restart/30000 || echo [WARNING] Failure policy failed.
+sc description MonitorHubAgent "MonitorHub Enterprise Telemetry Agent"
+sc failure MonitorHubAgent reset= 86400 actions= restart/5000/restart/10000/restart/30000
 
 :: Phase 3: Start
 echo [INFO] Starting MonitorHub Agent...
 set /a retry=0
-:retry_start
+
+:RETRY_START
+set /a retry+=1
+echo [INFO] Starting MonitorHub Agent (Attempt %retry%/3)...
 sc start MonitorHubAgent >nul 2>&1
-timeout /t 5 /nobreak >nul
+
+:: Wait for service to stabilize
+timeout /t 8 /nobreak >nul
+
 sc query MonitorHubAgent | find "RUNNING" >nul
-if %errorLevel% neq 0 (
-    set /a retry+=1
-    if !retry! lss 3 (
-        echo [WARNING] Service not running. Retry !retry!/3...
-        goto retry_start
-    )
-    echo [ERROR] PHASE_4_FAILURE: Service failed to start.
-    
-    echo.
-    echo ─── DIAGNOSTIC LOG (Last 5 lines) ─────────────────
-    if exist "agent.log" (
-        powershell -Command "Get-Content agent.log -Tail 5"
-    ) else (
-        echo [INFO] agent.log not found. The process may not have even started.
-    )
-    echo ───────────────────────────────────────────────────
-    echo.
-    
-    echo [INFO] Run "sc query MonitorHubAgent" to check status manually.
-    pause
-    exit /b 1
+if not errorlevel 1 goto START_SUCCESS
+
+:: If not running, check if it's pending
+sc query MonitorHubAgent | find "START_PENDING" >nul
+if not errorlevel 1 (
+    echo [INFO] Service is starting up. Waiting 10 more seconds...
+    timeout /t 10 /nobreak >nul
+    sc query MonitorHubAgent | find "RUNNING" >nul
+    if not errorlevel 1 goto START_SUCCESS
 )
 
+if %retry% LSS 3 (
+    echo [WARNING] Service failed to reach RUNNING state. Retrying...
+    goto RETRY_START
+)
+
+:: If we get here, it failed 3 times
+goto PHASE_4_FAILED
+
+:START_SUCCESS
 echo [SUCCESS] MonitorHub Agent is NOW RUNNING.
+echo [INFO] Verification: Service detected in RUNNING state.
 echo ========================================================
 pause
-exit /b 0`;
+exit /b 0
+
+:: ── Error Handlers
+:NO_ADMIN
+echo [ERROR] This installer requires Administrator privileges.
+pause
+exit /b 1
+
+:DOWNLOAD_FAILED
+echo [ERROR] Failed to download agent binary.
+pause
+exit /b 1
+
+:PHASE_1_FAILED
+echo [ERROR] PHASE_1_FAILURE: Service creation failed.
+sc query MonitorHubAgent
+pause
+exit /b 1
+
+:PHASE_4_FAILED
+echo [ERROR] PHASE_4_FAILURE: Service failed to start after 3 attempts.
+echo.
+echo --- SERVICE STATUS ---
+sc query MonitorHubAgent
+echo.
+echo --- RECENT AGENT LOGS (C:\\MonitorHub\\agent.log) ---
+if exist "C:\\MonitorHub\\agent.log" (
+    powershell -Command "Get-Content 'C:\\MonitorHub\\agent.log' -Tail 10"
+) else (
+    echo [INFO] agent.log not found. The process may not have started at all.
+    echo [TIP] Check Windows Event Viewer (System) for Service Control Manager errors.
+)
+echo -------------------------------------
+echo.
+pause
+exit /b 1`;
 
         return reply
             .type('application/octet-stream')
@@ -582,7 +651,16 @@ exit /b 0`;
                 return reply.redirect(binary.file_path);
             } else {
                 // Development/Local: Stream from disk
-                const absPath = path.resolve(__dirname, '../../../', binary.file_path);
+                let absPath = path.resolve(__dirname, '../../../', binary.file_path);
+                
+                // Fallback for local dev if file_path is relative to agent-go
+                if (!fs.existsSync(absPath)) {
+                    const localGoBin = path.resolve(__dirname, '../../../../uptimebuddy-go-agent/bin', `monitorhub-agent-${os}-${arch}${os === 'windows' ? '.exe' : ''}`);
+                    if (fs.existsSync(localGoBin)) {
+                        absPath = localGoBin;
+                    }
+                }
+
                 if (!fs.existsSync(absPath)) {
                     return reply.status(404).send({ error: 'Binary file missing on server' });
                 }

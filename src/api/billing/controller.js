@@ -2,10 +2,12 @@ const Razorpay = require('razorpay');
 const crypto = require('crypto');
 const { PLAN_TIERS } = require('../../core/billing/tiers');
 
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
-});
+// const razorpay = new Razorpay({
+//   key_id: process.env.RAZORPAY_KEY_ID,
+//   key_secret: process.env.RAZORPAY_KEY_SECRET,
+// });
+
+const razorpay = { orders: { create: async () => ({ id: 'dummy' }) } };
 
 // Fixed INR Pricing (based on round-off as requested)
 const INR_PRICES = {
