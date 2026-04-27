@@ -455,7 +455,7 @@ echo [INFO] Starting MonitorHub Agent (Attempt %retry%/3)...
 sc start MonitorHubAgent >nul 2>&1
 
 :: Wait for service to stabilize
-timeout /t 8 /nobreak >nul
+timeout /t 15 /nobreak >nul
 
 sc query MonitorHubAgent | find "RUNNING" >nul
 if not errorlevel 1 goto START_SUCCESS
@@ -463,8 +463,8 @@ if not errorlevel 1 goto START_SUCCESS
 :: If not running, check if it's pending
 sc query MonitorHubAgent | find "START_PENDING" >nul
 if not errorlevel 1 (
-    echo [INFO] Service is starting up. Waiting 10 more seconds...
-    timeout /t 10 /nobreak >nul
+    echo [INFO] Service is starting up. Waiting 20 more seconds...
+    timeout /t 20 /nobreak >nul
     sc query MonitorHubAgent | find "RUNNING" >nul
     if not errorlevel 1 goto START_SUCCESS
 )
