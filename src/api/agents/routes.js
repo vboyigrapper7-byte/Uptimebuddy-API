@@ -474,7 +474,16 @@ if %retry% LSS 3 (
     goto RETRY_START
 )
 
-:: If we get here, it failed 3 times
+:: If we get here, it failed 3 times. Try to diagnose.
+echo [ERROR] MonitorHub Agent failed to start after 3 attempts.
+sc query MonitorHubAgent
+echo [DEBUG] Checking for error codes...
+sc query MonitorHubAgent | find "WIN32_EXIT_CODE"
+echo [DEBUG] Checking for recent logs...
+if exist "C:\MonitorHub\agent.log" (
+    echo [DEBUG] Last 10 lines of C:\MonitorHub\agent.log:
+    powershell -Command "Get-Content 'C:\MonitorHub\agent.log' -Tail 10"
+)
 goto PHASE_4_FAILED
 
 :START_SUCCESS
