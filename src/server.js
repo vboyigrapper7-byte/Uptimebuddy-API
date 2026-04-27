@@ -50,6 +50,14 @@ const buildServer = async () => {
     // Must happen FIRST so variables like 'pool' are available to decorators
     const { authRoutes, agentRoutes, monitorRoutes, webhookRoutes, publicRoutes, billingRoutes, teamRoutes, auditRoutes, alertRoutes, pool } = getRoutesAndServices();
 
+    // ── Database Initialization (One-time Indexing) ──────────────────────
+    try {
+        await pool.query('CREATE INDEX IF NOT EXISTS idx_agent_metrics_recorded_at ON agent_metrics(recorded_at)');
+        logger.info('[DB] Initialization: Metrics index verified.');
+    } catch (dbInitErr) {
+        logger.error(`[DB] Initialization Error: ${dbInitErr.message}`);
+    }
+
     const server = Fastify({
         ignoreTrailingSlash: true,
         logger: {

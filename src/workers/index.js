@@ -23,15 +23,15 @@ syncMonitors()
     .then(() => console.log('[Worker] Monitor synchronization complete.'))
     .catch(err => console.error('[Worker] Sync error:', err));
 
-// 2. Schedule Nightly Retention Cleanup (Runs daily at midnight)
+// 2. Schedule Periodic Retention Cleanup (Runs every hour)
 retentionQueue.add(
-    'nightly-cleanup', 
+    'periodic-retention', 
     {}, 
     { 
-        repeat: { pattern: '0 0 * * *' },
+        repeat: { every: 60 * 60 * 1000 },
         jobId: 'system-retention-job' 
     }
-).then(() => console.log('[Worker] Nightly retention job scheduled.'));
+).then(() => console.log('[Worker] Periodic retention job scheduled (Every 1 hour).'));
 
 // 3. Schedule Periodic Stats Computation (Runs every 5 minutes)
 statsQueue.add(
