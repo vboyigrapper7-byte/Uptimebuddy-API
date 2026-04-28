@@ -428,10 +428,10 @@ if "%PROCESSOR_ARCHITECTURE%"=="x86" (
         set "ARCH=386"
         echo [INFO] Detected 32-bit system.
     ) else (
-        echo [INFO] Detected 64-bit system (running 32-bit shell).
+        echo [INFO] Detected 64-bit system ^(running 32-bit shell^).
     )
 ) else (
-    echo [INFO] Detected 64-bit system (%PROCESSOR_ARCHITECTURE%).
+    echo [INFO] Detected 64-bit system ^(%PROCESSOR_ARCHITECTURE%^).
 )
 
 echo [INFO] Downloading Agent Engine (Go-Native/%ARCH%)...
@@ -446,7 +446,7 @@ if not exist "monitorhub-agent.exe" goto DOWNLOAD_FAILED
 :: Check if file size is too small (e.g. < 100kb), which indicates an error message instead of a binary
 for %%I in ("monitorhub-agent.exe") do set size=%%~zI
 if %size% LSS 102400 (
-    echo [ERROR] Downloaded file is too small (%size% bytes). It is likely an error message from the server.
+    echo [ERROR] Downloaded file is too small ^(%size% bytes^). It is likely an error message from the server.
     echo [DEBUG] File content:
     type "monitorhub-agent.exe"
     goto DOWNLOAD_FAILED
@@ -572,7 +572,7 @@ if exist "C:\\MonitorHub\\agent.log" (
     powershell -Command "Get-Content 'C:\\MonitorHub\\agent.log' -Tail 10"
 ) else (
     echo [INFO] agent.log not found. The process may not have started at all.
-    echo [TIP] Check Windows Event Viewer (System) for Service Control Manager errors.
+    echo [TIP] Check Windows Event Viewer ^(System^) for Service Control Manager errors.
 )
 echo -------------------------------------
 echo.
