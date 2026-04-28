@@ -50,10 +50,24 @@ const buildServer = async () => {
     // Must happen FIRST so variables like 'pool' are available to decorators
     const { authRoutes, agentRoutes, monitorRoutes, webhookRoutes, publicRoutes, billingRoutes, teamRoutes, auditRoutes, alertRoutes, pool } = getRoutesAndServices();
 
-    // ── Database Initialization (One-time Indexing) ──────────────────────
+    // ── Database Initialization (Metrics Index & Agent Distribution) ────
     try {
         await pool.query('CREATE INDEX IF NOT EXISTS idx_agent_metrics_recorded_at ON agent_metrics(recorded_at)');
-        logger.info('[DB] Initialization: Metrics index verified.');
+        
+        // Ensure distribution tables exist
+        await pool.query(`CREATE TABLE IF NOT EXISTS agent_releases (id SERIAL PRIMARY KEY, version VARCHAR(50) UNIQUE NOT NULL, is_stable BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT NOW())`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS agent_binaries (id SERIAL PRIMARY KEY, release_id INT REFERENCES agent_releases(id) ON DELETE CASCADE, os VARCHAR(20), arch VARCHAR(20), file_path TEXT NOT NULL, sha256 VARCHAR(64), created_at TIMESTAMP DEFAULT NOW())`);
+        
+        // Seed initial stable release if missing
+        await pool.query(`INSERT INTO agent_releases (version, is_stable) VALUES ('1.1.0', true) ON CONFLICT (version) DO UPDATE SET is_stable = true`);
+        const rel = await pool.query("SELECT id FROM agent_releases WHERE version = '1.1.0'");
+        const relId = rel.rows[0].id;
+        
+        // Ensure binary records exist
+        await pool.query(`INSERT INTO agent_binaries (release_id, os, arch, file_path) VALUES ($1, 'windows', 'amd64', 'internal') ON CONFLICT DO NOTHING`, [relId]);
+        await pool.query(`INSERT INTO agent_binaries (release_id, os, arch, file_path) VALUES ($1, 'windows', '386', 'internal') ON CONFLICT DO NOTHING`, [relId]);
+        
+        logger.info('[DB] Initialization: Metrics index & Agent Distribution verified.');
     } catch (dbInitErr) {
         logger.error(`[DB] Initialization Error: ${dbInitErr.message}`);
     }

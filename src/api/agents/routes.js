@@ -6,6 +6,21 @@ const { requireAuth, requireApiKey } = require('../auth/middleware');
 
 // ── SSRF / private‑IP guard ─────────────────────────────────────────────
 const PRIVATE_IP_RE = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|::1|0\.0\.0\.0)/i;
+const WINDOWS_AGENT_BINARY_PATH_64 = path.resolve(__dirname, './bin/windows/amd64/monitorhub-agent.exe');
+const WINDOWS_AGENT_BINARY_PATH_32 = path.resolve(__dirname, './bin/windows/386/monitorhub-agent.exe');
+
+function getPackagedAgentBinary(os, arch) {
+    if (os === 'windows') {
+        if (arch === 'amd64' && fs.existsSync(WINDOWS_AGENT_BINARY_PATH_64)) return WINDOWS_AGENT_BINARY_PATH_64;
+        if (arch === '386' && fs.existsSync(WINDOWS_AGENT_BINARY_PATH_32)) return WINDOWS_AGENT_BINARY_PATH_32;
+    }
+    return null;
+}
+
+function looksLikeInstaller(filePath) {
+    return /\.msi(?:$|[?#])/i.test(filePath || '');
+}
+
 const tokenCache = new Map(); // Phase 5: Fast token lookup cache
 
 // ── Metric range guard ───────────────────────────────────────────────────
@@ -159,7 +174,7 @@ async function agentRoutes(fastify, options) {
                 CREATE INDEX IF NOT EXISTS idx_alert_history_time ON alert_history(delivered_at DESC);
             `);
 
-            const releaseUrl = 'https://github.com/vboyigrapper7-byte/Uptimebuddy-API/releases/download/v1.0/MonitorHubAgent.msi';
+            const windowsAgentPath = 'src/api/agents/bin/windows/amd64/monitorhub-agent.exe';
             
             // 1. Setup Release
             await fastify.db.query(`
@@ -168,14 +183,21 @@ async function agentRoutes(fastify, options) {
                 ON CONFLICT (version) DO NOTHING;
             `);
 
-            // 2. Setup Windows MSI (Dual-Column Support)
+            // 2. Setup Windows (AMD64 & 386)
             await fastify.db.query(`
                 INSERT INTO agent_binaries (release_id, platform, os, architecture, arch, file_path, sha256)
-                VALUES (
+                VALUES 
+                (
                     (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
                     'windows', 'windows', 'amd64', 'amd64',
-                    '${releaseUrl}',
-                    'N/A'
+                    'src/api/agents/bin/windows/amd64/monitorhub-agent.exe',
+                    '3EBFD772D922EE26197BA257C0FAADE50B4F2721768CCC88CAB81A2911EF83D3'
+                ),
+                (
+                    (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
+                    'windows', 'windows', '386', '386',
+                    'src/api/agents/bin/windows/386/monitorhub-agent.exe',
+                    '20A6904728F743CA5BB9CB2BF5CE3E61F10563C0CC2C66488ECF0169D413EE13'
                 )
                 ON CONFLICT ON CONSTRAINT unique_platform_arch_release DO UPDATE SET file_path = EXCLUDED.file_path;
             `);
@@ -371,7 +393,7 @@ async function agentRoutes(fastify, options) {
     // ────────────────────────────────────────────────────────────────────
     // PUBLIC — Windows Native Service Installer Script
     // ────────────────────────────────────────────────────────────────────
-    fastify.get('/install_v2.bat', async (request, reply) => {
+    async function sendWindowsInstallerBat(request, reply) {
         const { token, host } = request.query;
         if (!token) return reply.status(400).send('Agent token is required');
 
@@ -399,8 +421,21 @@ mkdir "C:\\MonitorHub" 2>nul
 cd /d "%INSTALL_DIR%"
 
 :: ── Download Engine
-echo [INFO] Downloading Agent Engine (Go-Native)...
-set "AGENT_URL=${hostUrl}/api/v1/agents/bin/windows/amd64"
+echo [INFO] Detecting System Architecture...
+set "ARCH=amd64"
+if "%PROCESSOR_ARCHITECTURE%"=="x86" (
+    if "%PROCESSOR_ARCHITEW6432%"=="" (
+        set "ARCH=386"
+        echo [INFO] Detected 32-bit system.
+    ) else (
+        echo [INFO] Detected 64-bit system (running 32-bit shell).
+    )
+) else (
+    echo [INFO] Detected 64-bit system (%PROCESSOR_ARCHITECTURE%).
+)
+
+echo [INFO] Downloading Agent Engine (Go-Native/%ARCH%)...
+set "AGENT_URL=${hostUrl}/api/v1/agents/bin/windows/%ARCH%"
 curl.exe --ssl-no-revoke -f -s -L -o "monitorhub-agent.exe" "%AGENT_URL%"
 
 if exist "monitorhub-agent.exe" goto DOWNLOAD_OK
@@ -408,7 +443,17 @@ powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.Security
 
 :DOWNLOAD_OK
 if not exist "monitorhub-agent.exe" goto DOWNLOAD_FAILED
-echo [SUCCESS] Agent Engine downloaded.
+:: Check if file size is too small (e.g. < 100kb), which indicates an error message instead of a binary
+for %%I in ("monitorhub-agent.exe") do set size=%%~zI
+if %size% LSS 102400 (
+    echo [ERROR] Downloaded file is too small (%size% bytes). It is likely an error message from the server.
+    echo [DEBUG] File content:
+    type "monitorhub-agent.exe"
+    goto DOWNLOAD_FAILED
+)
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$bytes = [System.IO.File]::ReadAllBytes('monitorhub-agent.exe'); if ($bytes.Length -lt 2 -or $bytes[0] -ne 77 -or $bytes[1] -ne 90) { exit 1 }"
+if errorlevel 1 goto INVALID_BINARY
+echo [SUCCESS] Agent Engine downloaded (%size% bytes).
 
 :: ── Configuration
 echo [INFO] Configuring Agent Environment...
@@ -504,6 +549,12 @@ echo [ERROR] Failed to download agent binary.
 pause
 exit /b 1
 
+:INVALID_BINARY
+echo [ERROR] Downloaded agent is not a valid Windows executable.
+echo [TIP] The download endpoint may be returning an MSI, HTML error page, or proxy response.
+pause
+exit /b 1
+
 :PHASE_1_FAILED
 echo [ERROR] PHASE_1_FAILURE: Service creation failed.
 sc query MonitorHubAgent
@@ -535,7 +586,10 @@ exit /b 1`;
             .header('Pragma', 'no-cache')
             .header('Expires', '0')
             .send(script);
-    });
+    }
+
+    fastify.get('/install_v2.bat', sendWindowsInstallerBat);
+    fastify.get('/install_windows.bat', sendWindowsInstallerBat);
 
     // ────────────────────────────────────────────────────────────────────
     // PUBLIC — Agent Distribution (Go Agent)
@@ -637,7 +691,15 @@ exit /b 1`;
                 ORDER BY r.created_at DESC LIMIT 1
             `, [os, arch]);
 
+            const packagedBinary = getPackagedAgentBinary(os, arch);
+
             if (res.rows.length === 0) {
+                if (packagedBinary) {
+                    fastify.log.warn({ os, arch }, 'Binary metadata missing; serving packaged agent binary');
+                    reply.header('Cache-Control', 'public, max-age=86400');
+                    reply.header('Content-Disposition', `attachment; filename="monitorhub-agent-${os}-${arch}${os === 'windows' ? '.exe' : ''}"`);
+                    return reply.type('application/octet-stream').send(fs.createReadStream(packagedBinary));
+                }
                 fastify.log.warn({ os, arch }, 'Binary download failed - Not found');
                 return reply.status(404).send({ error: 'Binary not found' });
             }
@@ -655,14 +717,28 @@ exit /b 1`;
             // Log download to audit (optional)
             fastify.log.info(`[AgentDistribution] Download: ${os}/${arch}`);
 
+            if (packagedBinary && looksLikeInstaller(binary.file_path)) {
+                fastify.log.warn({ os, arch, file_path: binary.file_path }, 'Windows binary metadata points to installer; serving packaged service executable instead');
+                return reply.type('application/octet-stream').send(fs.createReadStream(packagedBinary));
+            }
+
             if (binary.file_path.startsWith('http')) {
                 // Production: Redirect to S3/CDN
                 return reply.redirect(binary.file_path);
             } else {
-                // Development/Local: Stream from disk
-                let absPath = path.resolve(__dirname, '../../../', binary.file_path);
+                // Priority 1: Check in local bin folder (where we copied it for deployment)
+                let absPath = path.resolve(__dirname, 'bin', os, arch, os === 'windows' ? 'monitorhub-agent.exe' : 'monitorhub-agent');
+
+                if (!fs.existsSync(absPath) && packagedBinary) {
+                    absPath = packagedBinary;
+                }
                 
-                // Fallback for local dev if file_path is relative to agent-go
+                // Priority 2: Fallback to old path logic
+                if (!fs.existsSync(absPath)) {
+                    absPath = path.resolve(__dirname, '../../../', binary.file_path);
+                }
+
+                // Priority 3: Final fallback for dev environments
                 if (!fs.existsSync(absPath)) {
                     const localGoBin = path.resolve(__dirname, '../../../../uptimebuddy-go-agent/bin', `monitorhub-agent-${os}-${arch}${os === 'windows' ? '.exe' : ''}`);
                     if (fs.existsSync(localGoBin)) {
@@ -671,6 +747,7 @@ exit /b 1`;
                 }
 
                 if (!fs.existsSync(absPath)) {
+                    fastify.log.error({ os, arch, attemptedPath: absPath }, 'Binary file missing on server');
                     return reply.status(404).send({ error: 'Binary file missing on server' });
                 }
                 const stream = fs.createReadStream(absPath);
@@ -772,7 +849,10 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
             // Priority 2: Check Local Disk (Legacy/Dev)
             const msiPath = path.resolve(__dirname, '../../../MonitorHubAgent.msi');
             if (fs.existsSync(msiPath)) {
-                return reply.download('MonitorHubAgent.msi');
+                return reply
+                    .type('application/octet-stream')
+                    .header('Content-Disposition', 'attachment; filename="MonitorHubAgent.msi"')
+                    .send(fs.createReadStream(msiPath));
             }
 
             // Priority 3: Final Fallback to Professional .bat
