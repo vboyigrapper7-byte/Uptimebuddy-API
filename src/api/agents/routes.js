@@ -300,6 +300,7 @@ async function agentRoutes(fastify, options) {
             const hostname = (hostnameRaw && hostnameRaw.trim()) ? hostnameRaw : null;
             const os_type  = request.body?.os_type || metrics?.os || null;
             const public_ip = request.ip;
+            const private_ip = metrics?.private_ip || null;
             const recordedAt = new Date();
 
             // 1.5 Update Agent State (CRITICAL: Update status FIRST for accuracy)
@@ -311,9 +312,10 @@ async function agentRoutes(fastify, options) {
                     agent_version = $3,
                     hostname = COALESCE($4, hostname),
                     os_type = COALESCE($5, os_type),
-                    public_ip = $6
+                    public_ip = $6,
+                    private_ip = COALESCE($7, private_ip)
                 WHERE id = $1`, 
-                [agentId, agent_type, agent_version, hostname, os_type, public_ip]
+                [agentId, agent_type, agent_version, hostname, os_type, public_ip, private_ip]
             );
 
             // Phase 3: Real-time broadcast via Redis Pub/Sub
