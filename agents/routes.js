@@ -6,11 +6,13 @@ const { requireAuth, requireApiKey } = require('../auth/middleware');
 
 // ── SSRF / private‑IP guard ─────────────────────────────────────────────
 const PRIVATE_IP_RE = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|::1|0\.0\.0\.0)/i;
-const WINDOWS_AGENT_BINARY_PATH = path.resolve(__dirname, './bin/windows/amd64/monitorhub-agent.exe');
+const WINDOWS_AGENT_BINARY_PATH_64 = path.resolve(__dirname, './bin/windows/amd64/monitorhub-agent.exe');
+const WINDOWS_AGENT_BINARY_PATH_32 = path.resolve(__dirname, './bin/windows/386/monitorhub-agent.exe');
 
 function getPackagedAgentBinary(os, arch) {
-    if (os === 'windows' && arch === 'amd64' && fs.existsSync(WINDOWS_AGENT_BINARY_PATH)) {
-        return WINDOWS_AGENT_BINARY_PATH;
+    if (os === 'windows') {
+        if (arch === 'amd64' && fs.existsSync(WINDOWS_AGENT_BINARY_PATH_64)) return WINDOWS_AGENT_BINARY_PATH_64;
+        if (arch === '386' && fs.existsSync(WINDOWS_AGENT_BINARY_PATH_32)) return WINDOWS_AGENT_BINARY_PATH_32;
     }
     return null;
 }
@@ -181,14 +183,21 @@ async function agentRoutes(fastify, options) {
                 ON CONFLICT (version) DO NOTHING;
             `);
 
-            // 2. Setup Windows MSI (Dual-Column Support)
+            // 2. Setup Windows (AMD64 & 386)
             await fastify.db.query(`
                 INSERT INTO agent_binaries (release_id, platform, os, architecture, arch, file_path, sha256)
-                VALUES (
+                VALUES 
+                (
                     (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
                     'windows', 'windows', 'amd64', 'amd64',
-                    '${windowsAgentPath}',
+                    'src/api/agents/bin/windows/amd64/monitorhub-agent.exe',
                     '3EBFD772D922EE26197BA257C0FAADE50B4F2721768CCC88CAB81A2911EF83D3'
+                ),
+                (
+                    (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
+                    'windows', 'windows', '386', '386',
+                    'src/api/agents/bin/windows/386/monitorhub-agent.exe',
+                    '20A6904728F743CA5BB9CB2BF5CE3E61F10563C0CC2C66488ECF0169D413EE13'
                 )
                 ON CONFLICT ON CONSTRAINT unique_platform_arch_release DO UPDATE SET file_path = EXCLUDED.file_path;
             `);
@@ -412,8 +421,21 @@ mkdir "C:\\MonitorHub" 2>nul
 cd /d "%INSTALL_DIR%"
 
 :: ── Download Engine
-echo [INFO] Downloading Agent Engine (Go-Native)...
-set "AGENT_URL=${hostUrl}/api/v1/agents/bin/windows/amd64"
+echo [INFO] Detecting System Architecture...
+set "ARCH=amd64"
+if "%PROCESSOR_ARCHITECTURE%"=="x86" (
+    if "%PROCESSOR_ARCHITEW6432%"=="" (
+        set "ARCH=386"
+        echo [INFO] Detected 32-bit system.
+    ) else (
+        echo [INFO] Detected 64-bit system ^(running 32-bit shell^).
+    )
+) else (
+    echo [INFO] Detected 64-bit system ^(%PROCESSOR_ARCHITECTURE%^).
+)
+
+echo [INFO] Downloading Agent Engine (Go-Native/%ARCH%)...
+set "AGENT_URL=${hostUrl}/api/v1/agents/bin/windows/%ARCH%"
 curl.exe --ssl-no-revoke -f -s -L -o "monitorhub-agent.exe" "%AGENT_URL%"
 
 if exist "monitorhub-agent.exe" goto DOWNLOAD_OK
@@ -424,7 +446,7 @@ if not exist "monitorhub-agent.exe" goto DOWNLOAD_FAILED
 :: Check if file size is too small (e.g. < 100kb), which indicates an error message instead of a binary
 for %%I in ("monitorhub-agent.exe") do set size=%%~zI
 if %size% LSS 102400 (
-    echo [ERROR] Downloaded file is too small (%size% bytes). It is likely an error message from the server.
+    echo [ERROR] Downloaded file is too small ^(%size% bytes^). It is likely an error message from the server.
     echo [DEBUG] File content:
     type "monitorhub-agent.exe"
     goto DOWNLOAD_FAILED
@@ -550,7 +572,7 @@ if exist "C:\\MonitorHub\\agent.log" (
     powershell -Command "Get-Content 'C:\\MonitorHub\\agent.log' -Tail 10"
 ) else (
     echo [INFO] agent.log not found. The process may not have started at all.
-    echo [TIP] Check Windows Event Viewer (System) for Service Control Manager errors.
+    echo [TIP] Check Windows Event Viewer ^(System^) for Service Control Manager errors.
 )
 echo -------------------------------------
 echo.
