@@ -810,24 +810,7 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
     });
 
     // ────────────────────────────────────────────────────────────────────
-    // Serve the actual Native Script Files
-    // ────────────────────────────────────────────────────────────────────
-    fastify.get('/scripts/windows', async (request, reply) => {
-        const scriptPath = path.resolve(__dirname, './bin/uptimebuddy-agent.ps1');
-        if (!fs.existsSync(scriptPath)) return reply.status(404).send('Agent script not found');
-        const content = await fs.promises.readFile(scriptPath, 'utf-8');
-        return reply.type('text/plain').send(content);
-    });
-
-    fastify.get('/scripts/linux', async (request, reply) => {
-        const scriptPath = path.resolve(__dirname, './bin/uptimebuddy-agent.py');
-        if (!fs.existsSync(scriptPath)) return reply.status(404).send('Agent script not found');
-        const content = await fs.promises.readFile(scriptPath, 'utf-8');
-        return reply.type('text/plain').send(content);
-    });
-
-    // ────────────────────────────────────────────────────────────────────
-    // PROFESSIONAL MSI DISTRIBUTION
+    // PROFESSIONAL MSI DISTRIBUTION (Zero-Config Token Extraction)
     // ────────────────────────────────────────────────────────────────────
     fastify.get('/install_windows.msi', async (request, reply) => {
         const { token } = request.query;
@@ -849,9 +832,31 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
             }
 
             if (msiPath) {
+                // Feature: Rename file to include token and host/port so MSI can auto-extract it
+                let downloadName = 'MonitorHubAgent.msi';
+                if (token) {
+                    const hostUrlStr = process.env.PUBLIC_API_URL || `http://${request.headers.host}`;
+                    try {
+                        const urlObj = new URL(hostUrlStr);
+                        const host = urlObj.hostname;
+                        const port = urlObj.port;
+                        const protocol = urlObj.protocol.replace(':', ''); // 'http' or 'https'
+                        
+                        downloadName = `MonitorHubAgent_${token}`;
+                        if (host && host !== 'api.monitorhubs.com') {
+                            downloadName += `_sh_${host}`;
+                            if (port) downloadName += `_sp_${port}`;
+                            if (protocol) downloadName += `_pr_${protocol}`;
+                        }
+                        downloadName += '.msi';
+                    } catch (e) {
+                        downloadName = `MonitorHubAgent_${token}.msi`;
+                    }
+                }
+
                 return reply
                     .type('application/octet-stream')
-                    .header('Content-Disposition', 'attachment; filename="MonitorHubAgent.msi"')
+                    .header('Content-Disposition', `attachment; filename="${downloadName}"`)
                     .send(fs.createReadStream(msiPath));
             }
 
@@ -871,13 +876,12 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
                 return reply.redirect(res.rows[0].file_path);
             }
 
-
-
             // Priority 3: Final Fallback to Professional .bat
             const hostUrl = process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
-            return reply.redirect(`${hostUrl}/api/v1/agents/install_v2.bat?token=${token}`);
+            const fallbackToken = token || 'YOUR_TOKEN_HERE';
+            return reply.redirect(`${hostUrl}/api/v1/agents/install_v2.bat?token=${fallbackToken}`);
         } catch (err) {
-            // On error, still try to fallback to .bat so the installation doesn't break
+            fastify.log.error(err, 'MSI download error');
             const hostUrl = process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
             return reply.redirect(`${hostUrl}/api/v1/agents/install_v2.bat?token=${token}`);
         }
