@@ -191,13 +191,13 @@ async function agentRoutes(fastify, options) {
                     (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
                     'windows', 'windows', 'amd64', 'amd64',
                     'src/api/agents/bin/windows/amd64/monitorhub-agent.exe',
-                    '3EBFD772D922EE26197BA257C0FAADE50B4F2721768CCC88CAB81A2911EF83D3'
+                    '90ED45B24B9A2AB8FDC317F0139776BEABBBE83DEC82315136020979A3131A03'
                 ),
                 (
                     (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
                     'windows', 'windows', '386', '386',
                     'src/api/agents/bin/windows/386/monitorhub-agent.exe',
-                    '20A6904728F743CA5BB9CB2BF5CE3E61F10563C0CC2C66488ECF0169D413EE13'
+                    '0146713F867312A8304241BE7CFD9ED8AA4964AA6240850D2DA2EA9725583010'
                 )
                 ON CONFLICT ON CONSTRAINT unique_platform_arch_release DO UPDATE SET file_path = EXCLUDED.file_path;
             `);
@@ -833,13 +833,36 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
         const { token } = request.query;
         
         try {
-            // Priority 1: Check Database (Harden for all column naming versions)
+            // Priority 1: Check Local Disk (This is where the new MSI is)
+            const searchPaths = [
+                path.resolve(__dirname, '../../../MonitorHubAgent.msi'), // Root of backend-ready
+                path.resolve(__dirname, '../../../../uptimebuddy-go-agent/MonitorHubAgent.msi'), // Dev location
+                path.resolve(__dirname, './bin/windows/amd64/MonitorHubAgent.msi') // Packaged location
+            ];
+
+            let msiPath = null;
+            for (const p of searchPaths) {
+                if (fs.existsSync(p)) {
+                    msiPath = p;
+                    break;
+                }
+            }
+
+            if (msiPath) {
+                return reply
+                    .type('application/octet-stream')
+                    .header('Content-Disposition', 'attachment; filename="MonitorHubAgent.msi"')
+                    .send(fs.createReadStream(msiPath));
+            }
+
+            // Priority 2: Check Database for a remote MSI link
             const res = await fastify.db.query(`
                 SELECT b.file_path 
                 FROM agent_binaries b
                 JOIN agent_releases r ON b.release_id = r.id
                 WHERE (b.platform = 'windows' OR b.os = 'windows') 
                   AND (b.architecture = 'amd64' OR b.arch = 'amd64')
+                  AND b.file_path LIKE '%.msi%'
                   AND r.is_stable = true
                 ORDER BY r.created_at DESC LIMIT 1
             `);
@@ -848,14 +871,7 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
                 return reply.redirect(res.rows[0].file_path);
             }
 
-            // Priority 2: Check Local Disk (Legacy/Dev)
-            const msiPath = path.resolve(__dirname, '../../../MonitorHubAgent.msi');
-            if (fs.existsSync(msiPath)) {
-                return reply
-                    .type('application/octet-stream')
-                    .header('Content-Disposition', 'attachment; filename="MonitorHubAgent.msi"')
-                    .send(fs.createReadStream(msiPath));
-            }
+
 
             // Priority 3: Final Fallback to Professional .bat
             const hostUrl = process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
