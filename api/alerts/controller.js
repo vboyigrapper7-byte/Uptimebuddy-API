@@ -93,9 +93,9 @@ const getAlertLogs = async (request, reply) => {
 
     try {
         const result = await pool.query(
-            `SELECT l.*, m.name as monitor_name
+            `SELECT l.*, COALESCE(m.name, 'System/Server') as monitor_name
              FROM alert_logs l
-             JOIN monitors m ON l.monitor_id = m.id
+             LEFT JOIN monitors m ON l.monitor_id = m.id
              WHERE l.user_id = $1
              ORDER BY l.delivered_at DESC
              LIMIT $2 OFFSET $3`,
@@ -105,7 +105,7 @@ const getAlertLogs = async (request, reply) => {
         return reply.send(result.rows);
     } catch (err) {
         request.log.error(err);
-        reply.code(500).send({ error: 'Failed to fetch alert logs' });
+        return reply.code(500).send({ error: 'Failed to fetch alert history' });
     }
 };
 
@@ -173,4 +173,40 @@ const testWebhookAlert = async (request, reply) => {
     }
 };
 
-module.exports = { getAlertSettings, updateAlertSettings, getAlertLogs, testEmailAlert, testWebhookAlert };
+const getAlertResources = async (request, reply) => {
+    try {
+        const pool = request.server.db;
+        const monitorsRes = await pool.query(
+            "SELECT id, name, type, alerts_enabled FROM monitors WHERE user_id = $1 ORDER BY created_at DESC",
+            [request.user.id]
+        );
+        const agentsRes = await pool.query(
+            "SELECT id, name, 'agent' as type, alerts_enabled FROM agents WHERE user_id = $1 ORDER BY created_at DESC",
+            [request.user.id]
+        );
+        
+        return reply.send({
+            monitors: monitorsRes.rows,
+            agents: agentsRes.rows
+        });
+    } catch (err) {
+        return reply.code(500).send({ error: err.message });
+    }
+};
+
+const toggleResourceAlert = async (request, reply) => {
+    const { resourceType, id, enabled } = request.body;
+    try {
+        const pool = request.server.db;
+        if (resourceType === 'agent') {
+            await pool.query('UPDATE agents SET alerts_enabled = $1 WHERE id = $2 AND user_id = $3', [enabled, id, request.user.id]);
+        } else {
+            await pool.query('UPDATE monitors SET alerts_enabled = $1 WHERE id = $2 AND user_id = $3', [enabled, id, request.user.id]);
+        }
+        return reply.send({ success: true });
+    } catch (err) {
+        return reply.code(500).send({ error: err.message });
+    }
+};
+
+module.exports = { getAlertSettings, updateAlertSettings, getAlertLogs, testEmailAlert, testWebhookAlert, getAlertResources, toggleResourceAlert };

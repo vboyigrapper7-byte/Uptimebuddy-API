@@ -7,10 +7,9 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-// Fixed INR Pricing (based on round-off as requested)
 const INR_PRICES = {
     free: 0,
-    starter: 799,
+    starter: 10,
     pro: 1999,
     business: 6999
 };
@@ -47,7 +46,8 @@ const createOrder = async (request, reply) => {
         return reply.send({
             id: order.id,
             currency: order.currency,
-            amount: order.amount
+            amount: order.amount,
+            key_id: process.env.RAZORPAY_KEY_ID
         });
     } catch (error) {
         request.log.error('Razorpay Create Order Error:', error);

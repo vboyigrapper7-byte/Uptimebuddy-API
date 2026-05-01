@@ -1,38 +1,257 @@
 const crypto = require('crypto');
 const path   = require('path');
 const fs     = require('fs');
+const auditService = require('../../core/auth/auditService');
+const { requireAuth, requireApiKey } = require('../auth/middleware');
 
 // ── SSRF / private‑IP guard ─────────────────────────────────────────────
 const PRIVATE_IP_RE = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|::1|0\.0\.0\.0)/i;
+const WINDOWS_AGENT_BINARY_PATH_64 = path.resolve(__dirname, './bin/windows/amd64/monitorhub-agent.exe');
+const WINDOWS_AGENT_BINARY_PATH_32 = path.resolve(__dirname, './bin/windows/386/monitorhub-agent.exe');
+
+function getPackagedAgentBinary(os, arch) {
+    if (os === 'windows') {
+        if (arch === 'amd64' && fs.existsSync(WINDOWS_AGENT_BINARY_PATH_64)) return WINDOWS_AGENT_BINARY_PATH_64;
+        if (arch === '386' && fs.existsSync(WINDOWS_AGENT_BINARY_PATH_32)) return WINDOWS_AGENT_BINARY_PATH_32;
+    }
+    return null;
+}
+
+function looksLikeInstaller(filePath) {
+    return /\.msi(?:$|[?#])/i.test(filePath || '');
+}
+
+const tokenCache = new Map(); // Phase 5: Fast token lookup cache
 
 // ── Metric range guard ───────────────────────────────────────────────────
 function validateMetrics(metrics) {
-    const { cpu_percent, ram_mb, disk_percent } = metrics;
-    if (typeof cpu_percent   !== 'number' || cpu_percent   < 0 || cpu_percent   > 100) return false;
-    if (typeof disk_percent  !== 'number' || disk_percent  < 0 || disk_percent  > 100) return false;
-    if (typeof ram_mb        !== 'number' || ram_mb        < 0 || ram_mb        > 4194304) return false;
-    if (metrics.ram_total_mb  !== undefined && (typeof metrics.ram_total_mb  !== 'number' || metrics.ram_total_mb  < 0)) return false;
-    // Add validation for new disk metrics
-    if (metrics.disk_total_gb !== undefined && (typeof metrics.disk_total_gb !== 'number')) return false;
-    if (metrics.disk_free_gb  !== undefined && (typeof metrics.disk_free_gb  !== 'number')) return false;
-    if (metrics.net_rx_mb     !== undefined && (typeof metrics.net_rx_mb     !== 'number' || metrics.net_rx_mb    < 0)) return false;
-    if (metrics.net_tx_mb     !== undefined && (typeof metrics.net_tx_mb     !== 'number' || metrics.net_tx_mb    < 0)) return false;
-    if (metrics.uptime_seconds !== undefined && (typeof metrics.uptime_seconds !== 'number' || metrics.uptime_seconds < 0)) return false;
-    if (metrics.process_count  !== undefined && (typeof metrics.process_count  !== 'number' || metrics.process_count  < 0)) return false;
+    // Robust parsing for case where metrics arrive as strings
+    const cpu = Number(metrics.cpu_percent);
+    const ram = Number(metrics.ram_mb);
+    const disk = Number(metrics.disk_percent);
+
+    if (isNaN(cpu) || cpu < 0 || cpu > 100) return false;
+    if (isNaN(disk) || disk < 0 || disk > 100) return false;
+    if (isNaN(ram) || ram < 0 || ram > 4194304) return false;
     return true;
 }
 
 // ── Agent dynamic status helper ───────────────────────────────────────────
 function getDynamicAgentStatus(agent) {
-    if (!agent.last_seen || agent.status === 'pending') return agent.status;
+    if (!agent.last_seen) return agent.status;
     const now = Date.now();
     const secondsSinceSeen = (now - new Date(agent.last_seen).getTime()) / 1000;
-    return secondsSinceSeen < 90 ? 'up' : 'down';
+    
+    // Phase 4: Tighten offline detection to 60s (was 90s)
+    if (secondsSinceSeen < 60) return 'up';
+    
+    // If it was pending but hasn't reported, stay pending
+    if (agent.status === 'pending') return 'pending';
+    
+    return 'down';
 }
 
-const { requireApiKey } = require('../auth/middleware');
-
 async function agentRoutes(fastify, options) {
+
+    // ────────────────────────────────────────────────────────────────────
+    // ONE-TIME ACTIVATION ROUTE (Visit once to setup database)
+    // ────────────────────────────────────────────────────────────────────
+    fastify.get('/internal/create-test-agent', async (request, reply) => {
+        try {
+            const token = 'ub_test_token_' + Date.now();
+            const name = 'Validation-Agent-' + Date.now();
+            
+            // Get first user
+            const userRes = await fastify.db.query('SELECT id FROM users LIMIT 1');
+            if (userRes.rows.length === 0) {
+                return reply.status(404).send({ error: 'No users found to assign agent to' });
+            }
+            const userId = userRes.rows[0].id;
+
+            await fastify.db.query(
+                "INSERT INTO agents (user_id, name, server_group, agent_token, status) VALUES ($1, $2, 'default', $3, 'pending')",
+                [userId, name, token]
+            );
+            console.log('[DEBUG] Agent inserted');
+
+            return { success: true, token, name };
+        } catch (err) {
+            console.error('[DEBUG] Error in create-test-agent:', err.message);
+            return reply.status(500).send({ success: false, error: err.message });
+        }
+    });
+
+    fastify.get('/internal/seed-distribution', async (request, reply) => {
+        try {
+            await fastify.db.query(`
+                -- 0. Repair users table (Crucial for Auth)
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS name VARCHAR(255);
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS status_slug VARCHAR(50);
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_id VARCHAR(50);
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS plan_expiry TIMESTAMP;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_ends_at TIMESTAMP;
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_id VARCHAR(255);
+                ALTER TABLE users ADD COLUMN IF NOT EXISTS provider VARCHAR(50) DEFAULT 'email';
+
+                -- 1. Repair monitors table
+                ALTER TABLE monitors ADD COLUMN IF NOT EXISTS last_checked TIMESTAMP;
+                ALTER TABLE monitors ADD COLUMN IF NOT EXISTS last_alert_at TIMESTAMP;
+                ALTER TABLE monitors ADD COLUMN IF NOT EXISTS category VARCHAR(20) DEFAULT 'uptime';
+                ALTER TABLE monitors ADD COLUMN IF NOT EXISTS assertion_config JSONB;
+
+                -- 2. Repair monitor_metrics
+                ALTER TABLE monitor_metrics ADD COLUMN IF NOT EXISTS status_code INT;
+                ALTER TABLE monitor_metrics ADD COLUMN IF NOT EXISTS error_message TEXT;
+
+                -- 3. Repair agents table (Fixing Heartbeat 500 errors)
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS public_ip varchar(45);
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS private_ip varchar(45);
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS hostname varchar(255);
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS os_type varchar(50);
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_type VARCHAR(50) DEFAULT 'node';
+                ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_version VARCHAR(20);
+
+                -- 4. Repair monitor_stats
+                CREATE TABLE IF NOT EXISTS monitor_stats (
+                    monitor_id      INT PRIMARY KEY REFERENCES monitors(id) ON DELETE CASCADE,
+                    uptime_24h      NUMERIC(5,2) DEFAULT 100.00,
+                    avg_latency_24h INTEGER DEFAULT 0,
+                    last_updated_at TIMESTAMP DEFAULT NOW()
+                );
+                
+                -- 5. Repair agent_metrics
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS ram_total_mb integer;
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS ram_percent numeric(5,2);
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS disk_total_gb numeric;
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS disk_free_gb numeric;
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS net_rx_mb numeric(8,3) DEFAULT 0;
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS net_tx_mb numeric(8,3) DEFAULT 0;
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS uptime_seconds bigint DEFAULT 0;
+                ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS process_count integer DEFAULT 0;
+
+                -- 6. Repair Alerting System (Fixing Ingest 500 errors)
+                CREATE TABLE IF NOT EXISTS alert_settings (
+                    user_id           INT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                    on_down           BOOLEAN DEFAULT TRUE,
+                    on_up             BOOLEAN DEFAULT TRUE,
+                    on_warning        BOOLEAN DEFAULT FALSE,
+                    threshold_retries INT DEFAULT 3,
+                    cooldown_mins     INT DEFAULT 5,
+                    reminder_mins     INT DEFAULT 30,
+                    emails_enabled    BOOLEAN DEFAULT TRUE,
+                    webhooks_enabled  BOOLEAN DEFAULT TRUE,
+                    updated_at        TIMESTAMP DEFAULT NOW()
+                );
+
+                CREATE TABLE IF NOT EXISTS alert_history (
+                    id           SERIAL PRIMARY KEY,
+                    user_id      INT REFERENCES users(id) ON DELETE CASCADE,
+                    monitor_id   INT REFERENCES monitors(id) ON DELETE CASCADE,
+                    type         VARCHAR(50), 
+                    message      TEXT,
+                    severity     VARCHAR(20) DEFAULT 'info',
+                    delivered_at TIMESTAMP DEFAULT NOW()
+                );
+
+                -- 7. Audit Logs (System Events)
+                CREATE TABLE IF NOT EXISTS audit_logs (
+                    id          SERIAL PRIMARY KEY,
+                    user_id     INT REFERENCES users(id) ON DELETE CASCADE,
+                    team_id     INT REFERENCES teams(id) ON DELETE CASCADE,
+                    action      VARCHAR(100) NOT NULL,
+                    metadata    JSONB DEFAULT '{}',
+                    created_at  TIMESTAMP DEFAULT NOW()
+                );
+
+                -- 8. Constraints
+                ALTER TABLE agent_binaries DROP CONSTRAINT IF EXISTS unique_platform_arch_release;
+                ALTER TABLE agent_binaries ADD CONSTRAINT unique_platform_arch_release UNIQUE (release_id, platform, architecture);
+
+                CREATE INDEX IF NOT EXISTS idx_agent_metrics_compound ON agent_metrics (agent_id, recorded_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_monitors_status ON monitors(status);
+                CREATE INDEX IF NOT EXISTS idx_monitor_metrics_time ON monitor_metrics(monitor_id, recorded_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_alert_history_time ON alert_history(delivered_at DESC);
+            `);
+
+            const windowsAgentPath = 'src/api/agents/bin/windows/amd64/monitorhub-agent.exe';
+            
+            // 1. Setup Release
+            await fastify.db.query(`
+                INSERT INTO agent_releases (version, is_stable, rollout_percentage)
+                VALUES ('1.0.0', true, 100)
+                ON CONFLICT (version) DO NOTHING;
+            `);
+
+            // 2. Setup Windows (AMD64 & 386)
+            await fastify.db.query(`
+                INSERT INTO agent_binaries (release_id, platform, os, architecture, arch, file_path, sha256)
+                VALUES 
+                (
+                    (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
+                    'windows', 'windows', 'amd64', 'amd64',
+                    'src/api/agents/bin/windows/amd64/monitorhub-agent.exe',
+                    '90ED45B24B9A2AB8FDC317F0139776BEABBBE83DEC82315136020979A3131A03'
+                ),
+                (
+                    (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
+                    'windows', 'windows', '386', '386',
+                    'src/api/agents/bin/windows/386/monitorhub-agent.exe',
+                    '0146713F867312A8304241BE7CFD9ED8AA4964AA6240850D2DA2EA9725583010'
+                )
+                ON CONFLICT ON CONSTRAINT unique_platform_arch_release DO UPDATE SET file_path = EXCLUDED.file_path;
+            `);
+
+            // 3. Setup Linux Agent (Dual-Column Support)
+            await fastify.db.query(`
+                INSERT INTO agent_binaries (release_id, platform, os, architecture, arch, file_path, sha256)
+                VALUES (
+                    (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
+                    'linux', 'linux', 'amd64', 'amd64',
+                    '/api/v1/agents/scripts/linux',
+                    'N/A'
+                )
+                ON CONFLICT ON CONSTRAINT unique_platform_arch_release DO UPDATE SET file_path = EXCLUDED.file_path;
+            `);
+
+            return { success: true, message: "Database REPAIRED and MAPPED to GitHub successfully!" };
+        } catch (err) {
+            return reply.status(500).send({ success: false, error: err.message });
+        }
+    });
+
+    // Check if an agent has connected (Used by the onboarding wizard)
+    fastify.get('/check-token', async (request, reply) => {
+        const { token } = request.query;
+        if (!token) return reply.status(400).send({ error: 'Token is required' });
+
+        try {
+            const res = await fastify.db.query(
+                'SELECT id, last_seen, status, hostname, public_ip FROM agents WHERE agent_token = $1',
+                [token]
+            );
+
+            if (res.rows.length === 0) {
+                return reply.send({ success: true, connected: false, message: 'Token not found in database' });
+            }
+            
+            const agent = res.rows[0];
+            const isConnected = agent.last_seen !== null;
+            
+            return reply.send({ 
+                success: true,
+                connected: isConnected,
+                status: isConnected ? 'up' : 'pending',
+                agent_id: agent.id,
+                hostname: agent.hostname,
+                public_ip: agent.public_ip,
+                last_seen: agent.last_seen
+            });
+        } catch (err) {
+            fastify.log.error(err, 'check-token error');
+            return reply.status(500).send({ error: err.message });
+        }
+    });
 
     // ────────────────────────────────────────────────────────────────────
     // PUBLIC — Agent ingest (uses agent_token as auth, not JWT)
@@ -50,7 +269,7 @@ async function agentRoutes(fastify, options) {
         // Extract agent_token from header (preferred) or body (legacy)
         const agent_token = request.headers['x-agent-token'] || request.body?.agent_token;
         const agent_type  = request.headers['x-agent-type']  || request.body?.agent_type || 'node';
-        const agent_version = request.headers['x-agent-version'] || request.body?.agent_version;
+        const agent_version = request.headers['x-agent-version'] || request.body?.agent_version || null;
         const { metrics } = request.body || {};
 
         if (!agent_token || !metrics) {
@@ -62,121 +281,116 @@ async function agentRoutes(fastify, options) {
         }
 
         try {
-            // 1. Initial Lookup (Resilient to missing IP columns)
-            let agentId, existing;
-            try {
-                const res = await fastify.db.query('SELECT id, public_ip, private_ip FROM agents WHERE agent_token = $1', [agent_token]);
-                if (res.rows.length === 0) return reply.status(401).send({ error: 'Invalid agent token' });
-                agentId  = res.rows[0].id;
-                existing = res.rows[0];
-            } catch (err) {
-                // FALLBACK: If columns don't exist yet
-                const res = await fastify.db.query('SELECT id FROM agents WHERE agent_token = $1', [agent_token]);
-                if (res.rows.length === 0) return reply.status(401).send({ error: 'Invalid agent token' });
-                agentId  = res.rows[0].id;
-                existing = { id: agentId }; // No IP history available
+            // 1. Token Validation (Optimized with Cache)
+            let agent = tokenCache.get(agent_token);
+            if (!agent) {
+                const res = await fastify.db.query(
+                    'SELECT id, user_id, status, name FROM agents WHERE agent_token = $1',
+                    [agent_token]
+                );
+                if (res.rows.length === 0) return reply.status(404).send({ error: 'Agent not found' });
+                agent = res.rows[0];
+                tokenCache.set(agent_token, agent);
             }
 
+            const agentId = agent.id;
+            const userId  = agent.user_id;
+            const prevStatus = agent.status;
+            const hostnameRaw = request.body?.hostname || metrics?.hostname;
+            const hostname = (hostnameRaw && hostnameRaw.trim()) ? hostnameRaw : null;
+            const os_type  = request.body?.os_type || metrics?.os || null;
+            const public_ip = request.ip;
+            const private_ip = metrics?.private_ip || null;
             const recordedAt = new Date();
 
-            // 2. Log Metrics (Resilient to missing columns)
+            // 1.5 Update Agent State (CRITICAL: Update status FIRST for accuracy)
+            await fastify.db.query(`
+                UPDATE agents 
+                SET last_seen = NOW(), 
+                    status = 'up', 
+                    agent_type = $2, 
+                    agent_version = $3,
+                    hostname = COALESCE($4, hostname),
+                    os_type = COALESCE($5, os_type),
+                    public_ip = $6,
+                    private_ip = COALESCE($7, private_ip)
+                WHERE id = $1`, 
+                [agentId, agent_type, agent_version, hostname, os_type, public_ip, private_ip]
+            );
+
+            // Phase 3: Real-time broadcast via Redis Pub/Sub
             try {
-                await fastify.db.query(
-                    `INSERT INTO agent_metrics
-                     (agent_id, recorded_at, cpu_percent, ram_mb, ram_total_mb, disk_percent, net_rx_mb, net_tx_mb, uptime_seconds, process_count, disk_total_gb, disk_free_gb)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                     ON CONFLICT DO NOTHING`,
-                    [
-                        agentId, recordedAt,
-                        metrics.cpu_percent, metrics.ram_mb, metrics.ram_total_mb ?? null,
-                        metrics.disk_percent,
-                        metrics.net_rx_mb ?? null, metrics.net_tx_mb ?? null,
-                        metrics.uptime_seconds ?? null, metrics.process_count ?? null,
-                        metrics.disk_total_gb ?? null, metrics.disk_free_gb ?? null
-                    ]
-                );
-            } catch (err) {
-                // FALLBACK: Basic metrics only
-                await fastify.db.query(
-                    `INSERT INTO agent_metrics (agent_id, recorded_at, cpu_percent, ram_mb, disk_percent) VALUES ($1, $2, $3, $4, $5)`,
-                    [agentId, recordedAt, metrics.cpu_percent, metrics.ram_mb, metrics.disk_percent]
-                );
+                const { redisConnection } = require('../../core/queue/setup');
+                if (redisConnection && redisConnection.status === 'ready') {
+                    redisConnection.publish('agent-updates', JSON.stringify({
+                        type: 'AGENT_UPDATE',
+                        agent_id: agentId,
+                        status: 'up',
+                        hostname: hostname || agent.hostname,
+                        metrics: metrics
+                    }));
+                }
+            } catch (redisErr) {
+                fastify.log.warn({ error: redisErr.message }, 'Redis broadcast skipped due to connection error');
             }
 
-            // 3. Update Status (Resilient to missing SaaS columns)
-            const { public_ip, private_ip, hostname, os_type } = request.body || {};
+            // 2. Save Metrics (Non-blocking DB insert)
+            const computed_ram_percent = metrics.ram_percent !== undefined ? metrics.ram_percent : (metrics.ram_total_mb ? (metrics.ram_mb / metrics.ram_total_mb) * 100 : 0);
             
+            // We don't await this to speed up the heartbeat response
+            fastify.db.query(`
+                INSERT INTO agent_metrics (
+                    agent_id, recorded_at, cpu_percent, ram_mb, ram_percent, disk_percent, 
+                    net_rx_mb, net_tx_mb, process_count,
+                    ram_total_mb, disk_total_gb, disk_free_gb, uptime_seconds
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+                [
+                    agentId, recordedAt, 
+                    metrics.cpu_percent, metrics.ram_mb, computed_ram_percent, metrics.disk_percent,
+                    metrics.net_rx_mb || 0, metrics.net_tx_mb || 0, metrics.process_count || 0,
+                    metrics.ram_total_mb || null, metrics.disk_total_gb || null, metrics.disk_free_gb || null, metrics.uptime_seconds || 0
+                ]
+            ).catch(err => fastify.log.warn({ agentId, error: err.message }, 'Metrics insertion failed'));
+
+            // 4. Alert Trigger (Up/Down Logic)
             try {
-                const publicIpChanged  = public_ip && public_ip !== (existing.public_ip || '');
-                const privateIpChanged = private_ip && private_ip !== (existing.private_ip || '');
-                const metaChanged      = hostname || os_type || agent_version;
-
-                if (metaChanged || publicIpChanged || privateIpChanged) {
-                    await fastify.db.query(`
-                        UPDATE agents SET 
-                            last_seen = NOW(),
-                            status = 'active',
-                            agent_type = $6,
-                            agent_version = COALESCE($7, agent_version),
-                            public_ip = COALESCE($2, public_ip),
-                            private_ip = COALESCE($3, private_ip),
-                            prev_public_ip = CASE WHEN $2 IS NOT NULL AND $2 != COALESCE(public_ip, '') THEN public_ip ELSE prev_public_ip END,
-                            prev_private_ip = CASE WHEN $3 IS NOT NULL AND $3 != COALESCE(private_ip, '') THEN private_ip ELSE prev_private_ip END,
-                            ip_changed_at = CASE WHEN ($2 IS NOT NULL AND $2 != COALESCE(public_ip, '')) OR ($3 IS NOT NULL AND $3 != COALESCE(private_ip, '')) THEN NOW() ELSE ip_changed_at END,
-                            hostname = COALESCE($4, hostname),
-                            os_type = COALESCE($5, os_type)
-                        WHERE id = $1`, 
-                        [agentId, public_ip || null, private_ip || null, hostname || null, os_type || null, agent_type, agent_version || null]
-                    );
-                } else {
-                    await fastify.db.query("UPDATE agents SET last_seen = NOW(), status = 'active' WHERE id = $1", [agentId]);
-                }
-            } catch (err) {
-                // FINAL FALLBACK: Essential Heartbeat
-                await fastify.db.query("UPDATE agents SET last_seen = NOW(), status = 'active', agent_type = $2 WHERE id = $1", [agentId, agent_type]);
-            }
-
-            // 4. Check for Updates (Rollout-Aware)
-            let update_available = null;
-            if (agent_type === 'go' && agent_version) {
-                try {
-                    const latestRes = await fastify.db.query('SELECT * FROM agent_releases WHERE is_stable = true ORDER BY created_at DESC LIMIT 1');
-                    if (latestRes.rows.length > 0) {
-                        const latest = latestRes.rows[0];
-                        if (latest.version !== agent_version) {
-                            // Determine if this specific agent is in the rollout group
-                            let inRolloutGroup = true;
-                            if (latest.rollout_percentage < 100) {
-                                const hash = crypto.createHash('md5').update(agent_token).digest('hex');
-                                const bucket = parseInt(hash.substring(0, 2), 16) % 100;
-                                inRolloutGroup = (bucket < latest.rollout_percentage);
-                            }
-
-                            if (inRolloutGroup) {
-                                update_available = latest.version;
-                                fastify.log.info({ agentId, agent_version, latest: latest.version }, 'Update signal sent to agent');
-                            }
-                        }
+                if (prevStatus === 'down' || prevStatus === 'pending') {
+                    const teamRes = await fastify.db.query('SELECT team_id FROM team_members WHERE user_id = $1 LIMIT 1', [userId]);
+                    const teamId = teamRes.rows[0]?.team_id;
+                    
+                    if (teamId) {
+                        await auditService.log(userId, teamId, 'server_recovered', { name: agent.name, id: agentId }).catch(e => fastify.log.warn(`Audit log failed: ${e.message}`));
                     }
-                } catch (e) { 
-                    fastify.log.error(e, 'Error checking for agent update');
+
+                    const { alertQueue } = require('../../core/queue/setup');
+                    alertQueue.add(
+                        `alert-agent-up-${agentId}-${Date.now()}`,
+                        { 
+                            monitorId: agentId,
+                            isAgent: true,
+                            target: agent.name || hostname || 'Server Agent', 
+                            previousStatus: prevStatus, 
+                            newStatus: 'up', 
+                            errorMessage: null, 
+                            timestamp: new Date().toISOString() 
+                        },
+                        { removeOnComplete: { count: 100 } }
+                    ).catch(err => fastify.log.error('[AgentIngest] Failed to queue recovery alert', err));
                 }
+            } catch (alertErr) {
+                fastify.log.warn({ error: alertErr.message }, 'Alert trigger skipped due to error (possibly missing tables)');
             }
 
-            return reply.send({ success: true, update_available });
+            return reply.send({ success: true });
         } catch (err) {
-            fastify.log.error(err, 'Agent ingest fatal error');
-            return reply.status(500).send({ error: 'Internal server error' });
+            fastify.log.error({ err, stack: err.stack, body: request.body }, 'Agent ingest fatal error');
+            return reply.status(500).send({ error: 'Internal server error', details: err.message });
         }
     });
-
-    // ────────────────────────────────────────────────────────────────────
     // PUBLIC — Agent script download
     // ────────────────────────────────────────────────────────────────────
     fastify.get('/script', async (request, reply) => {
-        // Primary: agent.js bundled inside the backend src directory (works on Render)
         const primaryPath  = path.resolve(__dirname, '../../agent.js');
-        // Fallback: monorepo sibling path (works locally)
         const fallbackPath = path.resolve(__dirname, '../../../../monitorhub-agent/agent.js');
         const scriptPath   = fs.existsSync(primaryPath) ? primaryPath : fallbackPath;
         try {
@@ -191,39 +405,7 @@ async function agentRoutes(fastify, options) {
     // ────────────────────────────────────────────────────────────────────
     // PUBLIC — Windows Native Service Installer Script
     // ────────────────────────────────────────────────────────────────────
-    fastify.get('/windows-service.js', async (request, reply) => {
-        const script = `
-const { Service } = require('node-windows');
-const path = require('path');
-
-const svc = new Service({
-  name: 'MonitorHubAgent',
-  description: 'Monitor Hub hardware telemetry agent',
-  script: path.join(__dirname, 'agent.js')
-});
-
-svc.on('install', () => {
-  console.log('[Service] Installed successfully into Windows SCM.');
-  svc.start();
-});
-
-svc.on('alreadyinstalled', () => {
-  console.log('[Service] Service already exists. Restarting...');
-  svc.restart();
-});
-
-svc.on('start', () => {
-  console.log('[Service] Monitor Hub Agent is now running in the background!');
-});
-
-svc.install();`;
-        return reply.type('application/javascript').send(script);
-    });
-
-    // ────────────────────────────────────────────────────────────────────
-    // PUBLIC — Installer script generators (token needed to download)
-    // ────────────────────────────────────────────────────────────────────
-    fastify.get('/install_windows.bat', async (request, reply) => {
+    async function sendWindowsInstallerBat(request, reply) {
         const { token, host } = request.query;
         if (!token) return reply.status(400).send('Agent token is required');
 
@@ -231,71 +413,195 @@ svc.install();`;
         const script = `@echo off
 setlocal enabledelayedexpansion
 
-:: ── Elevation Check ──────────────────────────────────────────────────────────
+:: ========================================================
+:: MonitorHub Enterprise Agent Installer (Bulletproof v2)
+:: ========================================================
+
+:: ── Elevation Check
+echo [INFO] Checking for Administrative privileges...
 net session >nul 2>&1
-if %errorLevel% neq 0 (
-    echo [ERROR] Please run this script as Administrator.
-    pause
-    exit /b
-)
+if errorlevel 1 goto NO_ADMIN
 
 echo ========================================================
-echo  MonitorHub Enterprise Agent Setup (Windows Native)
+echo  MonitorHub Enterprise Agent Setup (Windows)
 echo ========================================================
 
-:: ── Directory Setup ────────────────────────────────────────────────────────
-set "INSTALL_DIR=C:\\Program Files\\MonitorHub"
-mkdir "%INSTALL_DIR%" 2>nul
+:: ── Directory Setup
+set "INSTALL_DIR=%SystemDrive%\\Program Files\\MonitorHub"
+if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
+mkdir "C:\\MonitorHub" 2>nul
 cd /d "%INSTALL_DIR%"
 
-:: ── Download Native PowerShell Agent ────────────────────────────────────────
-echo [INFO] Downloading Native Pro Agent...
-curl.exe --ssl-no-revoke -f -s -L -o "monitorhub-agent.ps1" "${hostUrl}/api/v1/agents/scripts/windows"
-
-if %errorLevel% equ 0 (
-    echo [SUCCESS] Native Agent downloaded.
-    
-    :: Create config
-    echo [INFO] Configuring Environment...
-    setx AGENT_TOKEN "${token}" /M >nul
-    setx INGEST_URL "${hostUrl}/api/v1/agents/ingest" /M >nul
-
-    :: Register as a Scheduled Task (Native Windows way to run in background)
-    echo [INFO] Registering System Background Task...
-    schtasks /create /tn "MonitorHubAgent" /tr "powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File \\"%INSTALL_DIR%\\monitorhub-agent.ps1\\"" /sc onstart /ru SYSTEM /f
-    schtasks /run /tn "MonitorHubAgent"
-    
-    echo ========================================================
-    echo  [SUCCESS] Native Enterprise Agent installed!
-    echo  Telemetry is now flowing in the background.
-    echo ========================================================
-    pause
-    exit /b
-)
-
-:: ── Final Fallback to Node.js (Robust Legacy Path) ──────────────────────────
-echo [WARNING] Native Script Agent failed. Attempting Node.js Recovery...
-node -v >nul 2>&1
-if %errorLevel% equ 0 (
-    mkdir "%USERPROFILE%\\monitorhub-agent" 2>nul
-    cd /d "%USERPROFILE%\\monitorhub-agent"
-    echo AGENT_TOKEN=${token}> .env
-    echo INGEST_URL=${hostUrl}/api/v1/agents/ingest>> .env
-    call npm init -y >nul
-    call npm install axios dotenv systeminformation node-windows --quiet
-    curl.exe -s -L -o agent.js "${hostUrl}/api/v1/agents/script"
-    curl.exe -s -L -o service.js "${hostUrl}/api/v1/agents/windows-service.js"
-    node service.js
-    echo [SUCCESS] Legacy Node Agent installed successfully.
+:: ── Download Engine
+echo [INFO] Detecting System Architecture...
+set "ARCH=amd64"
+if "%PROCESSOR_ARCHITECTURE%"=="x86" (
+    if "%PROCESSOR_ARCHITEW6432%"=="" (
+        set "ARCH=386"
+        echo [INFO] Detected 32-bit system.
+    ) else (
+        echo [INFO] Detected 64-bit system ^(running 32-bit shell^).
+    )
 ) else (
-    echo [ERROR] No compatible runtime found.
+    echo [INFO] Detected 64-bit system ^(%PROCESSOR_ARCHITECTURE%^).
 )
-pause`;
+
+echo [INFO] Downloading Agent Engine (Go-Native/%ARCH%)...
+set "AGENT_URL=${hostUrl}/api/v1/agents/bin/windows/%ARCH%"
+curl.exe --ssl-no-revoke -f -s -L -o "monitorhub-agent.exe" "%AGENT_URL%"
+
+if exist "monitorhub-agent.exe" goto DOWNLOAD_OK
+powershell -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; (New-Object System.Net.WebClient).DownloadFile('%AGENT_URL%', 'monitorhub-agent.exe')"
+
+:DOWNLOAD_OK
+if not exist "monitorhub-agent.exe" goto DOWNLOAD_FAILED
+:: Check if file size is too small (e.g. < 100kb), which indicates an error message instead of a binary
+for %%I in ("monitorhub-agent.exe") do set size=%%~zI
+if %size% LSS 102400 (
+    echo [ERROR] Downloaded file is too small ^(%size% bytes^). It is likely an error message from the server.
+    echo [DEBUG] File content:
+    type "monitorhub-agent.exe"
+    goto DOWNLOAD_FAILED
+)
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$bytes = [System.IO.File]::ReadAllBytes('monitorhub-agent.exe'); if ($bytes.Length -lt 2 -or $bytes[0] -ne 77 -or $bytes[1] -ne 90) { exit 1 }"
+if errorlevel 1 goto INVALID_BINARY
+echo [SUCCESS] Agent Engine downloaded (%size% bytes).
+
+:: ── Configuration
+echo [INFO] Configuring Agent Environment...
+(
+echo {
+echo   "agentToken": "${token}",
+echo   "ingestUrl": "${hostUrl}/api/v1/agents/ingest"
+echo }
+) > "config.json"
+setx AGENT_TOKEN "${token}" /M >nul 2>&1
+set "AGENT_TOKEN=${token}"
+
+:: ── Service Registration
+echo [INFO] Registering Windows Service...
+
+:: Short path resolution for reliability
+for %%I in ("%INSTALL_DIR%") do set "SHORT_DIR=%%~sI"
+set "AGENT_PATH=%SHORT_DIR%\\monitorhub-agent.exe"
+
+echo [INFO] Cleaning up existing service...
+sc stop MonitorHubAgent >nul 2>&1
+sc delete MonitorHubAgent >nul 2>&1
+
+echo [DEBUG] Resolved Path: %AGENT_PATH%
+
+:: Phase 1: Create
+echo [INFO] Creating service...
+:: Note the MANDATORY space after binPath= and before the path
+sc create MonitorHubAgent binPath= "\"%AGENT_PATH%\"" start= auto DisplayName= "MonitorHub Enterprise Agent"
+if errorlevel 1 goto PHASE_1_FAILED
+
+:: Phase 2: Configure
+echo [INFO] Applying service parameters...
+sc description MonitorHubAgent "MonitorHub Enterprise Telemetry Agent"
+sc failure MonitorHubAgent reset= 86400 actions= restart/5000/restart/10000/restart/30000
+
+:: Phase 3: Start
+echo [INFO] Starting MonitorHub Agent...
+set /a retry=0
+
+:RETRY_START
+set /a retry+=1
+echo [INFO] Starting MonitorHub Agent (Attempt %retry%/3)...
+sc start MonitorHubAgent >nul 2>&1
+
+:: Wait for service to stabilize
+timeout /t 15 /nobreak >nul
+
+sc query MonitorHubAgent | find "RUNNING" >nul
+if not errorlevel 1 goto START_SUCCESS
+
+:: If not running, check if it's pending
+sc query MonitorHubAgent | find "START_PENDING" >nul
+if not errorlevel 1 (
+    echo [INFO] Service is starting up. Waiting 20 more seconds...
+    timeout /t 20 /nobreak >nul
+    sc query MonitorHubAgent | find "RUNNING" >nul
+    if not errorlevel 1 goto START_SUCCESS
+)
+
+if %retry% LSS 3 (
+    echo [WARNING] Service failed to reach RUNNING state. Retrying...
+    goto RETRY_START
+)
+
+:: If we get here, it failed 3 times. Try to diagnose.
+echo [ERROR] MonitorHub Agent failed to start after 3 attempts.
+sc query MonitorHubAgent
+echo [DEBUG] Checking for error codes...
+sc query MonitorHubAgent | find "WIN32_EXIT_CODE"
+echo [DEBUG] Checking for recent logs...
+if exist "C:\MonitorHub\agent.log" (
+    echo [DEBUG] Last 10 lines of C:\MonitorHub\agent.log:
+    powershell -Command "Get-Content 'C:\MonitorHub\agent.log' -Tail 10"
+)
+goto PHASE_4_FAILED
+
+:START_SUCCESS
+echo [SUCCESS] MonitorHub Agent is NOW RUNNING.
+echo [INFO] Verification: Service detected in RUNNING state.
+echo ========================================================
+pause
+exit /b 0
+
+:: ── Error Handlers
+:NO_ADMIN
+echo [ERROR] This installer requires Administrator privileges.
+pause
+exit /b 1
+
+:DOWNLOAD_FAILED
+echo [ERROR] Failed to download agent binary.
+pause
+exit /b 1
+
+:INVALID_BINARY
+echo [ERROR] Downloaded agent is not a valid Windows executable.
+echo [TIP] The download endpoint may be returning an MSI, HTML error page, or proxy response.
+pause
+exit /b 1
+
+:PHASE_1_FAILED
+echo [ERROR] PHASE_1_FAILURE: Service creation failed.
+sc query MonitorHubAgent
+pause
+exit /b 1
+
+:PHASE_4_FAILED
+echo [ERROR] PHASE_4_FAILURE: Service failed to start after 3 attempts.
+echo.
+echo --- SERVICE STATUS ---
+sc query MonitorHubAgent
+echo.
+echo --- RECENT AGENT LOGS (C:\\MonitorHub\\agent.log) ---
+if exist "C:\\MonitorHub\\agent.log" (
+    powershell -Command "Get-Content 'C:\\MonitorHub\\agent.log' -Tail 10"
+) else (
+    echo [INFO] agent.log not found. The process may not have started at all.
+    echo [TIP] Check Windows Event Viewer ^(System^) for Service Control Manager errors.
+)
+echo -------------------------------------
+echo.
+pause
+exit /b 1`;
+
         return reply
             .type('application/octet-stream')
             .header('Content-Disposition', 'attachment; filename="setup_monitorhub_windows.bat"')
+            .header('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate')
+            .header('Pragma', 'no-cache')
+            .header('Expires', '0')
             .send(script);
-    });
+    }
+
+    fastify.get('/install_v2.bat', sendWindowsInstallerBat);
+    fastify.get('/install_windows.bat', sendWindowsInstallerBat);
 
     // ────────────────────────────────────────────────────────────────────
     // PUBLIC — Agent Distribution (Go Agent)
@@ -397,7 +703,15 @@ pause`;
                 ORDER BY r.created_at DESC LIMIT 1
             `, [os, arch]);
 
+            const packagedBinary = getPackagedAgentBinary(os, arch);
+
             if (res.rows.length === 0) {
+                if (packagedBinary) {
+                    fastify.log.warn({ os, arch }, 'Binary metadata missing; serving packaged agent binary');
+                    reply.header('Cache-Control', 'public, max-age=86400');
+                    reply.header('Content-Disposition', `attachment; filename="monitorhub-agent-${os}-${arch}${os === 'windows' ? '.exe' : ''}"`);
+                    return reply.type('application/octet-stream').send(fs.createReadStream(packagedBinary));
+                }
                 fastify.log.warn({ os, arch }, 'Binary download failed - Not found');
                 return reply.status(404).send({ error: 'Binary not found' });
             }
@@ -415,13 +729,37 @@ pause`;
             // Log download to audit (optional)
             fastify.log.info(`[AgentDistribution] Download: ${os}/${arch}`);
 
+            if (packagedBinary && looksLikeInstaller(binary.file_path)) {
+                fastify.log.warn({ os, arch, file_path: binary.file_path }, 'Windows binary metadata points to installer; serving packaged service executable instead');
+                return reply.type('application/octet-stream').send(fs.createReadStream(packagedBinary));
+            }
+
             if (binary.file_path.startsWith('http')) {
                 // Production: Redirect to S3/CDN
                 return reply.redirect(binary.file_path);
             } else {
-                // Development/Local: Stream from disk
-                const absPath = path.resolve(__dirname, '../../../', binary.file_path);
+                // Priority 1: Check in local bin folder (where we copied it for deployment)
+                let absPath = path.resolve(__dirname, 'bin', os, arch, os === 'windows' ? 'monitorhub-agent.exe' : 'monitorhub-agent');
+
+                if (!fs.existsSync(absPath) && packagedBinary) {
+                    absPath = packagedBinary;
+                }
+                
+                // Priority 2: Fallback to old path logic
                 if (!fs.existsSync(absPath)) {
+                    absPath = path.resolve(__dirname, '../../../', binary.file_path);
+                }
+
+                // Priority 3: Final fallback for dev environments
+                if (!fs.existsSync(absPath)) {
+                    const localGoBin = path.resolve(__dirname, '../../../../uptimebuddy-go-agent/bin', `monitorhub-agent-${os}-${arch}${os === 'windows' ? '.exe' : ''}`);
+                    if (fs.existsSync(localGoBin)) {
+                        absPath = localGoBin;
+                    }
+                }
+
+                if (!fs.existsSync(absPath)) {
+                    fastify.log.error({ os, arch, attemptedPath: absPath }, 'Binary file missing on server');
                     return reply.status(404).send({ error: 'Binary file missing on server' });
                 }
                 const stream = fs.createReadStream(absPath);
@@ -482,99 +820,131 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
     });
 
     // ────────────────────────────────────────────────────────────────────
-    // Serve the actual Native Script Files
-    // ────────────────────────────────────────────────────────────────────
-    fastify.get('/scripts/windows', async (request, reply) => {
-        const scriptPath = path.resolve(__dirname, '../../../uptimebuddy-agent.ps1');
-        const content = await fs.promises.readFile(scriptPath, 'utf-8');
-        return reply.type('text/plain').send(content);
-    });
-
-    fastify.get('/scripts/linux', async (request, reply) => {
-        const scriptPath = path.resolve(__dirname, '../../../uptimebuddy-agent.py');
-        const content = await fs.promises.readFile(scriptPath, 'utf-8');
-        return reply.type('text/plain').send(content);
-    });
-
-    // ────────────────────────────────────────────────────────────────────
-    // PROFESSIONAL MSI DISTRIBUTION
+    // PROFESSIONAL MSI DISTRIBUTION (Zero-Config Token Extraction)
     // ────────────────────────────────────────────────────────────────────
     fastify.get('/install_windows.msi', async (request, reply) => {
         const { token } = request.query;
-        const msiPath = path.resolve(__dirname, '../../../MonitorHubAgent.msi');
         
-        if (fs.existsSync(msiPath)) {
-            return reply.download('MonitorHubAgent.msi');
-        } else {
-            // Fallback to professional .bat if MSI is not built/uploaded yet
-            const hostUrl = process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
-            return reply.redirect(`${hostUrl}/api/v1/agents/install_windows.bat?token=${token}`);
-        }
-    });
-
-    // ────────────────────────────────────────────────────────────────────
-    // ONE-TIME ACTIVATION ROUTE (Visit once to setup database)
-    // ────────────────────────────────────────────────────────────────────
-    fastify.get('/internal/seed-distribution', async (request, reply) => {
         try {
-            const r2Base = 'https://pub-cd0ef10a12e241db85b83f22821052a0.r2.dev/bin/v1.0.0';
-            
-            // 1. Setup Release
-            await fastify.db.query(`
-                INSERT INTO agent_releases (version, is_stable, rollout_percentage)
-                VALUES ('1.0.0', true, 100)
-                ON CONFLICT (version) DO NOTHING;
+            // Priority 1: Check Local Disk (This is where the new MSI is)
+            const searchPaths = [
+                path.resolve(__dirname, '../../../MonitorHubAgent.msi'), // Root of backend-ready
+                path.resolve(__dirname, '../../../../uptimebuddy-go-agent/MonitorHubAgent.msi'), // Dev location
+                path.resolve(__dirname, './bin/windows/amd64/MonitorHubAgent.msi') // Packaged location
+            ];
+
+            let msiPath = null;
+            for (const p of searchPaths) {
+                if (fs.existsSync(p)) {
+                    msiPath = p;
+                    break;
+                }
+            }
+
+            if (msiPath) {
+                // Feature: Rename file to include token and host/port so MSI can auto-extract it
+                let downloadName = 'MonitorHubAgent.msi';
+                if (token) {
+                    const hostUrlStr = process.env.PUBLIC_API_URL || `http://${request.headers.host}`;
+                    try {
+                        const urlObj = new URL(hostUrlStr);
+                        const host = urlObj.hostname;
+                        const port = urlObj.port;
+                        const protocol = urlObj.protocol.replace(':', ''); // 'http' or 'https'
+                        
+                        downloadName = `MonitorHubAgent_${token}`;
+                        if (host && host !== 'api.monitorhubs.com') {
+                            downloadName += `_sh_${host}`;
+                            if (port) downloadName += `_sp_${port}`;
+                            if (protocol) downloadName += `_pr_${protocol}`;
+                        }
+                        downloadName += '.msi';
+                    } catch (e) {
+                        downloadName = `MonitorHubAgent_${token}.msi`;
+                    }
+                }
+
+                return reply
+                    .type('application/octet-stream')
+                    .header('Content-Disposition', `attachment; filename="${downloadName}"`)
+                    .send(fs.createReadStream(msiPath));
+            }
+
+            // Priority 2: Check Database for a remote MSI link
+            const res = await fastify.db.query(`
+                SELECT b.file_path 
+                FROM agent_binaries b
+                JOIN agent_releases r ON b.release_id = r.id
+                WHERE (b.platform = 'windows' OR b.os = 'windows') 
+                  AND (b.architecture = 'amd64' OR b.arch = 'amd64')
+                  AND b.file_path LIKE '%.msi%'
+                  AND r.is_stable = true
+                ORDER BY r.created_at DESC LIMIT 1
             `);
 
-            // 2. Setup Windows MSI
-            await fastify.db.query(`
-                INSERT INTO agent_binaries (release_id, platform, architecture, file_path, sha256)
-                VALUES (
-                    (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
-                    'windows', 'amd64',
-                    '${r2Base}/windows-amd64/MonitorHubAgent.msi',
-                    'N/A'
-                )
-                ON CONFLICT (release_id, platform, architecture) DO UPDATE SET file_path = EXCLUDED.file_path;
-            `);
+            if (res.rows.length > 0 && res.rows[0].file_path) {
+                return reply.redirect(res.rows[0].file_path);
+            }
 
-            // 3. Setup Linux Agent
-            await fastify.db.query(`
-                INSERT INTO agent_binaries (release_id, platform, architecture, file_path, sha256)
-                VALUES (
-                    (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
-                    'linux', 'amd64',
-                    '${r2Base}/linux-amd64/uptimebuddy-agent.py',
-                    'N/A'
-                )
-                ON CONFLICT (release_id, platform, architecture) DO UPDATE SET file_path = EXCLUDED.file_path;
-            `);
-
-            return { success: true, message: "Database updated with R2 links successfully!" };
+            // Priority 3: Final Fallback to Professional .bat
+            const hostUrl = process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
+            const fallbackToken = token || 'YOUR_TOKEN_HERE';
+            return reply.redirect(`${hostUrl}/api/v1/agents/install_v2.bat?token=${fallbackToken}`);
         } catch (err) {
-            return reply.status(500).send({ success: false, error: err.message });
+            fastify.log.error(err, 'MSI download error');
+            const hostUrl = process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
+            return reply.redirect(`${hostUrl}/api/v1/agents/install_v2.bat?token=${token}`);
         }
     });
 
+
     // ────────────────────────────────────────────────────────────────────
-    // PROTECTED — Dashboard / Management Routes (Auth required)
+    // PUBLIC — WebSocket Real-time Feed
+    // ────────────────────────────────────────────────────────────────────
+    fastify.get('/ws', { websocket: true }, (connection, req) => {
+        fastify.log.info('[WS] Client connected for real-time updates');
+        
+        connection.socket.on('message', message => {
+            // Echo or handle client heartbeats if needed
+            try {
+                const data = JSON.parse(message);
+                if (data.type === 'PING') connection.socket.send(JSON.stringify({ type: 'PONG' }));
+            } catch (e) {}
+        });
+
+        connection.socket.on('close', () => {
+            fastify.log.info('[WS] Client disconnected');
+        });
+    });
+
     // ────────────────────────────────────────────────────────────────────
     fastify.register(async (authScope) => {
-        const { requireAuth } = require('../auth/middleware');
         authScope.addHook('onRequest', requireAuth);
 
-        // List all servers for user
+        // List all servers for user (With Live Metrics)
         authScope.get('/', async (request, reply) => {
             const userId = request.user.id;
             try {
-                const res = await fastify.db.query(
-                    `SELECT id, name, server_group, agent_token, last_seen, status, 
-                            public_ip, private_ip, hostname, os_type, ip_changed_at
-                     FROM agents WHERE user_id = $1 ORDER BY id DESC`,
+                const res = await fastify.db.query(`
+                    SELECT a.*, 
+                           m.cpu_percent as cpu_usage, 
+                           m.ram_percent, 
+                           m.recorded_at as metric_last_seen,
+                           m.process_count,
+                           m.uptime_seconds
+                    FROM agents a
+                    LEFT JOIN LATERAL (
+                        SELECT cpu_percent, ram_percent, recorded_at, process_count, uptime_seconds
+                        FROM agent_metrics
+                        WHERE agent_id = a.id
+                        ORDER BY recorded_at DESC
+                        LIMIT 1
+                    ) m ON true
+                    WHERE a.user_id = $1
+                    ORDER BY a.created_at DESC`, 
                     [userId]
                 );
 
-                const now = Date.now();
                 const mapped = res.rows.map(agent => ({
                     ...agent,
                     status: getDynamicAgentStatus(agent)
@@ -603,9 +973,12 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
                 let queryText;
                 let queryParams = [id];
 
-                if (duration === '24H') {
+                if (duration === '24H' || duration === '12H') {
+                    const interval = duration === '24H' ? '24 hours' : '12 hours';
+                    const bucketSize = duration === '24H' ? '15 minutes' : '5 minutes';
+                    
                     queryText = `
-                        SELECT TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'HH24:MI') AS time,
+                        SELECT TO_CHAR(bucket, 'HH24:MI') AS time,
                                AVG(cpu_percent)::numeric(5,2)  AS cpu,
                                AVG(ram_mb)::int                AS memory,
                                MAX(ram_total_mb)::int          AS memory_total,
@@ -614,31 +987,21 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
                                AVG(net_tx_mb)::numeric(8,3)    AS net_tx,
                                MAX(uptime_seconds)::bigint     AS uptime_seconds,
                                AVG(process_count)::int         AS process_count
-                        FROM agent_metrics WHERE agent_id = $1
-                        AND recorded_at >= NOW() - INTERVAL '24 hours'
-                        GROUP BY TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'HH24:MI')
-                        ORDER BY 1 ASC`;
-                } else if (duration === '12H') {
-                    queryText = `
-                        SELECT TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'HH24:MI') AS time,
-                               AVG(cpu_percent)::numeric(5,2)  AS cpu,
-                               AVG(ram_mb)::int                AS memory,
-                               MAX(ram_total_mb)::int          AS memory_total,
-                               AVG(disk_percent)::numeric(5,2) AS disk,
-                               AVG(net_rx_mb)::numeric(8,3)    AS net_rx,
-                               AVG(net_tx_mb)::numeric(8,3)    AS net_tx,
-                               MAX(uptime_seconds)::bigint     AS uptime_seconds,
-                               AVG(process_count)::int         AS process_count
-                        FROM agent_metrics WHERE agent_id = $1
-                        AND recorded_at >= NOW() - INTERVAL '12 hours'
-                        GROUP BY TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'HH24:MI')
-                        ORDER BY 1 ASC`;
+                        FROM (
+                            SELECT 
+                                date_trunc('minute', recorded_at) - (CAST(EXTRACT(minute FROM recorded_at) AS integer) % ${parseInt(bucketSize)}) * interval '1 minute' as bucket,
+                                *
+                            FROM agent_metrics 
+                            WHERE agent_id = $1 AND recorded_at >= NOW() - INTERVAL '${interval}'
+                        ) AS bucketed
+                        GROUP BY bucket
+                        ORDER BY bucket ASC`;
                 } else {
-                    // Default: last 60 raw data points (~10 min at 10s intervals)
+                    // Default: last 60 raw data points (~30 min at 30s intervals)
                     queryText = `
                         SELECT TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'HH24:MI:SS') AS time,
                                cpu_percent AS cpu, ram_mb AS memory, ram_total_mb AS memory_total,
-                               disk_percent AS disk, net_rx_mb AS net_rx, net_tx_mb AS net_tx,
+                               ram_percent, disk_percent AS disk, net_rx_mb AS net_rx, net_tx_mb AS net_tx,
                                uptime_seconds, process_count
                         FROM agent_metrics WHERE agent_id = $1
                         ORDER BY recorded_at DESC LIMIT 60`;
@@ -715,6 +1078,13 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
                     [name || null, server_group !== undefined ? server_group : null, id, userId]
                 );
                 if (res.rows.length === 0) return reply.code(404).send({ error: 'Server not found' });
+                
+                // Professional Audit Log
+                const teamRes = await fastify.db.query('SELECT team_id FROM team_members WHERE user_id = $1 LIMIT 1', [userId]);
+                if (teamRes.rows.length > 0) {
+                    await auditService.log(userId, teamRes.rows[0].team_id, 'server_updated', { name: res.rows[0].name, group: server_group });
+                }
+
                 return reply.send(res.rows[0]);
             } catch (err) {
                 fastify.log.error(err, 'updateAgent error');
@@ -730,13 +1100,21 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
             try {
                 // Ownership check
                 const verify = await fastify.db.query(
-                    'SELECT id FROM agents WHERE id = $1 AND user_id = $2', [id, userId]
+                    'SELECT id, name FROM agents WHERE id = $1 AND user_id = $2', [id, userId]
                 );
                 if (verify.rows.length === 0) return reply.code(404).send({ error: 'Server not found' });
+
+                const serverName = verify.rows[0].name;
 
                 // agent_metrics has ON DELETE CASCADE — but we also delete explicitly to be safe
                 await fastify.db.query('DELETE FROM agent_metrics WHERE agent_id = $1', [id]);
                 await fastify.db.query('DELETE FROM agents WHERE id = $1', [id]);
+
+                // Professional Audit Log
+                const teamRes = await fastify.db.query('SELECT team_id FROM team_members WHERE user_id = $1 LIMIT 1', [userId]);
+                if (teamRes.rows.length > 0) {
+                    await auditService.log(userId, teamRes.rows[0].team_id, 'server_deleted', { name: serverName, id });
+                }
 
                 return reply.send({ success: true });
             } catch (err) {
@@ -745,6 +1123,7 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
             }
         });
     });
+
 }
 
 module.exports = agentRoutes;
