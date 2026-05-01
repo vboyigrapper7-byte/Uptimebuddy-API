@@ -7,11 +7,9 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-// Fixed INR Pricing (based on round-off as requested)
 const INR_PRICES = {
     free: 0,
-    test: 10,
-    starter: 799,
+    starter: 10,
     pro: 1999,
     business: 6999
 };
