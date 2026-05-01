@@ -64,14 +64,14 @@ async function enforceRetention() {
         await client.query('BEGIN');
 
         // 1. DETERMINE AGGRESSIVENESS (150MB Safety Threshold)
-        // If DB is approaching 200MB limit, we become more aggressive (1 day retention instead of 3)
-        let retentionInterval = '3 days';
+        // If DB is approaching 200MB limit, we become more aggressive (1 day retention instead of 365)
+        let retentionInterval = '365 days';
         if (initialSize > 150 * 1024 * 1024) {
             console.warn(`[RetentionWorker] ⚠️ CRITICAL: DB size (${initialSizeMB}MB) > 150MB. Running aggressive 1-day cleanup.`);
             retentionInterval = '1 day';
         }
 
-        // 2. HARD PURGE: Batched deletion of old agent metrics
+        // 2. HARD PURGE: Batched deletion of old agent metrics globally
         const deletedMetrics = await batchedDelete(
             client, 
             'agent_metrics', 
@@ -94,14 +94,14 @@ async function enforceRetention() {
         // 4. SOFT PURGE: Mark new metrics based on Tier Allowance
         let softPurgeCount = 0;
         for (const [tierKey, config] of Object.entries(PLAN_TIERS)) {
-            const days = Math.min(config.retentionDays || 14, 14);
+            const days = config.retentionDays || 1; // Default to 1 if not set
             
             const monitorRes = await client.query(
                 `UPDATE monitor_metrics mm
                  SET deletion_scheduled_at = NOW()
                  FROM monitors m JOIN users u ON m.user_id = u.id
                  WHERE mm.monitor_id = m.id AND u.tier = $1
-                 AND mm.recorded_at < NOW() - INTERVAL '14 days'
+                 AND mm.recorded_at < NOW() - INTERVAL '${days} days'
                  AND mm.deletion_scheduled_at IS NULL`,
                 [tierKey]
             );

@@ -23,7 +23,7 @@ const PLAN_TIERS = {
     starter: {
         id: 'starter',
         name: 'Starter',
-        priceINR: 10, // Temporarily 10 for testing
+        priceINR: 799, // Round off
         limits: {
             uptime: 25,
             api: 10,

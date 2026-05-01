@@ -9,7 +9,7 @@ const razorpay = new Razorpay({
 
 const INR_PRICES = {
     free: 0,
-    starter: 10,
+    starter: 799,
     pro: 1999,
     business: 6999
 };
@@ -46,7 +46,8 @@ const createOrder = async (request, reply) => {
         return reply.send({
             id: order.id,
             currency: order.currency,
-            amount: order.amount
+            amount: order.amount,
+            key_id: process.env.RAZORPAY_KEY_ID
         });
     } catch (error) {
         request.log.error('Razorpay Create Order Error:', error);
