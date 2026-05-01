@@ -357,15 +357,25 @@ async function agentRoutes(fastify, options) {
                 if (prevStatus === 'down' || prevStatus === 'pending') {
                     const teamRes = await fastify.db.query('SELECT team_id FROM team_members WHERE user_id = $1 LIMIT 1', [userId]);
                     const teamId = teamRes.rows[0]?.team_id;
-
-                    await fastify.db.query(
-                        'INSERT INTO alert_history (user_id, monitor_id, type, message, severity) VALUES ($1, $2, $3, $4, $5)',
-                        [userId, null, 'server_status', `[${agent.name}] System Online: Server is now UP and reporting telemetry.`, 'critical']
-                    ).catch(e => fastify.log.warn(`Alert history insert failed: ${e.message}`));
                     
                     if (teamId) {
                         await auditService.log(userId, teamId, 'server_recovered', { name: agent.name, id: agentId }).catch(e => fastify.log.warn(`Audit log failed: ${e.message}`));
                     }
+
+                    const { alertQueue } = require('../../core/queue/setup');
+                    alertQueue.add(
+                        `alert-agent-up-${agentId}-${Date.now()}`,
+                        { 
+                            monitorId: agentId,
+                            isAgent: true,
+                            target: agent.name || hostname || 'Server Agent', 
+                            previousStatus: prevStatus, 
+                            newStatus: 'up', 
+                            errorMessage: null, 
+                            timestamp: new Date().toISOString() 
+                        },
+                        { removeOnComplete: { count: 100 } }
+                    ).catch(err => fastify.log.error('[AgentIngest] Failed to queue recovery alert', err));
                 }
             } catch (alertErr) {
                 fastify.log.warn({ error: alertErr.message }, 'Alert trigger skipped due to error (possibly missing tables)');

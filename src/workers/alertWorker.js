@@ -12,24 +12,37 @@ const alertWorker = new Worker('alert-webhooks', async (job) => {
 
     console.log(`[AlertWorker] Processing alert for monitor ${monitorId} | ${previousStatus} → ${newStatus}`);
 
-    // Fetch monitor details including escalation state and priority
-    let monitor;
+    // Fetch details depending on whether it's a monitor or an agent
+    let entity;
     try {
-        const dbRes = await pool.query(
-            'SELECT user_id, priority, escalation_state, status FROM monitors WHERE id = $1',
-            [monitorId]
-        );
-        if (dbRes.rows.length === 0) {
-            logger.info(`[AlertWorker] Monitor ${monitorId} not found — skipping`);
-            return;
+        if (job.data.isAgent) {
+            const dbRes = await pool.query(
+                'SELECT user_id, status FROM agents WHERE id = $1',
+                [monitorId]
+            );
+            if (dbRes.rows.length === 0) {
+                logger.info(`[AlertWorker] Agent ${monitorId} not found — skipping`);
+                return;
+            }
+            entity = dbRes.rows[0];
+            entity.priority = 'high'; // Default high priority for servers
+        } else {
+            const dbRes = await pool.query(
+                'SELECT user_id, priority, escalation_state, status FROM monitors WHERE id = $1',
+                [monitorId]
+            );
+            if (dbRes.rows.length === 0) {
+                logger.info(`[AlertWorker] Monitor ${monitorId} not found — skipping`);
+                return;
+            }
+            entity = dbRes.rows[0];
         }
-        monitor = dbRes.rows[0];
     } catch (err) {
         logger.error(`[AlertWorker] DB Error: ${err.message}`);
         throw err;
     }
 
-    const { user_id: userId, priority, escalation_state } = monitor;
+    const { user_id: userId, priority, escalation_state } = entity;
 
     // ── 0. Fetch User Settings & Account Email ─────────────────────────────
     let settings, userEmail;
@@ -61,32 +74,34 @@ const alertWorker = new Worker('alert-webhooks', async (job) => {
     }
 
     // ── 2. Escalation State Machine ────────────────────────────────────────
-    let currentState = escalation_state || { step: 0, last_trigger: null };
-    const now = new Date();
+    if (!job.data.isAgent) {
+        let currentState = escalation_state || { step: 0, last_trigger: null };
+        const now = new Date();
 
-    if (newStatus === 'up') {
-        // Reset escalation on recovery
-        await pool.query(
-            'UPDATE monitors SET escalation_state = $1 WHERE id = $2',
-            [JSON.stringify({ step: 0, last_trigger: null }), monitorId]
-        );
-    } else {
-        // If down, check if we should trigger next step
-        // Step 0: Immediate (Handled below)
-        // Step 1: After 5 mins (Simplified logic here)
-        const lastTrigger = currentState.last_trigger ? new Date(currentState.last_trigger) : null;
-        const minsSinceLast = lastTrigger ? (now - lastTrigger) / 60000 : 999;
+        if (newStatus === 'up') {
+            // Reset escalation on recovery
+            await pool.query(
+                'UPDATE monitors SET escalation_state = $1 WHERE id = $2',
+                [JSON.stringify({ step: 0, last_trigger: null }), monitorId]
+            );
+        } else {
+            // If down, check if we should trigger next step
+            // Step 0: Immediate (Handled below)
+            // Step 1: After 5 mins (Simplified logic here)
+            const lastTrigger = currentState.last_trigger ? new Date(currentState.last_trigger) : null;
+            const minsSinceLast = lastTrigger ? (now - lastTrigger) / 60000 : 999;
 
-        if (currentState.step > 0 && minsSinceLast < ESCALATION_STEP_INTERVAL_MINS) {
-            logger.worker('AlertWorker', monitorId, `Suppressing duplicate escalation (Step ${currentState.step}, ${Math.round(minsSinceLast)}m ago)`);
-            return; // Skip if too soon
+            if (currentState.step > 0 && minsSinceLast < ESCALATION_STEP_INTERVAL_MINS) {
+                logger.worker('AlertWorker', monitorId, `Suppressing duplicate escalation (Step ${currentState.step}, ${Math.round(minsSinceLast)}m ago)`);
+                return; // Skip if too soon
+            }
+
+            // Update state for next step
+            await pool.query(
+                'UPDATE monitors SET escalation_state = $1 WHERE id = $2',
+                [JSON.stringify({ step: currentState.step + 1, last_trigger: now.toISOString() }), monitorId]
+            );
         }
-
-        // Update state for next step
-        await pool.query(
-            'UPDATE monitors SET escalation_state = $1 WHERE id = $2',
-            [JSON.stringify({ step: currentState.step + 1, last_trigger: now.toISOString() }), monitorId]
-        );
     }
 
     // ── 1. Dispatch Account Email Alert (If Enabled) ───────────────────────
@@ -98,14 +113,14 @@ const alertWorker = new Worker('alert-webhooks', async (job) => {
             await pool.query(
                 `INSERT INTO alert_logs (user_id, monitor_id, alert_type, status, provider)
                  VALUES ($1, $2, $3, $4, $5)`,
-                [userId, monitorId, newStatus, 'success', 'account-email']
+                [userId, job.data.isAgent ? null : monitorId, newStatus, 'success', 'account-email']
             );
         } catch (err) {
             logger.error(`[AlertWorker] Account email failed: ${err.message}`);
             await pool.query(
                 `INSERT INTO alert_logs (user_id, monitor_id, alert_type, status, error_message, provider)
                  VALUES ($1, $2, $3, $4, $5, $6)`,
-                [userId, monitorId, newStatus, 'failed', err.message, 'account-email']
+                [userId, job.data.isAgent ? null : monitorId, newStatus, 'failed', err.message, 'account-email']
             );
         }
     }
@@ -186,7 +201,7 @@ const alertWorker = new Worker('alert-webhooks', async (job) => {
                 await pool.query(
                     `INSERT INTO alert_logs (user_id, monitor_id, alert_type, status, error_message, provider)
                      VALUES ($1, $2, $3, $4, $5, $6)`,
-                    [userId, monitorId, newStatus, success ? 'success' : 'failed', success ? null : lastError, wh.provider]
+                    [userId, job.data.isAgent ? null : monitorId, newStatus, success ? 'success' : 'failed', success ? null : lastError, wh.provider]
                 );
             }
         } catch (err) {

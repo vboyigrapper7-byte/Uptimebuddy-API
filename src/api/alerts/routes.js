@@ -1,5 +1,5 @@
 const { requireAuth } = require('../auth/middleware');
-const { getAlertSettings, updateAlertSettings, getAlertLogs, testEmailAlert, testWebhookAlert } = require('./controller');
+const { getAlertSettings, updateAlertSettings, getAlertLogs, testEmailAlert, testWebhookAlert, getAlertResources, toggleResourceAlert } = require('./controller');
 
 async function alertRoutes(fastify, options) {
     fastify.addHook('onRequest', requireAuth);
@@ -10,6 +10,9 @@ async function alertRoutes(fastify, options) {
     fastify.get('/history', getAlertLogs);
     fastify.post('/test-email', testEmailAlert);
     fastify.post('/test-webhook', testWebhookAlert);
+    
+    fastify.get('/resources', getAlertResources);
+    fastify.post('/resources/toggle', toggleResourceAlert);
 }
 
 module.exports = alertRoutes;

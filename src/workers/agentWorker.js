@@ -35,6 +35,21 @@ async function checkAgentHealth(fastify) {
                     status: 'down',
                     hostname: agent.hostname
                 }));
+
+                const { alertQueue } = require('../core/queue/setup');
+                alertQueue.add(
+                    `alert-agent-${agent.id}-${Date.now()}`,
+                    { 
+                        monitorId: agent.id,
+                        isAgent: true,
+                        target: agent.name || agent.hostname || 'Server Agent', 
+                        previousStatus: 'up', 
+                        newStatus: 'down', 
+                        errorMessage: 'Server agent stopped reporting heartbeats.', 
+                        timestamp: new Date().toISOString() 
+                    },
+                    { removeOnComplete: { count: 100 } }
+                ).catch(err => console.error('[AgentWorker] Failed to queue alert', err));
             });
         }
     } catch (err) {
