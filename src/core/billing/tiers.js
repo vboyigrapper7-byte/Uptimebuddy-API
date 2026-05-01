@@ -20,6 +20,22 @@ const PLAN_TIERS = {
             prioritySupport: false
         }
     },
+    test: {
+        id: 'test',
+        name: 'Test Plan (₹10)',
+        priceINR: 10,
+        limits: {
+            uptime: 10,
+            api: 5,
+            server: 2
+        },
+        minInterval: 300,
+        retentionDays: 3,
+        features: {
+            advancedApi: false,
+            prioritySupport: false
+        }
+    },
     starter: {
         id: 'starter',
         name: 'Starter',
