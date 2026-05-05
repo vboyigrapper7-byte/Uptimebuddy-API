@@ -296,6 +296,12 @@ async function agentRoutes(fastify, options) {
             const agentId = agent.id;
             const userId  = agent.user_id;
             const prevStatus = agent.status;
+            
+            // Update cache so subsequent heartbeats know it's already 'up'
+            if (prevStatus !== 'up') {
+                agent.status = 'up';
+            }
+
             const hostnameRaw = request.body?.hostname || metrics?.hostname;
             const hostname = (hostnameRaw && hostnameRaw.trim()) ? hostnameRaw : null;
             const os_type  = request.body?.os_type || metrics?.os || null;

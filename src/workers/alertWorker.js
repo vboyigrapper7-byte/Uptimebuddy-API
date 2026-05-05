@@ -17,7 +17,7 @@ const alertWorker = new Worker('alert-webhooks', async (job) => {
     try {
         if (job.data.isAgent) {
             const dbRes = await pool.query(
-                'SELECT user_id, status FROM agents WHERE id = $1',
+                'SELECT user_id, status, alerts_enabled FROM agents WHERE id = $1',
                 [monitorId]
             );
             if (dbRes.rows.length === 0) {
@@ -28,7 +28,7 @@ const alertWorker = new Worker('alert-webhooks', async (job) => {
             entity.priority = 'high'; // Default high priority for servers
         } else {
             const dbRes = await pool.query(
-                'SELECT user_id, priority, escalation_state, status FROM monitors WHERE id = $1',
+                'SELECT user_id, priority, escalation_state, status, alerts_enabled FROM monitors WHERE id = $1',
                 [monitorId]
             );
             if (dbRes.rows.length === 0) {
@@ -40,6 +40,11 @@ const alertWorker = new Worker('alert-webhooks', async (job) => {
     } catch (err) {
         logger.error(`[AlertWorker] DB Error: ${err.message}`);
         throw err;
+    }
+
+    if (entity.alerts_enabled === false) {
+        logger.info(`[AlertWorker] Alerts disabled for ${job.data.isAgent ? 'agent' : 'monitor'} ${monitorId} — skipping`);
+        return;
     }
 
     const { user_id: userId, priority, escalation_state } = entity;

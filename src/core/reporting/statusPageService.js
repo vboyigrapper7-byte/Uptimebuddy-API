@@ -46,6 +46,14 @@ class StatusPageService {
             [user.id]
         );
 
+        // 4.5 Fetch Servers (Agents) for this user
+        const agentsRes = await pool.query(
+            `SELECT id, name, status, agent_type as type, hostname, os_type, last_seen as last_checked
+             FROM agents
+             WHERE user_id = $1`,
+            [user.id]
+        );
+
         const data = {
             page: {
                 name: user.name || slug,
@@ -53,10 +61,11 @@ class StatusPageService {
                 config: {}
             },
             monitors: monitorsRes.rows,
+            servers: agentsRes.rows,
             incidents: incidentsRes.rows,
-            overall_status: monitorsRes.rows.length === 0
+            overall_status: (monitorsRes.rows.length === 0 && agentsRes.rows.length === 0)
                 ? 'operational'
-                : monitorsRes.rows.every(m => m.status === 'up') ? 'operational' : 'degraded',
+                : (monitorsRes.rows.every(m => m.status === 'up') && agentsRes.rows.every(a => a.status === 'up')) ? 'operational' : 'degraded',
             updated_at: new Date().toISOString()
         };
 
