@@ -323,11 +323,14 @@ const getIncidents = async (request, reply) => {
     const userId = request.user.id;
     try {
         const res = await request.server.db.query(
-            `SELECT i.id, i.monitor_id, m.name AS monitor_name, m.target,
+            `SELECT i.id, i.monitor_id, i.agent_id, 
+                    COALESCE(m.name, a.name) AS monitor_name, 
+                    COALESCE(m.target, a.hostname) AS target,
                     i.started_at, i.resolved_at, i.error_message
              FROM incidents i
-             JOIN monitors m ON m.id = i.monitor_id
-             WHERE m.user_id = $1
+             LEFT JOIN monitors m ON m.id = i.monitor_id
+             LEFT JOIN agents a ON a.id = i.agent_id
+             WHERE m.user_id = $1 OR a.user_id = $1
              ORDER BY i.started_at DESC
              LIMIT 50`,
             [userId]

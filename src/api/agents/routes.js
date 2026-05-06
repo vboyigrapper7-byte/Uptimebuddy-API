@@ -368,6 +368,12 @@ async function agentRoutes(fastify, options) {
                         await auditService.log(userId, teamId, 'server_recovered', { name: agent.name, id: agentId }).catch(e => fastify.log.warn(`Audit log failed: ${e.message}`));
                     }
 
+                    // Resolve the incident in DB
+                    fastify.db.query(
+                        'UPDATE incidents SET resolved_at = NOW() WHERE agent_id = $1 AND resolved_at IS NULL',
+                        [agentId]
+                    ).catch(e => fastify.log.error(`[AgentRoutes] Failed to resolve incident: ${e.message}`));
+
                     const { alertQueue } = require('../../core/queue/setup');
                     alertQueue.add(
                         `alert-agent-up-${agentId}-${Date.now()}`,

@@ -35,12 +35,14 @@ class StatusPageService {
             [user.id]
         );
 
-        // 4. Fetch Recent Incidents (Last 7 days)
+        // 4. Fetch Recent Incidents (Last 7 days) for both Monitors and Agents
         const incidentsRes = await pool.query(
-            `SELECT i.*, m.name as monitor_name
+            `SELECT i.*, 
+                    COALESCE(m.name, a.name) as monitor_name
              FROM incidents i
-             JOIN monitors m ON i.monitor_id = m.id
-             WHERE m.user_id = $1
+             LEFT JOIN monitors m ON i.monitor_id = m.id
+             LEFT JOIN agents a ON i.agent_id = a.id
+             WHERE (m.user_id = $1 OR a.user_id = $1)
                AND i.started_at > NOW() - INTERVAL '7 days'
              ORDER BY i.started_at DESC`,
             [user.id]

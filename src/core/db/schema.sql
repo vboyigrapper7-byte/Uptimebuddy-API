@@ -62,8 +62,11 @@ CREATE TABLE IF NOT EXISTS monitors (
     status           VARCHAR(50)  DEFAULT 'pending',
     assertion_config JSONB,
     escalation_state JSONB        DEFAULT '{"step": 0, "last_trigger": null}',
+    alerts_enabled   BOOLEAN      DEFAULT TRUE,
     created_at       TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
 );
+
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS alerts_enabled BOOLEAN DEFAULT TRUE;
 
 -- Ensure existing installs have the new columns (safe migrations)
 ALTER TABLE monitors ADD COLUMN IF NOT EXISTS category VARCHAR(20) DEFAULT 'uptime';
@@ -106,10 +109,14 @@ CREATE TABLE IF NOT EXISTS incidents (
     monitor_id    INT          REFERENCES monitors(id) ON DELETE CASCADE,
     started_at    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP,
     resolved_at   TIMESTAMP,
-    error_message TEXT
+    error_message TEXT,
+    agent_id      INT          REFERENCES agents(id) ON DELETE CASCADE
 );
 
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS agent_id INT REFERENCES agents(id) ON DELETE CASCADE;
+
 CREATE INDEX IF NOT EXISTS idx_incidents_monitor_id ON incidents(monitor_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_incidents_agent_id ON incidents(agent_id, started_at DESC);
 
 -- ── Agents (physical server monitoring) ───────────────────────────────────────
 CREATE TABLE IF NOT EXISTS agents (
@@ -126,8 +133,11 @@ CREATE TABLE IF NOT EXISTS agents (
     hostname     VARCHAR(255),
     os_type      VARCHAR(50),
     agent_type   VARCHAR(50)  DEFAULT 'node',
-    agent_version VARCHAR(20)
+    agent_version VARCHAR(20),
+    alerts_enabled BOOLEAN     DEFAULT TRUE
 );
+
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS alerts_enabled BOOLEAN DEFAULT TRUE;
 
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
 

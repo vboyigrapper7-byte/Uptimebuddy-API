@@ -1,5 +1,6 @@
 const pool = require('../../core/db/pool');
 const auditService = require('../../core/auth/auditService');
+const emailService = require('../../core/email/emailService');
 
 const getMembers = async (request, reply) => {
     try {
@@ -33,16 +34,40 @@ const inviteMember = async (request, reply) => {
     const { email, role, teamId } = request.body;
     try {
         // Find user by email
-        const userRes = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
-        if (userRes.rows.length === 0) return reply.status(404).send({ error: 'User not found' });
+        let userRes = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
+        let userId;
 
-        const userId = userRes.rows[0].id;
+        if (userRes.rows.length === 0) {
+            // User doesn't exist yet, create a stub account for them to claim later
+            const stubRes = await pool.query(
+                'INSERT INTO users (email, password_hash, role) VALUES ($1, $2, $3) RETURNING id',
+                [email, 'INVITED_USER', 'customer']
+            );
+            userId = stubRes.rows[0].id;
+        } else {
+            userId = userRes.rows[0].id;
+        }
 
         // Add to team
         await pool.query(
             'INSERT INTO team_members (team_id, user_id, role) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING',
             [teamId, userId, role || 'member']
         );
+
+        // Fetch team name and inviter name for the email
+        const contextRes = await pool.query(
+            `SELECT t.name as team_name, u.name as inviter_name 
+             FROM teams t 
+             JOIN users u ON u.id = t.owner_id 
+             WHERE t.id = $1`, 
+            [teamId]
+        );
+        
+        if (contextRes.rows.length > 0) {
+            const { team_name, inviter_name } = contextRes.rows[0];
+            emailService.sendInvite(email, inviter_name || 'A team member', team_name)
+                .catch(e => console.error('[Invite] Email trigger failed:', e.message));
+        }
 
         // Audit Log
         await auditService.log(request.user.id, teamId, 'member_invited', { invited_email: email, role });

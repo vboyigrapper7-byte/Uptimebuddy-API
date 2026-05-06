@@ -111,6 +111,34 @@ class EmailService {
             return false;
         }
     }
+
+    /**
+     * Send a team invitation email
+     */
+    async sendInvite(email, inviterName, teamName) {
+        try {
+            const sender = process.env.EMAIL_FROM || 'onboarding@resend.dev';
+            await resend.emails.send({
+                from: `Monitor Hub <${sender}>`,
+                to: email,
+                subject: `${inviterName} invited you to join ${teamName} on Monitor Hub`,
+                html: `
+                    <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 500px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 12px;">
+                        <h2 style="color: #2563eb; margin-bottom: 8px;">You've been invited!</h2>
+                        <p style="color: #475569; font-size: 16px;"><strong>${inviterName}</strong> has invited you to collaborate on the team <strong>${teamName}</strong> within Monitor Hub.</p>
+                        <div style="margin: 24px 0; text-align: center;">
+                            <a href="https://monitorhubs.com/signup?email=${encodeURIComponent(email)}" style="background: #2563eb; color: white; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: bold; display: inline-block;">Accept Invitation</a>
+                        </div>
+                        <p style="color: #94a3b8; font-size: 14px;">If you already have an account, simply log in to see your new team. If not, click the button above to get started.</p>
+                    </div>
+                `
+            });
+            return true;
+        } catch (err) {
+            console.error('[EmailService] Failed to send invite:', err.message);
+            return false;
+        }
+    }
 }
 
 module.exports = new EmailService();

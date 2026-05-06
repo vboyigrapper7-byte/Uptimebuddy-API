@@ -41,7 +41,84 @@ async function computeMonitorStats() {
 }
 
 /**
- * Prune historical metrics older than 30 days to maintain performance.
+ * Perform Downsampling (Data Rollups)
+ * Compresses metrics older than 7 days into 1-hour averages to save 98% space.
+ */
+async function rollupMetrics() {
+    console.log('[StatsWorker] Starting metrics downsampling/rollup...');
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Ensure Rollup Tables Exist
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS agent_metrics_hourly (
+                id SERIAL PRIMARY KEY,
+                agent_id INT REFERENCES agents(id) ON DELETE CASCADE,
+                recorded_at TIMESTAMP NOT NULL,
+                cpu_percent NUMERIC(5,2),
+                ram_percent NUMERIC(5,2),
+                disk_percent NUMERIC(5,2),
+                net_rx_mb NUMERIC(8,3),
+                net_tx_mb NUMERIC(8,3),
+                UNIQUE(agent_id, recorded_at)
+            )
+        `);
+
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS monitor_metrics_hourly (
+                id SERIAL PRIMARY KEY,
+                monitor_id INT REFERENCES monitors(id) ON DELETE CASCADE,
+                recorded_at TIMESTAMP NOT NULL,
+                response_time_ms INTEGER,
+                status VARCHAR(20),
+                UNIQUE(monitor_id, recorded_at)
+            )
+        `);
+
+        // Rollup Agent Metrics (> 7 days)
+        const agentRes = await client.query(`
+            INSERT INTO agent_metrics_hourly (agent_id, recorded_at, cpu_percent, ram_percent, disk_percent, net_rx_mb, net_tx_mb)
+            SELECT 
+                agent_id,
+                date_trunc('hour', recorded_at) AS recorded_at,
+                AVG(cpu_percent), 
+                AVG(ram_percent), 
+                AVG(disk_percent),
+                SUM(net_rx_mb),
+                SUM(net_tx_mb)
+            FROM agent_metrics
+            WHERE recorded_at < NOW() - INTERVAL '7 days'
+            GROUP BY agent_id, date_trunc('hour', recorded_at)
+            ON CONFLICT (agent_id, recorded_at) DO NOTHING;
+        `);
+
+        // Rollup Monitor Metrics (> 7 days)
+        const monitorRes = await client.query(`
+            INSERT INTO monitor_metrics_hourly (monitor_id, recorded_at, response_time_ms, status)
+            SELECT 
+                monitor_id,
+                date_trunc('hour', recorded_at) AS recorded_at,
+                AVG(response_time_ms),
+                MAX(status)
+            FROM monitor_metrics
+            WHERE recorded_at < NOW() - INTERVAL '7 days'
+            GROUP BY monitor_id, date_trunc('hour', recorded_at)
+            ON CONFLICT (monitor_id, recorded_at) DO NOTHING;
+        `);
+
+        await client.query('COMMIT');
+        console.log(`[StatsWorker] Metrics downsampling complete. Inserted ${agentRes.rowCount} agent hours, ${monitorRes.rowCount} monitor hours.`);
+    } catch (err) {
+        await client.query('ROLLBACK');
+        console.error('[StatsWorker] Rollup failed:', err.message);
+    } finally {
+        client.release();
+    }
+}
+
+/**
+ * Prune historical metrics older than tier allowance to maintain performance.
  */
 async function pruneMetrics() {
     console.log('[StatsWorker] Starting tier-aware metrics pruning...');
@@ -96,6 +173,7 @@ const statsWorker = new Worker(
         if (job.name === 'compute-stats') {
             await computeMonitorStats();
         } else if (job.name === 'prune-metrics') {
+            await rollupMetrics();
             await pruneMetrics();
         }
     },
@@ -108,4 +186,4 @@ const statsWorker = new Worker(
 statsWorker.on('completed', (job) => console.log(`[StatsWorker] Job ${job.id} (${job.name}) completed.`));
 statsWorker.on('failed', (job, err) => console.error(`[StatsWorker] Job ${job.id} (${job.name}) failed:`, err));
 
-module.exports = { computeMonitorStats, pruneMetrics, statsWorker };
+module.exports = { computeMonitorStats, pruneMetrics, rollupMetrics, statsWorker };

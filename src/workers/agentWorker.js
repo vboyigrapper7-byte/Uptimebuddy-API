@@ -7,7 +7,7 @@ const pool = require('../core/db/pool');
 const { Worker } = require('bullmq');
 const { workerRedisConnection } = require('../core/queue/setup');
 
-async function checkAgentHealth(fastify) {
+async function checkAgentHealth() {
     console.log('[AgentWorker] Checking for offline agents...');
     try {
         // Mark agents as 'down' if not seen in 2 minutes
@@ -16,7 +16,7 @@ async function checkAgentHealth(fastify) {
             SET status = 'down' 
             WHERE status != 'down' 
             AND last_seen < NOW() - INTERVAL '2 minutes'
-            RETURNING id, name, hostname
+            RETURNING id, name, hostname, user_id
         `);
 
         if (res.rows.length > 0) {
@@ -36,6 +36,12 @@ async function checkAgentHealth(fastify) {
                     hostname: agent.hostname
                 }));
 
+                // Record the incident
+                pool.query(
+                    'INSERT INTO incidents (agent_id, started_at, error_message) VALUES ($1, NOW(), $2)', 
+                    [agent.id, 'Server agent stopped reporting heartbeats.']
+                ).catch(e => console.error('[AgentWorker] Failed to create incident:', e));
+
                 const { alertQueue } = require('../core/queue/setup');
                 alertQueue.add(
                     `alert-agent-${agent.id}-${Date.now()}`,
@@ -50,6 +56,15 @@ async function checkAgentHealth(fastify) {
                     },
                     { removeOnComplete: { count: 100 } }
                 ).catch(err => console.error('[AgentWorker] Failed to queue alert', err));
+
+                // Invalidate Public Status Page Cache for this user
+                pool.query('SELECT status_slug FROM users WHERE id = $1', [agent.user_id])
+                    .then(uRes => {
+                        if (uRes.rows.length > 0 && uRes.rows[0].status_slug) {
+                            const cache = require('../core/reporting/cache');
+                            cache.invalidate(uRes.rows[0].status_slug);
+                        }
+                    }).catch(e => console.error('[AgentWorker] Cache invalidation failed:', e));
             });
         }
     } catch (err) {
@@ -57,24 +72,20 @@ async function checkAgentHealth(fastify) {
     }
 }
 
-const startAgentWorker = (fastify) => {
-    const worker = new Worker(
-        'agent-tasks',
-        async (job) => {
-            if (job.name === 'check-health') {
-                await checkAgentHealth(fastify);
-            }
-        },
-        { 
-            connection: workerRedisConnection,
-            concurrency: 1 
+const agentWorker = new Worker(
+    'agent-tasks',
+    async (job) => {
+        if (job.name === 'check-health') {
+            await checkAgentHealth();
         }
-    );
+    },
+    { 
+        connection: workerRedisConnection,
+        concurrency: 1 
+    }
+);
 
-    worker.on('completed', (job) => console.log(`[AgentWorker] Job ${job.id} completed.`));
-    worker.on('failed', (job, err) => console.error(`[AgentWorker] Job ${job.id} failed:`, err));
+agentWorker.on('completed', (job) => console.log(`[AgentWorker] Job ${job.id} completed.`));
+agentWorker.on('failed', (job, err) => console.error(`[AgentWorker] Job ${job.id} failed:`, err));
 
-    return worker;
-};
-
-module.exports = { checkAgentHealth, startAgentWorker };
+module.exports = { checkAgentHealth, agentWorker };

@@ -204,6 +204,15 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
             );
         }
 
+        // 1.5 Invalidate Public Status Page Cache for this user
+        pool.query('SELECT status_slug FROM users WHERE id = $1', [user_id])
+            .then(uRes => {
+                if (uRes.rows.length > 0 && uRes.rows[0].status_slug) {
+                    const cache = require('../core/reporting/cache');
+                    cache.invalidate(uRes.rows[0].status_slug);
+                }
+            }).catch(e => logger.error(`[CheckWorker] Cache invalidation failed: ${e.message}`));
+
         // ── 2. Smart Alerting Logic ──────────────────────────────────────────
         // Determine if we SHOULD alert based on global settings & toggles
         // We now allow alerts on isFirstCheck if the status is NOT 'up' (Discovery Alert)
