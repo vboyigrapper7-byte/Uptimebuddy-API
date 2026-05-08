@@ -362,22 +362,38 @@ const testMonitor = async (request, reply) => {
             }
         }
 
+        const testMethod = (method || 'GET').toUpperCase();
+        const hasBody = body && !['GET', 'HEAD', 'OPTIONS'].includes(testMethod);
+
+        const finalHeaders = { 
+            ...parsedHeaders, 
+            'User-Agent': 'MonitorHub-Tester/2.0',
+            'Accept': '*/*'
+        };
+
+        // Auto-set Content-Type if JSON body is detected and not already set
+        if (hasBody && !finalHeaders['Content-Type'] && !finalHeaders['content-type']) {
+            try {
+                JSON.parse(body);
+                finalHeaders['Content-Type'] = 'application/json';
+            } catch (e) {
+                // Not valid JSON, leave as is or default to text
+                finalHeaders['Content-Type'] = 'text/plain';
+            }
+        }
+
         const res = await axios({
             url: target,
-            method: method || 'GET',
-            headers: { 
-                ...parsedHeaders, 
-                'User-Agent': 'MonitorHub-Tester/2.0',
-                'Accept': '*/*'
-            },
-            data: body,
-            timeout: 15000, // Increased to 15s for slower APIs
-            validateStatus: () => true, // Don't throw on any status code
+            method: testMethod,
+            headers: finalHeaders,
+            data: hasBody ? body : undefined,
+            timeout: 15000, 
+            validateStatus: () => true, 
             maxRedirects: 5,
-            maxContentLength: 5 * 1024 * 1024, // 5MB limit
-            responseType: 'text', // Get raw text to calculate size accurately
-            transformResponse: [(data) => data], // Don't auto-parse JSON on backend so we can control it on frontend
-            ...getSafeAxiosConfig() // SSRF Protection
+            maxContentLength: 5 * 1024 * 1024, 
+            responseType: 'text', 
+            transformResponse: [(data) => data], 
+            ...getSafeAxiosConfig() 
         });
         
         const time = Date.now() - startTime;
