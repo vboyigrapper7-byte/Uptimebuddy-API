@@ -159,9 +159,32 @@ const alertWorker = new Worker('alert-webhooks', async (job) => {
             } else if (wh.provider === 'discord') {
                 payload = alertService.getDiscordPayload(job.data);
             } else if (wh.provider === 'telegram') {
-                const [botToken, chatId] = wh.url.split('|');
-                if (botToken && chatId) {
-                    await alertService.sendTelegram(job.data, botToken, chatId);
+                const parts = wh.url.split('|');
+                if (parts.length === 2) {
+                    const [botToken, chatId] = parts;
+                    let success = false;
+                    let lastError = null;
+                    try {
+                        await alertService.sendTelegram(job.data, botToken, chatId);
+                        success = true;
+                        logger.worker('AlertWorker', monitorId, `✓ telegram alert dispatched`);
+                    } catch (err) {
+                        lastError = err.message;
+                        logger.error(`[AlertWorker] Telegram failed: ${err.message}`);
+                    }
+                    
+                    await pool.query(
+                        `INSERT INTO alert_logs (user_id, monitor_id, alert_type, status, error_message, provider)
+                         VALUES ($1, $2, $3, $4, $5, $6)`,
+                        [userId, job.data.isAgent ? null : monitorId, newStatus, success ? 'success' : 'failed', success ? null : lastError, 'telegram']
+                    );
+                } else {
+                    logger.error(`[AlertWorker] Invalid Telegram URL format: ${wh.url}`);
+                    await pool.query(
+                        `INSERT INTO alert_logs (user_id, monitor_id, alert_type, status, error_message, provider)
+                         VALUES ($1, $2, $3, $4, $5, $6)`,
+                        [userId, job.data.isAgent ? null : monitorId, newStatus, 'failed', 'Invalid URL format (expected token|chatId)', 'telegram']
+                    );
                 }
                 continue;
             } else if (wh.provider === 'email') {

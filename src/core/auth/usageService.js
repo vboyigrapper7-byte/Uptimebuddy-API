@@ -4,6 +4,7 @@
  */
 
 const { PLAN_TIERS } = require('../billing/tiers');
+const planService = require('../billing/planService');
 
 /**
  * Get full usage statistics for a user
@@ -54,7 +55,7 @@ async function getUserUsage(db, userId) {
  */
 async function checkLimit(db, user, category) {
     const usage = await getUserUsage(db, user.id);
-    const tierConfig = PLAN_TIERS[user.tier] || PLAN_TIERS.free;
+    const tierConfig = planService.getEffectiveTier(user);
     
     // Safety check for valid category
     if (!tierConfig.limits.hasOwnProperty(category)) {
@@ -82,7 +83,7 @@ async function checkLimit(db, user, category) {
  * @returns {number} The effective interval (clamped to minInterval)
  */
 function getEffectiveInterval(user, requestedInterval) {
-    const tierConfig = PLAN_TIERS[user.tier] || PLAN_TIERS.free;
+    const tierConfig = planService.getEffectiveTier(user);
     const minAllowed = tierConfig.minInterval || 300;
     return Math.max(requestedInterval, minAllowed);
 }
@@ -91,8 +92,8 @@ function getEffectiveInterval(user, requestedInterval) {
  * Get effective limits for a user
  * @param {string} tier 
  */
-function getTierLimits(tier) {
-    return PLAN_TIERS[tier] || PLAN_TIERS.free;
+function getTierLimits(user) {
+    return planService.getEffectiveTier(user);
 }
 
 /**
@@ -102,7 +103,7 @@ function getTierLimits(tier) {
  */
 async function getOverLimitMonitors(db, user) {
     const usage = await getUserUsage(db, user.id);
-    const tierConfig = PLAN_TIERS[user.tier] || PLAN_TIERS.free;
+    const tierConfig = planService.getEffectiveTier(user);
     
     let overLimitIds = [];
 

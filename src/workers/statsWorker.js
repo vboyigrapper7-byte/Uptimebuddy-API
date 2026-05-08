@@ -126,39 +126,41 @@ async function pruneMetrics() {
         // This query deletes metrics based on the retentionDays of the user's tier.
         // It uses a subquery to find the appropriate cutoff for each user.
         await pool.query(`
-            -- Prune Monitor Metrics
-            DELETE FROM monitor_metrics
-            WHERE (monitor_id, recorded_at) IN (
-                SELECT mm.monitor_id, mm.recorded_at
-                FROM monitor_metrics mm
-                JOIN monitors m ON mm.monitor_id = m.id
-                JOIN users u ON m.user_id = u.id
-                WHERE mm.recorded_at < NOW() - (
-                    CASE 
-                        WHEN u.tier = 'business' THEN INTERVAL '365 days'
-                        WHEN u.tier = 'pro'      THEN INTERVAL '30 days'
-                        WHEN u.tier = 'starter'  THEN INTERVAL '7 days'
-                        ELSE INTERVAL '1 day'
-                    END
-                )
-            );
+            -- Prune Monitor Metrics using an efficient JOIN
+            DELETE FROM monitor_metrics mm
+            USING monitors m, users u
+            WHERE mm.monitor_id = m.id 
+              AND m.user_id = u.id
+              AND mm.recorded_at < NOW() - (
+                CASE 
+                    WHEN (u.plan_expiry IS NULL OR u.plan_expiry > NOW()) THEN
+                        CASE 
+                            WHEN u.tier = 'business' THEN INTERVAL '365 days'
+                            WHEN u.tier = 'pro'      THEN INTERVAL '30 days'
+                            WHEN u.tier = 'starter'  THEN INTERVAL '7 days'
+                            ELSE INTERVAL '1 day'
+                        END
+                    ELSE INTERVAL '1 day'
+                END
+              );
 
-            -- Prune Agent Metrics
-            DELETE FROM agent_metrics
-            WHERE (agent_id, recorded_at) IN (
-                SELECT am.agent_id, am.recorded_at
-                FROM agent_metrics am
-                JOIN agents a ON am.agent_id = a.id
-                JOIN users u ON a.user_id = u.id
-                WHERE am.recorded_at < NOW() - (
-                    CASE 
-                        WHEN u.tier = 'business' THEN INTERVAL '365 days'
-                        WHEN u.tier = 'pro'      THEN INTERVAL '30 days'
-                        WHEN u.tier = 'starter'  THEN INTERVAL '7 days'
-                        ELSE INTERVAL '1 day'
-                    END
-                )
-            );
+            -- Prune Agent Metrics using an efficient JOIN
+            DELETE FROM agent_metrics am
+            USING agents a, users u
+            WHERE am.agent_id = a.id 
+              AND a.user_id = u.id
+              AND am.recorded_at < NOW() - (
+                CASE 
+                    WHEN (u.plan_expiry IS NULL OR u.plan_expiry > NOW()) THEN
+                        CASE 
+                            WHEN u.tier = 'business' THEN INTERVAL '365 days'
+                            WHEN u.tier = 'pro'      THEN INTERVAL '30 days'
+                            WHEN u.tier = 'starter'  THEN INTERVAL '7 days'
+                            ELSE INTERVAL '1 day'
+                        END
+                    ELSE INTERVAL '1 day'
+                END
+              );
         `);
         console.log('[StatsWorker] Tier-aware pruning complete.');
     } catch (err) {
