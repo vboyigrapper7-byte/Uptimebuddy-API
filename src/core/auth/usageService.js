@@ -12,38 +12,27 @@ const planService = require('../billing/planService');
  * @param {number} userId 
  */
 async function getUserUsage(db, userId) {
-    // 1. Fetch monitor counts by category
-    const monitorRes = await db.query(
-        `SELECT category, COUNT(*) as count 
+    /**
+     * Optimized single-query usage fetch.
+     * Counts monitors by category and agents in one database round-trip.
+     */
+    const res = await db.query(
+        `SELECT 
+            COUNT(*) FILTER (WHERE category = 'uptime' OR category IS NULL) as uptime,
+            COUNT(*) FILTER (WHERE category = 'api') as api,
+            (SELECT COUNT(*) FROM agents WHERE user_id = $1) as server
          FROM monitors 
-         WHERE user_id = $1 
-         GROUP BY category`,
+         WHERE user_id = $1`,
         [userId]
     );
 
-    const counts = {
-        uptime: 0,
-        api: 0,
-        server: 0
+    const row = res.rows[0];
+    return {
+        uptime: parseInt(row.uptime || 0, 10),
+        api: parseInt(row.api || 0, 10),
+        server: parseInt(row.server || 0, 10),
+        recycleBin: 0
     };
-
-    monitorRes.rows.forEach(row => {
-        if (counts.hasOwnProperty(row.category)) {
-            counts[row.category] = parseInt(row.count, 10);
-        }
-    });
-
-    // 2. Fetch server agent counts
-    const agentRes = await db.query(
-        'SELECT COUNT(*) as count FROM agents WHERE user_id = $1',
-        [userId]
-    );
-    counts.server = parseInt(agentRes.rows[0].count, 10);
-
-    // 3. Recycle Bin (Placeholder for future implementation)
-    counts.recycleBin = 0;
-
-    return counts;
 }
 
 /**

@@ -36,6 +36,7 @@ const getRoutesAndServices = () => {
         teamRoutes: require('./api/teams/routes'),
         auditRoutes: require('./api/audit/routes'),
         alertRoutes: require('./api/alerts/routes'),
+        adminRoutes: require('./api/admin/routes'),
         pool: require('./core/db/pool'),
         scheduler: require('./core/queue/scheduler'),
         statsWorker: require('./workers/statsWorker')
@@ -48,7 +49,7 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://monitorhubs.com';
 const buildServer = async () => {
     // ── Pre-boot Initialization ───────────────────────────────────────────
     // Must happen FIRST so variables like 'pool' are available to decorators
-    const { authRoutes, agentRoutes, monitorRoutes, webhookRoutes, publicRoutes, billingRoutes, teamRoutes, auditRoutes, alertRoutes, pool } = getRoutesAndServices();
+    const { authRoutes, agentRoutes, monitorRoutes, webhookRoutes, publicRoutes, billingRoutes, teamRoutes, auditRoutes, alertRoutes, adminRoutes, pool } = getRoutesAndServices();
 
     // ── Database Initialization (Metrics Index & Agent Distribution) ────
     try {
@@ -208,6 +209,7 @@ const buildServer = async () => {
     server.register(teamRoutes,    { prefix: '/api/v1/teams' });
     server.register(auditRoutes,   { prefix: '/api/v1/audit' });
     server.register(alertRoutes,   { prefix: '/api/v1/alerts' });
+    server.register(adminRoutes,   { prefix: '/api/v1/admin' });
     
     // ── Post-boot Initialization ─────────────────────────────────────────
     // Sync monitors with queue after server starts (non-blocking)

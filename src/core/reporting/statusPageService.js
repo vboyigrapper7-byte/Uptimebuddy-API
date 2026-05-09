@@ -18,16 +18,21 @@ class StatusPageService {
         if (cached) return cached;
 
         // 2. Find the user and their effective tier/limits
+        const normalizedSlug = slug.toLowerCase().trim();
         const userRes = await pool.query(
-            'SELECT id, name, email, tier, plan_expiry FROM users WHERE status_slug = $1',
-            [slug]
+            'SELECT id, name, email, tier, plan_expiry FROM users WHERE LOWER(status_slug) = $1',
+            [normalizedSlug]
         );
-        if (userRes.rows.length === 0) return null;
+        
+        if (userRes.rows.length === 0) {
+            console.warn(`[StatusPage] Public access attempt for unknown slug: ${slug}`);
+            return null;
+        }
 
         const user = userRes.rows[0];
         const planService = require('../billing/planService');
         const tierConfig = planService.getEffectiveTier(user);
-        const limit = tierConfig.limits.uptime || 5;
+        const limit = tierConfig?.limits?.uptime || 5;
 
         // 3. Fetch Monitors (Respecting limit and joining stats)
         const monitorsRes = await pool.query(

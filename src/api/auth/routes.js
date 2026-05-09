@@ -39,7 +39,7 @@ async function authRoutes(fastify, options) {
         protectedScope.get('/usage', async (request, reply) => {
             const usageService = require('../../core/auth/usageService');
             const usage = await usageService.getUserUsage(request.server.db, request.user.id);
-            const limits = usageService.getTierLimits(request.user.tier);
+            const limits = usageService.getTierLimits(request.user);
             const overLimitIds = await usageService.getOverLimitMonitors(request.server.db, request.user);
             return reply.send({ usage, limits, overLimitIds });
         });

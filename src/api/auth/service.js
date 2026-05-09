@@ -17,7 +17,7 @@ async function createUser(db, { email, password, passwordHash, role = 'customer'
     const trialDays = 14;
     const result = await db.query(
         `INSERT INTO users (email, password_hash, role, tier, plan_id, trial_ends_at) 
-         VALUES ($1, $2, $3, 'pro', 'pro_trial', NOW() + INTERVAL '14 days') 
+         VALUES ($1, $2, $3, 'free', 'free', NOW() + INTERVAL '14 days') 
          RETURNING id, email, role, tier, plan_id, trial_ends_at`,
         [email, finalHash, role]
     );

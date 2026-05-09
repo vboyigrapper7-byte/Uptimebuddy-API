@@ -10,6 +10,7 @@ const crypto = require('crypto');
 const bcrypt = require('bcrypt');
 const otpService = require('./services/otpService');
 const emailService = require('./services/emailService');
+const statusPageCache = require('../../core/reporting/cache');
 
 const RegisterSchema = z.object({
     email: z.string().email(),
@@ -77,7 +78,19 @@ const updateProfile = async (request, reply) => {
     }
 
     try {
-        // Attempt full update
+        // 1. Check uniqueness if status_slug is provided
+        if (status_slug) {
+            const normalizedSlug = status_slug.toLowerCase().trim();
+            const existing = await request.server.db.query(
+                'SELECT id FROM users WHERE status_slug = $1 AND id != $2',
+                [normalizedSlug, request.user.id]
+            );
+            if (existing.rows.length > 0) {
+                return reply.status(400).send({ error: 'This status page slug is already taken. Please choose another.' });
+            }
+        }
+
+        // 2. Attempt full update
         const res = await request.server.db.query(
             `UPDATE users SET 
                name = COALESCE($1, name),
@@ -85,6 +98,11 @@ const updateProfile = async (request, reply) => {
              WHERE id = $3 RETURNING id, email, name, status_slug, tier, role, created_at`,
             [name?.trim() || null, status_slug?.toLowerCase() || null, request.user.id]
         );
+
+        // 3. Invalidate cache if anything changed
+        if (status_slug) statusPageCache.invalidate(status_slug.toLowerCase());
+        if (request.user.status_slug) statusPageCache.invalidate(request.user.status_slug);
+
         return reply.send({ message: 'Profile updated successfully', user: res.rows[0] });
     } catch (err) {
         // Fallback: If status_slug column is missing, try updating only the name
@@ -94,7 +112,11 @@ const updateProfile = async (request, reply) => {
                     'UPDATE users SET name = $1 WHERE id = $2 RETURNING id, email, name, tier, role, created_at',
                     [name?.trim() || null, request.user.id]
                 );
-                return reply.send({ message: 'Profile updated (Status Page slug unavailable)', user: res.rows[0] });
+                return reply.send({ 
+                    message: 'Name updated, but Status Page slug could not be saved (Database schema needs update).', 
+                    user: res.rows[0],
+                    warning: 'Status Page feature is currently unavailable.'
+                });
             } catch (innerErr) {
                 request.log.error(innerErr);
             }

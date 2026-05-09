@@ -281,17 +281,13 @@ async function agentRoutes(fastify, options) {
         }
 
         try {
-            // 1. Token Validation (Optimized with Cache)
-            let agent = tokenCache.get(agent_token);
-            if (!agent) {
-                const res = await fastify.db.query(
-                    'SELECT id, user_id, status, name FROM agents WHERE agent_token = $1',
-                    [agent_token]
-                );
-                if (res.rows.length === 0) return reply.status(404).send({ error: 'Agent not found' });
-                agent = res.rows[0];
-                tokenCache.set(agent_token, agent);
-            }
+            // 1. Token Validation (Always fetch from DB to detect status transitions correctly)
+            const res = await fastify.db.query(
+                'SELECT id, user_id, status, name, hostname FROM agents WHERE agent_token = $1',
+                [agent_token]
+            );
+            if (res.rows.length === 0) return reply.status(404).send({ error: 'Agent not found' });
+            const agent = res.rows[0];
 
             const agentId = agent.id;
             const userId  = agent.user_id;
