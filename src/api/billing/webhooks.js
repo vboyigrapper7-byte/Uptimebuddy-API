@@ -1,4 +1,6 @@
 const crypto = require('crypto');
+const auditService = require('../../core/admin/auditService');
+
 
 const handleWebhook = async (request, reply) => {
     const secret = process.env.RAZORPAY_WEBHOOK_SECRET;
@@ -29,7 +31,18 @@ const handleWebhook = async (request, reply) => {
                 const { user_id, plan_id } = txRes.rows[0];
                 await db.query('UPDATE users SET tier = $1, plan_expiry = NOW() + INTERVAL \'32 days\' WHERE id = $2', [plan_id, user_id]);
                 await db.query('UPDATE transactions SET payment_id = $1, status = \'paid\' WHERE order_id = $2', [payment_id, order_id]);
+                
+                await auditService.logAction(db, {
+                    userId: user_id,
+                    action: 'PAYMENT_CAPTURED',
+                    entityType: 'transaction',
+                    entityId: order_id,
+                    newValue: { plan_id, payment_id },
+                    ipAddress: request.ip
+                });
+
                 request.log.info(`[BillingWebhook] Upgraded user ${user_id} via payment.captured`);
+
             }
         }
 
@@ -44,7 +57,17 @@ const handleWebhook = async (request, reply) => {
                     'UPDATE users SET plan_expiry = NOW() + INTERVAL \'32 days\', subscription_id = $1 WHERE id = $2',
                     [sub_id, user_id]
                 );
+
+                await auditService.logAction(db, {
+                    userId: user_id,
+                    action: 'SUBSCRIPTION_RENEWED',
+                    entityType: 'subscription',
+                    entityId: sub_id,
+                    ipAddress: request.ip
+                });
+
                 request.log.info(`[BillingWebhook] Extended subscription for user ${user_id} (Sub: ${sub_id})`);
+
             }
         }
 
@@ -60,7 +83,18 @@ const handleWebhook = async (request, reply) => {
                     'UPDATE users SET tier = \'free\', plan_expiry = NOW(), subscription_id = NULL WHERE id = $1',
                     [user_id]
                 );
+
+                await auditService.logAction(db, {
+                    userId: user_id,
+                    action: 'SUBSCRIPTION_CANCELLED',
+                    entityType: 'subscription',
+                    entityId: sub_id,
+                    newValue: { event },
+                    ipAddress: request.ip
+                });
+
                 request.log.info(`[BillingWebhook] Downgraded user ${user_id} due to ${event}`);
+
             }
         }
     } catch (err) {

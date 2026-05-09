@@ -7,11 +7,12 @@ const razorpay = new Razorpay({
   key_secret: process.env.RAZORPAY_KEY_SECRET,
 });
 
-const INR_PRICES = {
+// Fixed USD Pricing (rounded, accepts payment in INR or USD based on payer location)
+const USD_PRICES = {
     free: 0,
-    starter: 799,
-    pro: 1999,
-    business: 6999
+    starter: 10,
+    pro: 24,
+    business: 84
 };
 
 const createOrder = async (request, reply) => {
@@ -22,15 +23,15 @@ const createOrder = async (request, reply) => {
             return reply.code(400).send({ message: 'Invalid plan selected' });
         }
 
-        const priceInINR = INR_PRICES[planId];
+        const priceInUSD = USD_PRICES[planId];
         
-        if (!priceInINR || priceInINR === 0) {
+        if (!priceInUSD || priceInUSD === 0) {
              return reply.code(400).send({ message: 'Free plans do not require a payment order.' });
         }
 
         const options = {
-            amount: priceInINR * 100, // Amount in paisa
-            currency: 'INR',
+            amount: priceInUSD * 100, // Amount in cents (USD)
+            currency: 'USD',
             receipt: `receipt_order_${request.user.id}_${Date.now()}`,
             payment_capture: 1 // Auto capture
         };
@@ -116,8 +117,8 @@ const verifyPayment = async (request, reply) => {
 const getPlans = async (request, reply) => {
     return reply.send({
         tiers: PLAN_TIERS,
-        prices: INR_PRICES,
-        currency: 'INR'
+        prices: USD_PRICES,
+        currency: 'USD'
     });
 };
 

@@ -8,7 +8,9 @@ const Fastify = require('fastify');
 const cors    = require('@fastify/cors');
 const rateLimit = require('@fastify/rate-limit');
 const helmet = require('@fastify/helmet');
+const jwt = require('@fastify/jwt');
 const winston = require('winston');
+
 const axios = require('axios');
 const fastifyWebsocket = require('@fastify/websocket');
 
@@ -88,6 +90,11 @@ const buildServer = async () => {
         global: true,
         contentSecurityPolicy: process.env.NODE_ENV === 'production'
     });
+
+    await server.register(jwt, {
+        secret: process.env.JWT_SECRET || 'super_secret_key_123_monitorhub_2026'
+    });
+
 
     server.setErrorHandler((error, request, reply) => {
         logger.error(`[Fatal Server Error] ${request.method} ${request.url}`, { 

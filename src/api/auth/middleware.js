@@ -8,7 +8,7 @@ const { validateApiKey } = require('./service');
 const planService = require('../../core/billing/planService');
 
 /**
- * Standard Auth Guard: Validates Firebase ID Token
+ * Standard Auth Guard: Validates Firebase ID Token OR Impersonation JWT
  */
 async function requireAuth(request, reply) {
     const authHeader = request.headers.authorization;
@@ -16,10 +16,32 @@ async function requireAuth(request, reply) {
         return reply.status(401).send({ error: 'Missing or malformed Authorization header' });
     }
 
-    const idToken = authHeader.split('Bearer ')[1];
+    const token = authHeader.split('Bearer ')[1];
 
+    // 1. Try Impersonation Logic First (Backend-signed JWT)
     try {
-        const decodedToken = await admin.auth().verifyIdToken(idToken);
+        const decodedImpersonation = await request.jwtVerify();
+        if (decodedImpersonation && decodedImpersonation.impersonation) {
+            const userId = decodedImpersonation.targetUserId;
+            const res = await request.server.db.query(
+                'SELECT id, email, name, status_slug, role, tier, plan_id, trial_ends_at, plan_expiry, subscription_id FROM users WHERE id = $1',
+                [userId]
+            );
+
+            if (res.rows.length > 0) {
+                request.user = res.rows[0];
+                request.impersonatorId = decodedImpersonation.adminId;
+                request.isImpersonating = true;
+                return; // Impersonation session successfully established
+            }
+        }
+    } catch (jwtErr) {
+        // Not a valid backend JWT or expired, fall back to Firebase
+    }
+
+    // 2. Standard Firebase Auth Flow
+    try {
+        const decodedToken = await admin.auth().verifyIdToken(token);
         
         let res;
         try {

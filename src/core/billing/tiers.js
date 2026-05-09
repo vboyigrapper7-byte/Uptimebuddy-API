@@ -1,13 +1,14 @@
 /**
  * SaaS Tier Definitions for Monitor Hub
  * All limits and features associated with each plan.
+ * Pricing is in USD — Razorpay accepts both USD and INR based on the payer's location.
  */
 
 const PLAN_TIERS = {
     free: {
         id: 'free',
         name: 'Free',
-        priceINR: 0,
+        priceUSD: 0,
         limits: {
             uptime: 5,
             api: 2,
@@ -23,7 +24,7 @@ const PLAN_TIERS = {
     starter: {
         id: 'starter',
         name: 'Starter',
-        priceINR: 799, // Round off
+        priceUSD: 10, // $10/month
         limits: {
             uptime: 25,
             api: 10,
@@ -39,7 +40,7 @@ const PLAN_TIERS = {
     pro: {
         id: 'pro',
         name: 'Pro',
-        priceINR: 1999, // Round off
+        priceUSD: 24, // $24/month
         limits: {
             uptime: 100,
             api: 50,
@@ -55,7 +56,7 @@ const PLAN_TIERS = {
     business: {
         id: 'business',
         name: 'Business',
-        priceINR: 6999, // Round off
+        priceUSD: 84, // $84/month
         limits: {
             uptime: 500,
             api: 250,

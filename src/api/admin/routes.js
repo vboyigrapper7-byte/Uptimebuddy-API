@@ -22,6 +22,10 @@ async function adminRoutes(fastify, options) {
         protectedScope.get('/users/:id', controller.getUserDetails);
         protectedScope.put('/users/:id', controller.updateUser);
         protectedScope.delete('/users/:id', controller.deleteUser);
+        protectedScope.post('/users/:id/impersonate', controller.impersonate);
+        protectedScope.get('/analytics/revenue', controller.getRevenueAnalytics);
+
+
         
         // Monitors & Agents Management
         protectedScope.get('/monitors', controller.getMonitors);
