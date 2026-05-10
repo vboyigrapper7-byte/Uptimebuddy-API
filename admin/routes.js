@@ -22,6 +22,10 @@ async function adminRoutes(fastify, options) {
         protectedScope.get('/users/:id', controller.getUserDetails);
         protectedScope.put('/users/:id', controller.updateUser);
         protectedScope.delete('/users/:id', controller.deleteUser);
+        protectedScope.post('/users/:id/impersonate', controller.impersonate);
+        protectedScope.get('/analytics/revenue', controller.getRevenueAnalytics);
+
+
         
         // Monitors & Agents Management
         protectedScope.get('/monitors', controller.getMonitors);
@@ -30,6 +34,12 @@ async function adminRoutes(fastify, options) {
         protectedScope.get('/agents', controller.getAgents);
         protectedScope.delete('/agents/:id', controller.deleteAgent);
         
+        // Blogs Management
+        protectedScope.get('/blogs', controller.getBlogs);
+        protectedScope.post('/blogs', controller.createBlog);
+        protectedScope.put('/blogs/:id', controller.updateBlog);
+        protectedScope.delete('/blogs/:id', controller.deleteBlog);
+
         // Logs
         protectedScope.get('/logs', controller.getSystemLogs);
     });

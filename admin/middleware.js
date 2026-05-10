@@ -1,22 +1,13 @@
 /**
  * Admin Authentication Middleware
- * Validates admin token.
+ * Upgraded to use JWT with expiration.
  */
-const crypto = require('crypto');
 
-const ADMIN_SECRET = process.env.ADMIN_SECRET || 'monitorhub_admin_secret_key_2026';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'Rajkumarrathi@gmail.com';
 
-// Stateless token generation for reliability across process restarts
-function generateAdminToken() {
-    return crypto.createHmac('sha256', ADMIN_SECRET).update(ADMIN_PASSWORD).digest('hex');
-}
-
-function revokeAdminToken(token) {
-    // In a fully stateless setup with a single token, we can't truly revoke it without changing the password.
-    // This is acceptable for a single-admin upgrade task.
-}
-
+/**
+ * Validates the admin JWT token
+ */
 async function requireAdminAuth(request, reply) {
     const authHeader = request.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -25,18 +16,31 @@ async function requireAdminAuth(request, reply) {
 
     const token = authHeader.split('Bearer ')[1];
 
-    const expectedToken = generateAdminToken();
+    try {
+        const decoded = await request.jwtVerify();
+        
+        if (!decoded.isAdmin) {
+            return reply.status(403).send({ error: 'Access denied: Requires admin privileges' });
+        }
 
-    if (token !== expectedToken) {
-        return reply.status(401).send({ error: 'Invalid or expired admin token' });
+        request.isAdmin = true;
+    } catch (err) {
+        request.log.error('Admin JWT verification failed:', err.message);
+        return reply.status(401).send({ error: 'Invalid or expired admin session' });
     }
+}
 
-    request.isAdmin = true;
+/**
+ * Revoke token logic (Stub for now, as JWT is stateless)
+ */
+function revokeAdminToken(token) {
+    // In a stateless JWT setup, we would typically use a blocklist in Redis.
+    // For single-admin use, letting the token expire is sufficient.
 }
 
 module.exports = {
     requireAdminAuth,
-    generateAdminToken,
     revokeAdminToken,
     ADMIN_PASSWORD
 };
+

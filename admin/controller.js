@@ -1,7 +1,11 @@
 /**
  * Admin Controller
  */
-const { generateAdminToken, revokeAdminToken, ADMIN_PASSWORD } = require('./middleware');
+const { revokeAdminToken, ADMIN_PASSWORD } = require('./middleware');
+const { PLAN_TIERS } = require('../../core/billing/tiers');
+const auditService = require('../../core/admin/auditService');
+
+
 
 const login = async (request, reply) => {
     const { password } = request.body;
@@ -10,8 +14,17 @@ const login = async (request, reply) => {
         return reply.status(401).send({ error: 'Invalid admin credentials' });
     }
     
-    const token = generateAdminToken();
+    // Issue a JWT token valid for 12 hours
+    const token = await reply.jwtSign({ 
+        isAdmin: true, 
+        email: ADMIN_PASSWORD, // Using the email/identifier from config
+        role: 'superadmin'
+    }, { 
+        expiresIn: '12h' 
+    });
+
     return reply.send({ success: true, token });
+
 };
 
 const logout = async (request, reply) => {
@@ -138,10 +151,26 @@ const updateUser = async (request, reply) => {
         const { id } = request.params;
         const { tier, role } = request.body;
         
+        const oldUserRes = await db.query('SELECT tier, role FROM users WHERE id = $1', [id]);
+        const oldUser = oldUserRes.rows[0];
+
         await db.query(
-            'UPDATE users SET tier = COALESCE($1, tier), role = COALESCE($2, role), updated_at = NOW() WHERE id = $3',
+            'UPDATE users SET tier = COALESCE($1, tier), role = COALESCE($2, role) WHERE id = $3',
             [tier, role, id]
         );
+
+        // Audit Log
+        await auditService.logAction(db, {
+            adminId: request.user?.id, // Assuming request.user is populated if admin is a user too
+            action: 'USER_UPDATE',
+            entityType: 'user',
+            entityId: id,
+            oldValue: oldUser,
+            newValue: { tier, role },
+            ipAddress: request.ip,
+            userAgent: request.headers['user-agent']
+        });
+
         
         return reply.send({ success: true, message: 'User updated successfully' });
     } catch (err) {
@@ -155,8 +184,23 @@ const deleteUser = async (request, reply) => {
         const db = request.server.db;
         const { id } = request.params;
         
+        const userRes = await db.query('SELECT email FROM users WHERE id = $1', [id]);
+        const userEmail = userRes.rows[0]?.email;
+
         // Due to foreign keys with CASCADE, deleting a user deletes their monitors, alerts, etc.
         await db.query('DELETE FROM users WHERE id = $1', [id]);
+        
+        // Audit Log
+        await auditService.logAction(db, {
+            adminId: request.user?.id,
+            action: 'USER_DELETE',
+            entityType: 'user',
+            entityId: id,
+            oldValue: { email: userEmail },
+            ipAddress: request.ip,
+            userAgent: request.headers['user-agent']
+        });
+
         
         return reply.send({ success: true, message: 'User deleted successfully' });
     } catch (err) {
@@ -164,6 +208,51 @@ const deleteUser = async (request, reply) => {
         return reply.status(500).send({ error: 'Failed to delete user' });
     }
 };
+
+const impersonate = async (request, reply) => {
+    try {
+        const db = request.server.db;
+        const { id } = request.params;
+
+        // 1. Verify target user exists
+        const userRes = await db.query('SELECT id, email FROM users WHERE id = $1', [id]);
+        if (userRes.rows.length === 0) {
+            return reply.status(404).send({ error: 'Target user not found' });
+        }
+        const user = userRes.rows[0];
+
+        // 2. Generate Impersonation Token (1 hour expiry)
+        const token = await reply.jwtSign({
+            impersonation: true,
+            targetUserId: user.id,
+            adminId: request.user?.id || 'admin',
+            role: 'customer' // The role they will act as
+        }, {
+            expiresIn: '1h'
+        });
+
+        // 3. Audit Log
+        await auditService.logAction(db, {
+            adminId: request.user?.id || 'admin',
+            userId: user.id,
+            action: 'USER_IMPERSONATION_START',
+            entityType: 'user',
+            entityId: user.id,
+            ipAddress: request.ip,
+            userAgent: request.headers['user-agent']
+        });
+
+        return reply.send({
+            success: true,
+            token,
+            redirect: '/dashboard'
+        });
+    } catch (err) {
+        request.log.error('Admin Impersonate Error:', err);
+        return reply.status(500).send({ error: 'Failed to generate impersonation session' });
+    }
+};
+
 
 const getMonitors = async (request, reply) => {
     try {
@@ -218,10 +307,10 @@ const getAgents = async (request, reply) => {
         const offset = (page - 1) * limit;
         
         const query = `
-            SELECT a.id, a.name, a.status, a.hostname, a.public_ip, a.os, a.last_seen, a.created_at, u.email as user_email 
+            SELECT a.id, a.name, a.status, a.last_seen, u.email as user_email 
             FROM agents a
             JOIN users u ON a.user_id = u.id
-            ORDER BY a.created_at DESC LIMIT $1 OFFSET $2
+            ORDER BY a.id DESC LIMIT $1 OFFSET $2
         `;
         const countQuery = 'SELECT COUNT(*) as total FROM agents';
         
@@ -265,7 +354,93 @@ const deleteAgent = async (request, reply) => {
     }
 };
 
+const getRevenueAnalytics = async (request, reply) => {
+    try {
+        const db = request.server.db;
+
+        // 1. Calculate MRR (Monthly Recurring Revenue) based on current active tiers
+        const userTiersRes = await db.query(`
+            SELECT tier, COUNT(*) as count 
+            FROM users 
+            WHERE tier != 'free' 
+              AND (plan_expiry > NOW() OR subscription_id IS NOT NULL)
+            GROUP BY tier
+        `);
+
+        let mrr = 0;
+        const mrrByTier = {};
+        userTiersRes.rows.forEach(row => {
+            const plan = PLAN_TIERS[row.tier];
+            if (plan) {
+                const tierMrr = (plan.priceUSD || 0) * parseInt(row.count);
+                mrr += tierMrr;
+                mrrByTier[row.tier] = {
+                    count: parseInt(row.count),
+                    mrr: tierMrr
+                };
+            }
+        });
+
+        // 2. Transaction Totals
+        const statsRes = await db.query(`
+            SELECT 
+                COUNT(*) as total_tx,
+                SUM(CASE WHEN status = 'paid' THEN amount ELSE 0 END) as total_revenue,
+                COUNT(CASE WHEN status = 'paid' THEN 1 END) as paid_count,
+                COUNT(CASE WHEN status = 'failed' THEN 1 END) as failed_count,
+                SUM(CASE WHEN status = 'paid' AND created_at > NOW() - INTERVAL '30 days' THEN amount ELSE 0 END) as monthly_revenue
+            FROM transactions
+        `);
+        const stats = statsRes.rows[0];
+
+        // 3. Revenue Trend (Last 7 days)
+        const trendRes = await db.query(`
+            SELECT 
+                DATE(created_at) as date,
+                SUM(amount) as daily_revenue
+            FROM transactions
+            WHERE status = 'paid' AND created_at > NOW() - INTERVAL '7 days'
+            GROUP BY DATE(created_at)
+            ORDER BY DATE(created_at) ASC
+        `);
+
+        // 4. Recent Transactions
+        const recentRes = await db.query(`
+            SELECT t.*, u.email 
+            FROM transactions t
+            JOIN users u ON t.user_id = u.id
+            ORDER BY t.created_at DESC
+            LIMIT 10
+        `);
+
+        return reply.send({
+            mrr,
+            mrrByTier,
+            totalRevenue: parseInt(stats.total_revenue) / 100, // Cents to USD
+            monthlyRevenue: parseInt(stats.monthly_revenue) / 100,
+            transactionHealth: {
+                total: parseInt(stats.total_tx),
+                paid: parseInt(stats.paid_count),
+                failed: parseInt(stats.failed_count),
+                successRate: stats.total_tx > 0 ? (parseInt(stats.paid_count) / parseInt(stats.total_tx)) * 100 : 0
+            },
+            revenueTrend: trendRes.rows.map(r => ({
+                date: r.date,
+                revenue: parseInt(r.daily_revenue) / 100
+            })),
+            recentTransactions: recentRes.rows.map(r => ({
+                ...r,
+                amount: parseInt(r.amount) / 100
+            }))
+        });
+    } catch (err) {
+        request.log.error('Admin Revenue Analytics Error:', err);
+        return reply.status(500).send({ error: 'Failed to fetch revenue analytics' });
+    }
+};
+
 const getSystemLogs = async (request, reply) => {
+
     // A simplified system logs endpoint fetching recent incidents or alerts for the dashboard activity feed
     try {
         const db = request.server.db;
@@ -285,6 +460,65 @@ const getSystemLogs = async (request, reply) => {
 };
 
 
+const getBlogs = async (request, reply) => {
+    try {
+        const db = request.server.db;
+        const res = await db.query('SELECT * FROM blogs ORDER BY published_at DESC');
+        return reply.send({ success: true, blogs: res.rows });
+    } catch (err) {
+        request.log.error('Admin Get Blogs Error:', err);
+        return reply.status(500).send({ error: 'Failed to fetch blogs' });
+    }
+};
+
+const createBlog = async (request, reply) => {
+    try {
+        const db = request.server.db;
+        const { slug, title, excerpt, content, category, cover_image, author_name, author_role, author_image } = request.body;
+        
+        await db.query(`
+            INSERT INTO blogs (slug, title, excerpt, content, category, cover_image, author_name, author_role, author_image)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        `, [slug, title, excerpt, content, category, cover_image, author_name, author_role, author_image]);
+        
+        return reply.send({ success: true, message: 'Blog created successfully' });
+    } catch (err) {
+        request.log.error('Admin Create Blog Error:', err);
+        return reply.status(500).send({ error: 'Failed to create blog' });
+    }
+};
+
+const updateBlog = async (request, reply) => {
+    try {
+        const db = request.server.db;
+        const { id } = request.params;
+        const { title, excerpt, content, category, cover_image, author_name, author_role, author_image } = request.body;
+        
+        await db.query(`
+            UPDATE blogs 
+            SET title=$1, excerpt=$2, content=$3, category=$4, cover_image=$5, author_name=$6, author_role=$7, author_image=$8
+            WHERE id=$9
+        `, [title, excerpt, content, category, cover_image, author_name, author_role, author_image, id]);
+        
+        return reply.send({ success: true, message: 'Blog updated successfully' });
+    } catch (err) {
+        request.log.error('Admin Update Blog Error:', err);
+        return reply.status(500).send({ error: 'Failed to update blog' });
+    }
+};
+
+const deleteBlog = async (request, reply) => {
+    try {
+        const db = request.server.db;
+        const { id } = request.params;
+        await db.query('DELETE FROM blogs WHERE id = $1', [id]);
+        return reply.send({ success: true, message: 'Blog deleted successfully' });
+    } catch (err) {
+        request.log.error('Admin Delete Blog Error:', err);
+        return reply.status(500).send({ error: 'Failed to delete blog' });
+    }
+};
+
 module.exports = {
     login,
     logout,
@@ -297,5 +531,13 @@ module.exports = {
     getAgents,
     deleteMonitor,
     deleteAgent,
-    getSystemLogs
+    getSystemLogs,
+    impersonate,
+    getRevenueAnalytics,
+    getBlogs,
+    createBlog,
+    updateBlog,
+    deleteBlog
 };
+
+
