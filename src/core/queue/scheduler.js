@@ -54,9 +54,15 @@ async function unscheduleMonitor(monitorId) {
 async function syncMonitors() {
     console.log('[Scheduler] Starting monitor synchronization...');
     try {
-        // 1. Fetch all monitors from DB
+        const planService = require('../billing/planService');
+
+        // 1. Fetch all active (non-paused) monitors with user tier info
         const res = await pool.query(
-            'SELECT id, type, target, interval_seconds FROM monitors'
+            `SELECT m.id, m.type, m.target, m.interval_seconds, m.status,
+                    u.tier, u.plan_expiry
+             FROM monitors m
+             JOIN users u ON m.user_id = u.id
+             WHERE m.status != 'paused'`
         );
         const dbMonitors = res.rows;
         
@@ -64,11 +70,23 @@ async function syncMonitors() {
         const repeatableJobs = await monitorQueue.getRepeatableJobs();
         const activeJobIds = new Set(repeatableJobs.map(j => j.id));
 
-        console.log(`[Scheduler] Found ${dbMonitors.length} monitors in DB and ${activeJobIds.size} jobs in Queue`);
+        console.log(`[Scheduler] Found ${dbMonitors.length} active monitors in DB and ${activeJobIds.size} jobs in Queue`);
 
         let syncCount = 0;
         for (const monitor of dbMonitors) {
             const expectedJobId = `monitor-${monitor.id}`;
+
+            // Enforce tier-based interval minimum during sync
+            const tierConfig = planService.getEffectiveTier({ tier: monitor.tier, plan_expiry: monitor.plan_expiry });
+            const minAllowed = tierConfig.minInterval || 300;
+            const effectiveInterval = Math.max(monitor.interval_seconds, minAllowed);
+
+            // If DB interval needs correction, update it
+            if (effectiveInterval !== monitor.interval_seconds) {
+                console.log(`[Scheduler] Correcting interval for monitor ${monitor.id}: ${monitor.interval_seconds}s → ${effectiveInterval}s (tier: ${tierConfig.id})`);
+                await pool.query('UPDATE monitors SET interval_seconds = $1 WHERE id = $2', [effectiveInterval, monitor.id]);
+                monitor.interval_seconds = effectiveInterval;
+            }
             
             // Check if it's already in the queue with the CORRECT interval
             const existingJob = repeatableJobs.find(j => j.id === expectedJobId);
@@ -86,11 +104,11 @@ async function syncMonitors() {
             }
         }
 
-        // 3. (Optional) Cleanup jobs that don't exist in DB
-        const dbIds = new Set(dbMonitors.map(m => `monitor-${m.id}`));
+        // 3. Cleanup jobs that don't exist in DB or are paused
+        const activeDbIds = new Set(dbMonitors.map(m => `monitor-${m.id}`));
         for (const job of repeatableJobs) {
-            if (!dbIds.has(job.id)) {
-                console.log(`[Scheduler] Cleaning up orphaned job in queue: ${job.id}`);
+            if (!activeDbIds.has(job.id)) {
+                console.log(`[Scheduler] Cleaning up orphaned/paused job in queue: ${job.id}`);
                 await monitorQueue.removeRepeatableByKey(job.key);
             }
         }

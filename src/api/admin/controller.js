@@ -460,6 +460,65 @@ const getSystemLogs = async (request, reply) => {
 };
 
 
+const getBlogs = async (request, reply) => {
+    try {
+        const db = request.server.db;
+        const res = await db.query('SELECT * FROM blogs ORDER BY published_at DESC');
+        return reply.send({ success: true, blogs: res.rows });
+    } catch (err) {
+        request.log.error('Admin Get Blogs Error:', err);
+        return reply.status(500).send({ error: 'Failed to fetch blogs' });
+    }
+};
+
+const createBlog = async (request, reply) => {
+    try {
+        const db = request.server.db;
+        const { slug, title, excerpt, content, category, cover_image, author_name, author_role, author_image } = request.body;
+        
+        await db.query(`
+            INSERT INTO blogs (slug, title, excerpt, content, category, cover_image, author_name, author_role, author_image)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        `, [slug, title, excerpt, content, category, cover_image, author_name, author_role, author_image]);
+        
+        return reply.send({ success: true, message: 'Blog created successfully' });
+    } catch (err) {
+        request.log.error('Admin Create Blog Error:', err);
+        return reply.status(500).send({ error: 'Failed to create blog' });
+    }
+};
+
+const updateBlog = async (request, reply) => {
+    try {
+        const db = request.server.db;
+        const { id } = request.params;
+        const { title, excerpt, content, category, cover_image, author_name, author_role, author_image } = request.body;
+        
+        await db.query(`
+            UPDATE blogs 
+            SET title=$1, excerpt=$2, content=$3, category=$4, cover_image=$5, author_name=$6, author_role=$7, author_image=$8
+            WHERE id=$9
+        `, [title, excerpt, content, category, cover_image, author_name, author_role, author_image, id]);
+        
+        return reply.send({ success: true, message: 'Blog updated successfully' });
+    } catch (err) {
+        request.log.error('Admin Update Blog Error:', err);
+        return reply.status(500).send({ error: 'Failed to update blog' });
+    }
+};
+
+const deleteBlog = async (request, reply) => {
+    try {
+        const db = request.server.db;
+        const { id } = request.params;
+        await db.query('DELETE FROM blogs WHERE id = $1', [id]);
+        return reply.send({ success: true, message: 'Blog deleted successfully' });
+    } catch (err) {
+        request.log.error('Admin Delete Blog Error:', err);
+        return reply.status(500).send({ error: 'Failed to delete blog' });
+    }
+};
+
 module.exports = {
     login,
     logout,
@@ -474,7 +533,11 @@ module.exports = {
     deleteAgent,
     getSystemLogs,
     impersonate,
-    getRevenueAnalytics
+    getRevenueAnalytics,
+    getBlogs,
+    createBlog,
+    updateBlog,
+    deleteBlog
 };
 
 

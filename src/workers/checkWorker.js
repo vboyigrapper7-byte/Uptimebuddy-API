@@ -88,6 +88,16 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
         }
     }
 
+    // ── 1b. Interval Enforcement Guard ─────────────────────────────────────
+    // If the user's plan has changed (e.g. expired), correct the interval at runtime
+    const minAllowedInterval = tierConfig.minInterval || 300;
+    if (monitor.interval_seconds < minAllowedInterval) {
+        logger.info(`[CheckWorker] Monitor ${monitorId} interval (${monitor.interval_seconds}s) below tier minimum (${minAllowedInterval}s). Correcting...`);
+        await pool.query('UPDATE monitors SET interval_seconds = $1 WHERE id = $2', [minAllowedInterval, monitorId]);
+        // The scheduler sync will pick up the corrected interval on next cycle
+        return;
+    }
+
     const startTime = Date.now();
     let status       = 'down';
     let errorMessage = null;
