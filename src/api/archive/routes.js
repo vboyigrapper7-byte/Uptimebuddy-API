@@ -1,5 +1,5 @@
 const { getSettings, updateSettings, getHistory, downloadArchive, triggerManualArchive } = require('./controllers/archiveController');
-const { requireAuth } = require('../auth/middleware/authMiddleware');
+const { requireAuth } = require('../auth/middleware');
 
 async function archiveRoutes(fastify, options) {
     // All archive routes require authentication
