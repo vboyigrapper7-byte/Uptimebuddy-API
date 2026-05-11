@@ -8,8 +8,11 @@ const Fastify = require('fastify');
 const cors    = require('@fastify/cors');
 const rateLimit = require('@fastify/rate-limit');
 const helmet = require('@fastify/helmet');
+const jwt = require('@fastify/jwt');
 const winston = require('winston');
+
 const axios = require('axios');
+const fastifyWebsocket = require('@fastify/websocket');
 
 const logger = winston.createLogger({
     level: process.env.LOG_LEVEL || 'info',
@@ -35,7 +38,11 @@ const getRoutesAndServices = () => {
         teamRoutes: require('./api/teams/routes'),
         auditRoutes: require('./api/audit/routes'),
         alertRoutes: require('./api/alerts/routes'),
-        pool: require('./core/db/pool')
+        adminRoutes: require('./api/admin/routes'),
+        archiveRoutes: require('./api/archive/routes'),
+        pool: require('./core/db/pool'),
+        scheduler: require('./core/queue/scheduler'),
+        statsWorker: require('./workers/statsWorker')
     };
 };
 
@@ -45,9 +52,40 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://monitorhubs.com';
 const buildServer = async () => {
     // ── Pre-boot Initialization ───────────────────────────────────────────
     // Must happen FIRST so variables like 'pool' are available to decorators
-    const { authRoutes, agentRoutes, monitorRoutes, webhookRoutes, publicRoutes, billingRoutes, teamRoutes, auditRoutes, alertRoutes, pool } = getRoutesAndServices();
+    const { authRoutes, agentRoutes, monitorRoutes, webhookRoutes, publicRoutes, billingRoutes, teamRoutes, auditRoutes, alertRoutes, adminRoutes, archiveRoutes, pool } = getRoutesAndServices();
+
+    // ── Database Initialization (Metrics Index & Agent Distribution) ────
+    try {
+        await pool.query('CREATE INDEX IF NOT EXISTS idx_agent_metrics_recorded_at ON agent_metrics(recorded_at)');
+        
+        // Ensure distribution tables exist
+        await pool.query(`CREATE TABLE IF NOT EXISTS agent_releases (id SERIAL PRIMARY KEY, version VARCHAR(50) UNIQUE NOT NULL, is_stable BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT NOW())`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS agent_binaries (id SERIAL PRIMARY KEY, release_id INT REFERENCES agent_releases(id) ON DELETE CASCADE, os VARCHAR(20), arch VARCHAR(20), file_path TEXT NOT NULL, sha256 VARCHAR(64), created_at TIMESTAMP DEFAULT NOW())`);
+        
+        // Auto-patch missing columns for older databases
+        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS status_slug VARCHAR(50)`);
+        await pool.query(`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS agent_id INT`);
+        await pool.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_type VARCHAR(50) DEFAULT 'node'`);
+        
+        // Auto-patch missing tables for older databases
+        await pool.query(`CREATE TABLE IF NOT EXISTS monitor_stats (monitor_id INT PRIMARY KEY REFERENCES monitors(id) ON DELETE CASCADE, uptime_24h NUMERIC(5,2) DEFAULT 100.00, avg_latency_24h INTEGER DEFAULT 0, last_updated_at TIMESTAMP DEFAULT NOW())`);
+        
+        // Seed initial stable release if missing
+        await pool.query(`INSERT INTO agent_releases (version, is_stable) VALUES ('1.1.0', true) ON CONFLICT (version) DO UPDATE SET is_stable = true`);
+        const rel = await pool.query("SELECT id FROM agent_releases WHERE version = '1.1.0'");
+        const relId = rel.rows[0].id;
+        
+        // Ensure binary records exist
+        await pool.query(`INSERT INTO agent_binaries (release_id, os, arch, file_path) VALUES ($1, 'windows', 'amd64', 'internal') ON CONFLICT DO NOTHING`, [relId]);
+        await pool.query(`INSERT INTO agent_binaries (release_id, os, arch, file_path) VALUES ($1, 'windows', '386', 'internal') ON CONFLICT DO NOTHING`, [relId]);
+        
+        logger.info('[DB] Initialization: Metrics index & Agent Distribution verified.');
+    } catch (dbInitErr) {
+        logger.error(`[DB] Initialization Error: ${dbInitErr.message}`);
+    }
 
     const server = Fastify({
+        ignoreTrailingSlash: true,
         logger: {
             level: process.env.LOG_LEVEL || 'info',
             transport: process.env.NODE_ENV !== 'production'
@@ -61,6 +99,11 @@ const buildServer = async () => {
         global: true,
         contentSecurityPolicy: process.env.NODE_ENV === 'production'
     });
+
+    await server.register(jwt, {
+        secret: process.env.JWT_SECRET || 'super_secret_key_123_monitorhub_2026'
+    });
+
 
     server.setErrorHandler((error, request, reply) => {
         logger.error(`[Fatal Server Error] ${request.method} ${request.url}`, { 
@@ -104,6 +147,35 @@ const buildServer = async () => {
     // ── DB decorator ─────────────────────────────────────────────────────
     server.decorate('db', {
         query: (text, params) => pool.query(text, params),
+    });
+
+    // ── WebSocket Support & Real-time Broadcast ──────────────────────────
+    await server.register(fastifyWebsocket);
+    
+    server.decorate('broadcast', (data) => {
+        const message = JSON.stringify(data);
+        for (const client of server.websocketServer.clients) {
+            if (client.readyState === 1) { // Open
+                client.send(message);
+            }
+        }
+    });
+
+    // ── Redis Pub/Sub Subscriber (Cross-process Real-time Sync) ───────────
+    const { makeRedisConnection } = require('./core/queue/setup');
+    const subscriber = makeRedisConnection();
+    
+    subscriber.subscribe('agent-updates', (err) => {
+        if (err) logger.error(`[Redis PubSub] Subscription error: ${err.message}`);
+    });
+
+    subscriber.on('message', (channel, message) => {
+        try {
+            const data = JSON.parse(message);
+            server.broadcast(data);
+        } catch (e) {
+            logger.warn(`[Redis PubSub] Failed to parse message: ${message}`);
+        }
     });
 
     // ── Health check (Diagnostic Tool) ──────────────────────────────────
@@ -153,6 +225,14 @@ const buildServer = async () => {
     server.register(teamRoutes,    { prefix: '/api/v1/teams' });
     server.register(auditRoutes,   { prefix: '/api/v1/audit' });
     server.register(alertRoutes,   { prefix: '/api/v1/alerts' });
+    server.register(adminRoutes,   { prefix: '/api/v1/admin' });
+    server.register(archiveRoutes, { prefix: '/api/v1/archive' });
+    
+    // ── Post-boot Initialization ─────────────────────────────────────────
+    // Sync monitors with queue after server starts (non-blocking)
+    const { scheduler, statsWorker } = getRoutesAndServices();
+    scheduler.syncMonitors().catch(err => logger.error(`[Startup] syncMonitors failed: ${err.message}`));
+    statsWorker.computeMonitorStats().catch(err => logger.error(`[Startup] computeMonitorStats failed: ${err.message}`));
 
     return server;
 };
