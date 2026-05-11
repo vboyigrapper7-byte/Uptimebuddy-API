@@ -100,7 +100,9 @@ async function enforceRetention() {
                 `UPDATE monitor_metrics mm
                  SET deletion_scheduled_at = NOW()
                  FROM monitors m JOIN users u ON m.user_id = u.id
+                 LEFT JOIN archive_settings as_settings ON u.id = as_settings.user_id
                  WHERE mm.monitor_id = m.id AND u.tier = $1
+                 AND (as_settings.auto_archive IS NULL OR as_settings.auto_archive = false)
                  AND mm.recorded_at < NOW() - INTERVAL '${days} days'
                  AND mm.deletion_scheduled_at IS NULL`,
                 [tierKey]
@@ -110,12 +112,68 @@ async function enforceRetention() {
                 `UPDATE agent_metrics am
                  SET deletion_scheduled_at = NOW()
                  FROM agents a JOIN users u ON a.user_id = u.id
+                 LEFT JOIN archive_settings as_settings ON u.id = as_settings.user_id
                  WHERE am.agent_id = a.id AND u.tier = $1
+                 AND (as_settings.auto_archive IS NULL OR as_settings.auto_archive = false)
                  AND am.recorded_at < NOW() - INTERVAL '${days} days'
                  AND am.deletion_scheduled_at IS NULL`,
                 [tierKey]
             );
             softPurgeCount += (monitorRes.rowCount + agentRes.rowCount);
+
+            const archiveUsersRes = await client.query(
+                `SELECT u.id, as_settings.* 
+                 FROM users u 
+                 JOIN archive_settings as_settings ON u.id = as_settings.user_id
+                 WHERE u.tier = $1 AND as_settings.auto_archive = true AND as_settings.credentials_encrypted IS NOT NULL`,
+                [tierKey]
+            );
+            
+            const { archiveQueue } = require('../core/queue/setup');
+            
+            for (const row of archiveUsersRes.rows) {
+                const userDays = row.retention_days || days;
+                const thresholdDate = new Date();
+                thresholdDate.setDate(thresholdDate.getDate() - userDays);
+                
+                const monitorMetricsCheck = await client.query(
+                    `SELECT 1 FROM monitor_metrics mm JOIN monitors m ON mm.monitor_id = m.id 
+                     WHERE m.user_id = $1 AND mm.recorded_at < $2 LIMIT 1`,
+                    [row.id, thresholdDate]
+                );
+                if (monitorMetricsCheck.rowCount > 0) {
+                    const archRes = await client.query(
+                        `INSERT INTO archives (user_id, data_type, provider, status) VALUES ($1, $2, $3, $4) RETURNING id`,
+                        [row.id, 'monitor_metrics', row.provider, 'pending']
+                    );
+                    await archiveQueue.add('archive-monitor-metrics', {
+                        archiveId: archRes.rows[0].id,
+                        userId: row.id,
+                        dataType: 'monitor_metrics',
+                        settings: row,
+                        dateThreshold: thresholdDate
+                    });
+                }
+
+                const agentMetricsCheck = await client.query(
+                    `SELECT 1 FROM agent_metrics am JOIN agents a ON am.agent_id = a.id 
+                     WHERE a.user_id = $1 AND am.recorded_at < $2 LIMIT 1`,
+                    [row.id, thresholdDate]
+                );
+                if (agentMetricsCheck.rowCount > 0) {
+                    const archRes = await client.query(
+                        `INSERT INTO archives (user_id, data_type, provider, status) VALUES ($1, $2, $3, $4) RETURNING id`,
+                        [row.id, 'agent_metrics', row.provider, 'pending']
+                    );
+                    await archiveQueue.add('archive-agent-metrics', {
+                        archiveId: archRes.rows[0].id,
+                        userId: row.id,
+                        dataType: 'agent_metrics',
+                        settings: row,
+                        dateThreshold: thresholdDate
+                    });
+                }
+            }
         }
 
         await client.query('COMMIT');

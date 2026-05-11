@@ -300,4 +300,33 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_version VARCHAR(20);
 ALTER TABLE monitor_metrics ADD COLUMN IF NOT EXISTS status_code INT;
 ALTER TABLE monitor_metrics ADD COLUMN IF NOT EXISTS error_message TEXT;
 
+-- ── Archival System (Cold Storage) ──────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS archive_settings (
+    user_id           INT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    provider          VARCHAR(50) NOT NULL DEFAULT 's3',
+    credentials_encrypted TEXT,
+    retention_days    INT DEFAULT 30,
+    auto_archive      BOOLEAN DEFAULT FALSE,
+    compression_enabled BOOLEAN DEFAULT TRUE,
+    encryption_enabled  BOOLEAN DEFAULT FALSE,
+    encryption_key_encrypted TEXT,
+    updated_at        TIMESTAMP DEFAULT NOW()
+);
 
+CREATE TABLE IF NOT EXISTS archives (
+    id               SERIAL PRIMARY KEY,
+    user_id          INT REFERENCES users(id) ON DELETE CASCADE,
+    data_type        VARCHAR(50) NOT NULL,
+    file_name        VARCHAR(255),
+    provider         VARCHAR(50) NOT NULL,
+    file_size_bytes  BIGINT,
+    record_count     INT,
+    status           VARCHAR(50) DEFAULT 'pending',
+    provider_file_id VARCHAR(255),
+    checksum         VARCHAR(100),
+    created_at       TIMESTAMP DEFAULT NOW(),
+    verified_at      TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_archives_user_id ON archives(user_id);
+CREATE INDEX IF NOT EXISTS idx_archives_status ON archives(status);

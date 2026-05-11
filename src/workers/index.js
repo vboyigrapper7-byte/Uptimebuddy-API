@@ -12,6 +12,7 @@ require('./retentionWorker');
 require('./statsWorker');
 require('./reminderWorker');
 require('./agentWorker');
+require('./archiveWorker');
 
 const { syncMonitors } = require('../core/queue/scheduler');
 const { retentionQueue, statsQueue, reminderQueue, agentQueue } = require('../core/queue/setup');

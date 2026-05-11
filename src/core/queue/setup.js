@@ -47,21 +47,24 @@ const jobOptions = {
     removeOnFail: { count: 200 }
 };
 
-const monitorQueue   = new Queue('monitor-checks',  { connection: redisConnection, defaultJobOptions: jobOptions });
-const alertQueue     = new Queue('alert-webhooks',  { connection: redisConnection, defaultJobOptions: jobOptions });
+const monitorQueue = new Queue('monitor-checks', { connection: redisConnection, defaultJobOptions: jobOptions });
+const alertQueue = new Queue('alert-webhooks', { connection: redisConnection, defaultJobOptions: jobOptions });
 const retentionQueue = new Queue('retention-tasks', { connection: redisConnection, defaultJobOptions: jobOptions });
-const statsQueue     = new Queue('stats-tasks',     { connection: redisConnection, defaultJobOptions: jobOptions });
-const reminderQueue  = new Queue('reminder-checks',  { connection: redisConnection, defaultJobOptions: jobOptions });
-const agentQueue     = new Queue('agent-tasks',     { connection: redisConnection, defaultJobOptions: jobOptions });
+const statsQueue = new Queue('stats-tasks', { connection: redisConnection, defaultJobOptions: jobOptions });
+const reminderQueue = new Queue('reminder-checks', { connection: redisConnection, defaultJobOptions: jobOptions });
+const agentQueue = new Queue('agent-tasks', { connection: redisConnection, defaultJobOptions: jobOptions });
 
-module.exports = { 
-    redisConnection, 
-    workerRedisConnection, 
+const archiveQueue = new Queue('archive-tasks', { connection: redisConnection, defaultJobOptions: jobOptions });
+
+module.exports = {
+    redisConnection,
+    workerRedisConnection,
     makeRedisConnection,
-    monitorQueue, 
-    alertQueue, 
-    retentionQueue, 
-    statsQueue, 
+    monitorQueue,
+    alertQueue,
+    retentionQueue,
+    statsQueue,
     reminderQueue,
-    agentQueue
+    agentQueue,
+    archiveQueue
 };

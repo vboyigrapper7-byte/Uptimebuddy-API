@@ -410,6 +410,17 @@ async function agentRoutes(fastify, options) {
         }
     });
 
+    fastify.get('/scripts/linux', async (request, reply) => {
+        const scriptPath = path.resolve(__dirname, 'uptimebuddy-agent.py');
+        try {
+            const content = await fs.promises.readFile(scriptPath, 'utf-8');
+            return reply.type('text/plain').send(content);
+        } catch (err) {
+            fastify.log.error({ err, scriptPath }, 'Could not serve linux python agent');
+            return reply.status(500).send({ error: 'Agent script not available' });
+        }
+    });
+
     // ────────────────────────────────────────────────────────────────────
     // PUBLIC — Windows Native Service Installer Script
     // ────────────────────────────────────────────────────────────────────
