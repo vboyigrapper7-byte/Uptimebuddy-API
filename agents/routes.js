@@ -191,13 +191,13 @@ async function agentRoutes(fastify, options) {
                     (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
                     'windows', 'windows', 'amd64', 'amd64',
                     'src/api/agents/bin/windows/amd64/monitorhub-agent.exe',
-                    '3EBFD772D922EE26197BA257C0FAADE50B4F2721768CCC88CAB81A2911EF83D3'
+                    '90ED45B24B9A2AB8FDC317F0139776BEABBBE83DEC82315136020979A3131A03'
                 ),
                 (
                     (SELECT id FROM agent_releases WHERE version = '1.0.0' LIMIT 1),
                     'windows', 'windows', '386', '386',
                     'src/api/agents/bin/windows/386/monitorhub-agent.exe',
-                    '20A6904728F743CA5BB9CB2BF5CE3E61F10563C0CC2C66488ECF0169D413EE13'
+                    '0146713F867312A8304241BE7CFD9ED8AA4964AA6240850D2DA2EA9725583010'
                 )
                 ON CONFLICT ON CONSTRAINT unique_platform_arch_release DO UPDATE SET file_path = EXCLUDED.file_path;
             `);
@@ -281,25 +281,28 @@ async function agentRoutes(fastify, options) {
         }
 
         try {
-            // 1. Token Validation (Optimized with Cache)
-            let agent = tokenCache.get(agent_token);
-            if (!agent) {
-                const res = await fastify.db.query(
-                    'SELECT id, user_id, status, name FROM agents WHERE agent_token = $1',
-                    [agent_token]
-                );
-                if (res.rows.length === 0) return reply.status(404).send({ error: 'Agent not found' });
-                agent = res.rows[0];
-                tokenCache.set(agent_token, agent);
-            }
+            // 1. Token Validation (Always fetch from DB to detect status transitions correctly)
+            const res = await fastify.db.query(
+                'SELECT id, user_id, status, name, hostname FROM agents WHERE agent_token = $1',
+                [agent_token]
+            );
+            if (res.rows.length === 0) return reply.status(404).send({ error: 'Agent not found' });
+            const agent = res.rows[0];
 
             const agentId = agent.id;
             const userId  = agent.user_id;
             const prevStatus = agent.status;
+            
+            // Update cache so subsequent heartbeats know it's already 'up'
+            if (prevStatus !== 'up') {
+                agent.status = 'up';
+            }
+
             const hostnameRaw = request.body?.hostname || metrics?.hostname;
             const hostname = (hostnameRaw && hostnameRaw.trim()) ? hostnameRaw : null;
             const os_type  = request.body?.os_type || metrics?.os || null;
             const public_ip = request.ip;
+            const private_ip = metrics?.private_ip || null;
             const recordedAt = new Date();
 
             // 1.5 Update Agent State (CRITICAL: Update status FIRST for accuracy)
@@ -311,9 +314,10 @@ async function agentRoutes(fastify, options) {
                     agent_version = $3,
                     hostname = COALESCE($4, hostname),
                     os_type = COALESCE($5, os_type),
-                    public_ip = $6
+                    public_ip = $6,
+                    private_ip = COALESCE($7, private_ip)
                 WHERE id = $1`, 
-                [agentId, agent_type, agent_version, hostname, os_type, public_ip]
+                [agentId, agent_type, agent_version, hostname, os_type, public_ip, private_ip]
             );
 
             // Phase 3: Real-time broadcast via Redis Pub/Sub
@@ -355,15 +359,31 @@ async function agentRoutes(fastify, options) {
                 if (prevStatus === 'down' || prevStatus === 'pending') {
                     const teamRes = await fastify.db.query('SELECT team_id FROM team_members WHERE user_id = $1 LIMIT 1', [userId]);
                     const teamId = teamRes.rows[0]?.team_id;
-
-                    await fastify.db.query(
-                        'INSERT INTO alert_history (user_id, monitor_id, type, message, severity) VALUES ($1, $2, $3, $4, $5)',
-                        [userId, null, 'server_status', `[${agent.name}] System Online: Server is now UP and reporting telemetry.`, 'critical']
-                    ).catch(e => fastify.log.warn(`Alert history insert failed: ${e.message}`));
                     
                     if (teamId) {
                         await auditService.log(userId, teamId, 'server_recovered', { name: agent.name, id: agentId }).catch(e => fastify.log.warn(`Audit log failed: ${e.message}`));
                     }
+
+                    // Resolve the incident in DB
+                    fastify.db.query(
+                        'UPDATE incidents SET resolved_at = NOW() WHERE agent_id = $1 AND resolved_at IS NULL',
+                        [agentId]
+                    ).catch(e => fastify.log.error(`[AgentRoutes] Failed to resolve incident: ${e.message}`));
+
+                    const { alertQueue } = require('../../core/queue/setup');
+                    alertQueue.add(
+                        `alert-agent-up-${agentId}-${Date.now()}`,
+                        { 
+                            monitorId: agentId,
+                            isAgent: true,
+                            target: agent.name || hostname || 'Server Agent', 
+                            previousStatus: prevStatus, 
+                            newStatus: 'up', 
+                            errorMessage: null, 
+                            timestamp: new Date().toISOString() 
+                        },
+                        { removeOnComplete: { count: 100 } }
+                    ).catch(err => fastify.log.error('[AgentIngest] Failed to queue recovery alert', err));
                 }
             } catch (alertErr) {
                 fastify.log.warn({ error: alertErr.message }, 'Alert trigger skipped due to error (possibly missing tables)');
@@ -386,6 +406,17 @@ async function agentRoutes(fastify, options) {
             return reply.type('application/javascript').send(content);
         } catch (err) {
             fastify.log.error(err, 'Could not serve agent script');
+            return reply.status(500).send({ error: 'Agent script not available' });
+        }
+    });
+
+    fastify.get('/scripts/linux', async (request, reply) => {
+        const scriptPath = path.resolve(__dirname, 'uptimebuddy-agent.py');
+        try {
+            const content = await fs.promises.readFile(scriptPath, 'utf-8');
+            return reply.type('text/plain').send(content);
+        } catch (err) {
+            fastify.log.error({ err, scriptPath }, 'Could not serve linux python agent');
             return reply.status(500).send({ error: 'Agent script not available' });
         }
     });
@@ -808,36 +839,64 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
     });
 
     // ────────────────────────────────────────────────────────────────────
-    // Serve the actual Native Script Files
-    // ────────────────────────────────────────────────────────────────────
-    fastify.get('/scripts/windows', async (request, reply) => {
-        const scriptPath = path.resolve(__dirname, './bin/uptimebuddy-agent.ps1');
-        if (!fs.existsSync(scriptPath)) return reply.status(404).send('Agent script not found');
-        const content = await fs.promises.readFile(scriptPath, 'utf-8');
-        return reply.type('text/plain').send(content);
-    });
-
-    fastify.get('/scripts/linux', async (request, reply) => {
-        const scriptPath = path.resolve(__dirname, './bin/uptimebuddy-agent.py');
-        if (!fs.existsSync(scriptPath)) return reply.status(404).send('Agent script not found');
-        const content = await fs.promises.readFile(scriptPath, 'utf-8');
-        return reply.type('text/plain').send(content);
-    });
-
-    // ────────────────────────────────────────────────────────────────────
-    // PROFESSIONAL MSI DISTRIBUTION
+    // PROFESSIONAL MSI DISTRIBUTION (Zero-Config Token Extraction)
     // ────────────────────────────────────────────────────────────────────
     fastify.get('/install_windows.msi', async (request, reply) => {
         const { token } = request.query;
         
         try {
-            // Priority 1: Check Database (Harden for all column naming versions)
+            // Priority 1: Check Local Disk (This is where the new MSI is)
+            const searchPaths = [
+                path.resolve(__dirname, '../../../MonitorHubAgent.msi'), // Root of backend-ready
+                path.resolve(__dirname, '../../../../uptimebuddy-go-agent/MonitorHubAgent.msi'), // Dev location
+                path.resolve(__dirname, './bin/windows/amd64/MonitorHubAgent.msi') // Packaged location
+            ];
+
+            let msiPath = null;
+            for (const p of searchPaths) {
+                if (fs.existsSync(p)) {
+                    msiPath = p;
+                    break;
+                }
+            }
+
+            if (msiPath) {
+                // Feature: Rename file to include token and host/port so MSI can auto-extract it
+                let downloadName = 'MonitorHubAgent.msi';
+                if (token) {
+                    const hostUrlStr = process.env.PUBLIC_API_URL || `http://${request.headers.host}`;
+                    try {
+                        const urlObj = new URL(hostUrlStr);
+                        const host = urlObj.hostname;
+                        const port = urlObj.port;
+                        const protocol = urlObj.protocol.replace(':', ''); // 'http' or 'https'
+                        
+                        downloadName = `MonitorHubAgent_${token}`;
+                        if (host && host !== 'api.monitorhubs.com') {
+                            downloadName += `_sh_${host}`;
+                            if (port) downloadName += `_sp_${port}`;
+                            if (protocol) downloadName += `_pr_${protocol}`;
+                        }
+                        downloadName += '.msi';
+                    } catch (e) {
+                        downloadName = `MonitorHubAgent_${token}.msi`;
+                    }
+                }
+
+                return reply
+                    .type('application/octet-stream')
+                    .header('Content-Disposition', `attachment; filename="${downloadName}"`)
+                    .send(fs.createReadStream(msiPath));
+            }
+
+            // Priority 2: Check Database for a remote MSI link
             const res = await fastify.db.query(`
                 SELECT b.file_path 
                 FROM agent_binaries b
                 JOIN agent_releases r ON b.release_id = r.id
                 WHERE (b.platform = 'windows' OR b.os = 'windows') 
                   AND (b.architecture = 'amd64' OR b.arch = 'amd64')
+                  AND b.file_path LIKE '%.msi%'
                   AND r.is_stable = true
                 ORDER BY r.created_at DESC LIMIT 1
             `);
@@ -846,20 +905,12 @@ echo "[SUCCESS] Native MonitorHub Agent is now active!"
                 return reply.redirect(res.rows[0].file_path);
             }
 
-            // Priority 2: Check Local Disk (Legacy/Dev)
-            const msiPath = path.resolve(__dirname, '../../../MonitorHubAgent.msi');
-            if (fs.existsSync(msiPath)) {
-                return reply
-                    .type('application/octet-stream')
-                    .header('Content-Disposition', 'attachment; filename="MonitorHubAgent.msi"')
-                    .send(fs.createReadStream(msiPath));
-            }
-
             // Priority 3: Final Fallback to Professional .bat
             const hostUrl = process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
-            return reply.redirect(`${hostUrl}/api/v1/agents/install_v2.bat?token=${token}`);
+            const fallbackToken = token || 'YOUR_TOKEN_HERE';
+            return reply.redirect(`${hostUrl}/api/v1/agents/install_v2.bat?token=${fallbackToken}`);
         } catch (err) {
-            // On error, still try to fallback to .bat so the installation doesn't break
+            fastify.log.error(err, 'MSI download error');
             const hostUrl = process.env.PUBLIC_API_URL || 'https://api.monitorhubs.com';
             return reply.redirect(`${hostUrl}/api/v1/agents/install_v2.bat?token=${token}`);
         }
