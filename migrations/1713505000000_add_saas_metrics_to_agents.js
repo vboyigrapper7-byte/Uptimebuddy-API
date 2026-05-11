@@ -4,24 +4,24 @@ exports.shorthands = undefined;
 
 exports.up = (pgm) => {
   // 1. Add IP and Metadata columns to agents table
-  pgm.addColumns('agents', {
-    public_ip:       { type: 'varchar(45)',  notNull: false },
-    private_ip:      { type: 'varchar(45)',  notNull: false },
-    prev_public_ip:  { type: 'varchar(45)',  notNull: false },
-    prev_private_ip: { type: 'varchar(45)',  notNull: false },
-    ip_changed_at:   { type: 'timestamp',    notNull: false },
-    hostname:        { type: 'varchar(255)', notNull: false },
-    os_type:         { type: 'varchar(50)',  notNull: false },
-  });
+  pgm.sql(`
+    ALTER TABLE agents ADD COLUMN IF NOT EXISTS public_ip varchar(45);
+    ALTER TABLE agents ADD COLUMN IF NOT EXISTS private_ip varchar(45);
+    ALTER TABLE agents ADD COLUMN IF NOT EXISTS prev_public_ip varchar(45);
+    ALTER TABLE agents ADD COLUMN IF NOT EXISTS prev_private_ip varchar(45);
+    ALTER TABLE agents ADD COLUMN IF NOT EXISTS ip_changed_at timestamp;
+    ALTER TABLE agents ADD COLUMN IF NOT EXISTS hostname varchar(255);
+    ALTER TABLE agents ADD COLUMN IF NOT EXISTS os_type varchar(50);
+  `);
 
   // 2. Add detailed disk metrics to agent_metrics table
-  pgm.addColumns('agent_metrics', {
-    disk_total_gb: { type: 'numeric(10,2)', notNull: false },
-    disk_free_gb:  { type: 'numeric(10,2)', notNull: false },
-  });
+  pgm.sql(`
+    ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS disk_total_gb numeric(10,2);
+    ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS disk_free_gb numeric(10,2);
+  `);
 
   // 3. Create index for last_seen to optimize status lookups
-  pgm.createIndex('agents', 'last_seen', { name: 'idx_agents_last_seen' });
+  pgm.sql(`CREATE INDEX IF NOT EXISTS idx_agents_last_seen ON agents (last_seen);`);
 };
 
 exports.down = (pgm) => {

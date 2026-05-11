@@ -4,46 +4,55 @@ exports.shorthands = undefined;
 
 exports.up = (pgm) => {
   // 1. Table to track agent releases
-  pgm.createTable('agent_releases', {
-    id:                 'id',
-    version:            { type: 'varchar(50)',  notNull: true, unique: true },
-    is_stable:          { type: 'boolean',      notNull: true, default: true },
-    rollout_percentage: { type: 'integer',      notNull: true, default: 100 },
-    release_notes:      { type: 'text' },
-    created_at:         { type: 'timestamp',    notNull: true, default: pgm.func('current_timestamp') },
-  });
+  pgm.sql(`
+    CREATE TABLE IF NOT EXISTS agent_releases (
+      id                 SERIAL PRIMARY KEY,
+      version            VARCHAR(50) UNIQUE NOT NULL,
+      is_stable          BOOLEAN NOT NULL DEFAULT true,
+      rollout_percentage INTEGER NOT NULL DEFAULT 100,
+      release_notes      TEXT,
+      created_at         TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+  `);
 
   // 2. Table to track binary metadata per platform
-  pgm.createTable('agent_binaries', {
-    id:              'id',
-    release_id:      { type: 'integer',      notNull: true, references: '"agent_releases"', onDelete: 'cascade' },
-    platform:        { type: 'varchar(50)',  notNull: true },
-    architecture:    { type: 'varchar(50)',  notNull: true },
-    file_path:       { type: 'text',         notNull: true },
-    sha256:          { type: 'varchar(64)',  notNull: true },
-    download_count:  { type: 'integer',      notNull: true, default: 0 },
-  });
+  pgm.sql(`
+    CREATE TABLE IF NOT EXISTS agent_binaries (
+      id             SERIAL PRIMARY KEY,
+      release_id     INTEGER NOT NULL REFERENCES agent_releases(id) ON DELETE CASCADE,
+      platform       VARCHAR(50) NOT NULL,
+      architecture   VARCHAR(50) NOT NULL,
+      file_path      TEXT NOT NULL,
+      sha256         VARCHAR(64) NOT NULL,
+      download_count INTEGER NOT NULL DEFAULT 0
+    );
+  `);
 
-  pgm.createIndex('agent_binaries', ['platform', 'architecture']);
-  pgm.createIndex('agent_binaries', 'release_id');
+  pgm.sql(`
+    ALTER TABLE agent_binaries ADD COLUMN IF NOT EXISTS platform VARCHAR(50);
+    ALTER TABLE agent_binaries ADD COLUMN IF NOT EXISTS architecture VARCHAR(50);
+  `);
+
+  pgm.sql(`CREATE INDEX IF NOT EXISTS agent_binaries_platform_architecture_index ON agent_binaries(platform, architecture);`);
+  pgm.sql(`CREATE INDEX IF NOT EXISTS agent_binaries_release_id_index ON agent_binaries(release_id);`);
 
   // 3. Update agents table
-  pgm.addColumns('agents', {
-    agent_type:    { type: 'varchar(20)',  notNull: true, default: 'node' },
-    agent_version: { type: 'varchar(50)',  notNull: false },
-    public_ip:     { type: 'varchar(45)',  notNull: false },
-    private_ip:    { type: 'varchar(45)',  notNull: false },
-    hostname:      { type: 'varchar(255)', notNull: false },
-    os_type:       { type: 'varchar(50)',  notNull: false },
-  });
+  pgm.sql(`
+    ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_type VARCHAR(20) NOT NULL DEFAULT 'node';
+    ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_version VARCHAR(50);
+    ALTER TABLE agents ADD COLUMN IF NOT EXISTS public_ip VARCHAR(45);
+    ALTER TABLE agents ADD COLUMN IF NOT EXISTS private_ip VARCHAR(45);
+    ALTER TABLE agents ADD COLUMN IF NOT EXISTS hostname VARCHAR(255);
+    ALTER TABLE agents ADD COLUMN IF NOT EXISTS os_type VARCHAR(50);
+  `);
 
   // 4. Update agent_metrics table with hardware stats
-  pgm.addColumns('agent_metrics', {
-    ram_total_mb:  { type: 'integer', notNull: false },
-    disk_total_gb: { type: 'numeric', notNull: false },
-    disk_free_gb:  { type: 'numeric', notNull: false },
-    uptime_seconds: { type: 'bigint',  notNull: false },
-  });
+  pgm.sql(`
+    ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS ram_total_mb INTEGER;
+    ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS disk_total_gb NUMERIC;
+    ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS disk_free_gb NUMERIC;
+    ALTER TABLE agent_metrics ADD COLUMN IF NOT EXISTS uptime_seconds BIGINT;
+  `);
 };
 
 exports.down = (pgm) => {

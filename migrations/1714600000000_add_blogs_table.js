@@ -1,21 +1,19 @@
 exports.up = (pgm) => {
-    pgm.createTable('blogs', {
-        id: 'id',
-        slug: { type: 'varchar(255)', notNull: true, unique: true },
-        title: { type: 'varchar(255)', notNull: true },
-        excerpt: { type: 'text' },
-        content: { type: 'text', notNull: true },
-        category: { type: 'varchar(100)', default: 'General' },
-        cover_image: { type: 'varchar(500)' },
-        published_at: {
-            type: 'timestamp',
-            notNull: true,
-            default: pgm.func('current_timestamp'),
-        },
-        author_name: { type: 'varchar(100)', default: 'Monitor Hub Team' },
-        author_role: { type: 'varchar(100)', default: 'DevOps Experts' },
-        author_image: { type: 'varchar(500)', default: 'https://i.pravatar.cc/150?u=monitorhub' }
-    });
+    pgm.sql(`
+        CREATE TABLE IF NOT EXISTS blogs (
+            id SERIAL PRIMARY KEY,
+            slug VARCHAR(255) UNIQUE NOT NULL,
+            title VARCHAR(255) NOT NULL,
+            excerpt TEXT,
+            content TEXT NOT NULL,
+            category VARCHAR(100) DEFAULT 'General',
+            cover_image VARCHAR(500),
+            published_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            author_name VARCHAR(100) DEFAULT 'Monitor Hub Team',
+            author_role VARCHAR(100) DEFAULT 'DevOps Experts',
+            author_image VARCHAR(500) DEFAULT 'https://i.pravatar.cc/150?u=monitorhub'
+        );
+    `);
 };
 
 exports.down = (pgm) => {
