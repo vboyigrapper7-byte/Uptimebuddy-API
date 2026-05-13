@@ -1,6 +1,7 @@
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
 const { PLAN_TIERS } = require('../../core/billing/tiers');
+const pool = require('../../core/db/pool');
 
 const razorpay = new Razorpay({
   key_id: process.env.RAZORPAY_KEY_ID,
@@ -140,15 +141,12 @@ const verifyPayment = async (request, reply) => {
 
         request.log.info(`[Billing] Signature verified successfully for ${razorpay_subscription_id || razorpay_order_id}`);
 
-        const db = request.server.db;
-
-        // ANTI-TAMPERING: Fetch original plan from DB, do not trust request.body.planId
         const txQuery = razorpay_subscription_id 
             ? 'SELECT plan_id, status FROM transactions WHERE subscription_id = $1'
             : 'SELECT plan_id, status FROM transactions WHERE order_id = $1';
         const txId = razorpay_subscription_id || razorpay_order_id;
 
-        const txRes = await db.query(txQuery, [txId]);
+        const txRes = await pool.query(txQuery, [txId]);
         if (txRes.rows.length === 0) {
             request.log.error('[Billing] Transaction NOT found in DB!', { txId, type: razorpay_subscription_id ? 'subscription' : 'order' });
             return reply.code(404).send({ message: 'Transaction reference not found in system.' });
@@ -163,13 +161,13 @@ const verifyPayment = async (request, reply) => {
 
         // Update user's tier and subscription info
         if (razorpay_subscription_id) {
-            await db.query(`
+            await pool.query(`
                 UPDATE users 
                 SET tier = $1, subscription_id = $2, subscription_status = 'active', updated_at = NOW()
                 WHERE id = $3
             `, [verifiedPlanId, razorpay_subscription_id, request.user.id]);
         } else {
-            await db.query(`
+            await pool.query(`
                 UPDATE users 
                 SET tier = $1, updated_at = NOW()
                 WHERE id = $2
@@ -177,7 +175,7 @@ const verifyPayment = async (request, reply) => {
         }
 
         // Mark transaction as paid (IDEMPOTENCY)
-        await db.query(
+        await pool.query(
             `UPDATE transactions SET payment_id = $1, status = $2, updated_at = NOW() 
              WHERE ${razorpay_subscription_id ? 'subscription_id' : 'order_id'} = $3`,
             [razorpay_payment_id, 'paid', txId]
