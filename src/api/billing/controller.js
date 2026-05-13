@@ -94,6 +94,8 @@ const createSubscription = async (request, reply) => {
 
         return reply.send({
             id: subscription.id,
+            amount: plan.priceUSD * 100,
+            currency: 'USD',
             key_id: process.env.RAZORPAY_KEY_ID
         });
     } catch (error) {
