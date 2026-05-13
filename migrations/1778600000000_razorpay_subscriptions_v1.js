@@ -1,17 +1,19 @@
 exports.up = (pgm) => {
-    // 1. User Table Enhancements for Subscriptions
-    pgm.addColumns('users', {
-        subscription_id: { type: 'varchar(255)', default: null },
-        subscription_status: { type: 'varchar(50)', default: null },
-        cancel_at_period_end: { type: 'boolean', default: false }
-    });
+    // 1. User Table Enhancements (Hardened with IF NOT EXISTS)
+    pgm.sql(`
+        ALTER TABLE "users" 
+        ADD COLUMN IF NOT EXISTS "subscription_id" varchar(255) DEFAULT NULL,
+        ADD COLUMN IF NOT EXISTS "subscription_status" varchar(50) DEFAULT NULL,
+        ADD COLUMN IF NOT EXISTS "cancel_at_period_end" boolean DEFAULT false;
+    `);
 
-    // 2. Transaction Table Enhancements
-    pgm.addColumns('transactions', {
-        subscription_id: { type: 'varchar(255)', default: null }
-    });
+    // 2. Transaction Table Enhancements (Hardened with IF NOT EXISTS)
+    pgm.sql(`
+        ALTER TABLE "transactions" 
+        ADD COLUMN IF NOT EXISTS "subscription_id" varchar(255) DEFAULT NULL;
+    `);
 
-    // 3. Webhook Idempotency Table
+    // 3. Webhook Idempotency Table (Hardened with ifNotExists)
     pgm.createTable('processed_webhooks', {
         id: 'id',
         event_id: { type: 'varchar(255)', notNull: true, unique: true },
@@ -20,13 +22,14 @@ exports.up = (pgm) => {
             notNull: true,
             default: pgm.func('current_timestamp'),
         },
-    });
+    }, { ifNotExists: true });
 
-    pgm.createIndex('processed_webhooks', 'event_id');
+    // 4. Index for Webhooks (Hardened with ifNotExists)
+    pgm.createIndex('processed_webhooks', 'event_id', { ifNotExists: true });
 };
 
 exports.down = (pgm) => {
-    pgm.dropTable('processed_webhooks');
-    pgm.dropColumns('transactions', ['subscription_id']);
-    pgm.dropColumns('users', ['subscription_id', 'subscription_status', 'cancel_at_period_end']);
+    pgm.dropTable('processed_webhooks', { ifExists: true });
+    pgm.dropColumns('transactions', ['subscription_id'], { ifExists: true });
+    pgm.dropColumns('users', ['subscription_id', 'subscription_status', 'cancel_at_period_end'], { ifExists: true });
 };
