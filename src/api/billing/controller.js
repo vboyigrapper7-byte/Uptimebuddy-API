@@ -129,8 +129,16 @@ const verifyPayment = async (request, reply) => {
             .digest('hex');
 
         if (generated_signature !== razorpay_signature) {
+            request.log.error('[Billing] Signature Mismatch!', {
+                received: razorpay_signature,
+                generated: generated_signature,
+                data: data,
+                type: razorpay_subscription_id ? 'subscription' : 'order'
+            });
             return reply.code(400).send({ message: 'Invalid payment signature. Verification failed.' });
         }
+
+        request.log.info(`[Billing] Signature verified successfully for ${razorpay_subscription_id || razorpay_order_id}`);
 
         const db = request.server.db;
 
@@ -142,6 +150,7 @@ const verifyPayment = async (request, reply) => {
 
         const txRes = await db.query(txQuery, [txId]);
         if (txRes.rows.length === 0) {
+            request.log.error('[Billing] Transaction NOT found in DB!', { txId, type: razorpay_subscription_id ? 'subscription' : 'order' });
             return reply.code(404).send({ message: 'Transaction reference not found in system.' });
         }
         
