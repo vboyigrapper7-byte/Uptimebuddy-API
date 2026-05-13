@@ -147,17 +147,25 @@ const verifyPayment = async (request, reply) => {
         const txId = razorpay_subscription_id || razorpay_order_id;
 
         const txRes = await pool.query(txQuery, [txId]);
-        if (txRes.rows.length === 0) {
+        
+        if (!txRes || !txRes.rows || txRes.rows.length === 0) {
             request.log.error('[Billing] Transaction NOT found in DB!', { txId, type: razorpay_subscription_id ? 'subscription' : 'order' });
-            return reply.code(404).send({ message: 'Transaction reference not found in system.' });
+            return reply.code(404).send({ message: 'Transaction reference not found in system. Please contact support.' });
         }
         
         const transaction = txRes.rows[0];
+        if (!transaction) {
+             return reply.code(404).send({ message: 'Transaction data corrupted.' });
+        }
+
         if (transaction.status === 'paid') {
             return reply.send({ success: true, message: 'Payment already processed.', tier: transaction.plan_id });
         }
 
         const verifiedPlanId = transaction.plan_id;
+        if (!verifiedPlanId) {
+             return reply.code(400).send({ message: 'Plan information missing from transaction record.' });
+        }
 
         // Update user's tier and subscription info
         if (razorpay_subscription_id) {
