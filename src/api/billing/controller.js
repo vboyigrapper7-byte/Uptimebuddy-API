@@ -62,7 +62,14 @@ const createSubscription = async (request, reply) => {
         const plan = PLAN_TIERS[planId];
         
         if (!plan || !plan.razorpayPlanId) {
+            request.log.warn(`Subscription attempt failed: Plan metadata or ID missing for ${planId}`);
             return reply.code(400).send({ message: 'Invalid subscription plan selected or plan ID missing.' });
+        }
+
+        // CONFIG GUARD: Ensure API keys exist
+        if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
+            request.log.error('CRITICAL: Razorpay API keys are missing in ENV.');
+            return reply.code(500).send({ message: 'Billing system misconfigured (Keys missing).' });
         }
 
         const options = {
@@ -75,6 +82,7 @@ const createSubscription = async (request, reply) => {
             }
         };
 
+        request.log.info(`[Billing] Creating Razorpay subscription for user ${request.user.id} (Plan: ${planId})`);
         const subscription = await razorpay.subscriptions.create(options);
 
         // PERSISTENCE: Save subscription reference to transactions
@@ -88,8 +96,16 @@ const createSubscription = async (request, reply) => {
             key_id: process.env.RAZORPAY_KEY_ID
         });
     } catch (error) {
-        request.log.error('Razorpay Create Subscription Error:', error);
-        return reply.code(500).send({ message: 'Failed to initialize subscription gateway.' });
+        request.log.error('Razorpay Create Subscription Error:', {
+            message: error.message,
+            description: error.description,
+            code: error.code,
+            userId: request.user.id
+        });
+        return reply.code(500).send({ 
+            message: 'Failed to initialize subscription gateway.',
+            error: error.description || error.message 
+        });
     }
 };
 
