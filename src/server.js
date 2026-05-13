@@ -62,6 +62,14 @@ const buildServer = async () => {
         await pool.query(`CREATE TABLE IF NOT EXISTS agent_releases (id SERIAL PRIMARY KEY, version VARCHAR(50) UNIQUE NOT NULL, is_stable BOOLEAN DEFAULT FALSE, created_at TIMESTAMP DEFAULT NOW())`);
         await pool.query(`CREATE TABLE IF NOT EXISTS agent_binaries (id SERIAL PRIMARY KEY, release_id INT REFERENCES agent_releases(id) ON DELETE CASCADE, os VARCHAR(20), arch VARCHAR(20), file_path TEXT NOT NULL, sha256 VARCHAR(64), created_at TIMESTAMP DEFAULT NOW())`);
         
+        // Auto-patch missing columns for older databases
+        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS status_slug VARCHAR(50)`);
+        await pool.query(`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS agent_id INT`);
+        await pool.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_type VARCHAR(50) DEFAULT 'node'`);
+        
+        // Auto-patch missing tables for older databases
+        await pool.query(`CREATE TABLE IF NOT EXISTS monitor_stats (monitor_id INT PRIMARY KEY REFERENCES monitors(id) ON DELETE CASCADE, uptime_24h NUMERIC(5,2) DEFAULT 100.00, avg_latency_24h INTEGER DEFAULT 0, last_updated_at TIMESTAMP DEFAULT NOW())`);
+        
         // Seed initial stable release if missing
         await pool.query(`INSERT INTO agent_releases (version, is_stable) VALUES ('1.1.0', true) ON CONFLICT (version) DO UPDATE SET is_stable = true`);
         const rel = await pool.query("SELECT id FROM agent_releases WHERE version = '1.1.0'");

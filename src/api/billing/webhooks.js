@@ -17,13 +17,21 @@ const handleWebhook = async (request, reply) => {
     }
 
     const event = request.body.event;
+    const eventId = request.body.id; // Razorpay sends a unique event ID
     const db = request.server.db;
     const payload = request.body.payload;
 
-    request.log.info(`[BillingWebhook] Received event: ${event}`);
+    request.log.info(`[BillingWebhook] Received event: ${event} (ID: ${eventId})`);
 
     try {
-        // ── 1. Handle Legacy Payment Captured (Single Payments) ────────────────
+        // ── IDEMPOTENCY CHECK ────────────────────────────────────────────────
+        const checkRes = await db.query('SELECT 1 FROM processed_webhooks WHERE event_id = $1', [eventId]);
+        if (checkRes.rows.length > 0) {
+            request.log.info(`[BillingWebhook] Event ${eventId} already processed. Skipping.`);
+            return reply.send({ status: 'ok', duplicated: true });
+        }
+
+        // ── 1. Handle Legacy Payment Captured (One-time Orders) ───────────────
         if (event === 'payment.captured') {
             const { order_id, id: payment_id } = payload.payment.entity;
             const txRes = await db.query('SELECT user_id, plan_id, status FROM transactions WHERE order_id = $1', [order_id]);
@@ -42,61 +50,63 @@ const handleWebhook = async (request, reply) => {
                 });
 
                 request.log.info(`[BillingWebhook] Upgraded user ${user_id} via payment.captured`);
-
             }
         }
 
-        // ── 2. Handle Subscription Renewals ────────────────────────────────────
-        else if (event === 'subscription.charged') {
-            const { id: sub_id, customer_id, notes } = payload.subscription.entity;
+        // ── 2. Handle Subscription Activation & Renewals ───────────────────────
+        else if (event === 'subscription.activated' || event === 'subscription.charged') {
+            const { id: sub_id, notes, current_end } = payload.subscription.entity;
             const user_id = notes?.user_id;
+            const plan_id = notes?.plan_id;
 
             if (user_id) {
-                // Determine plan from subscription data if possible, or keep existing
-                await db.query(
-                    'UPDATE users SET plan_expiry = NOW() + INTERVAL \'32 days\', subscription_id = $1 WHERE id = $2',
-                    [sub_id, user_id]
-                );
+                const expiryDate = current_end ? new Date(current_end * 1000) : new Date(Date.now() + 32 * 24 * 60 * 60 * 1000);
+                
+                await db.query(`
+                    UPDATE users 
+                    SET tier = $1, plan_expiry = $2, subscription_id = $3, subscription_status = 'active', updated_at = NOW() 
+                    WHERE id = $4
+                `, [plan_id || 'pro', expiryDate, sub_id, user_id]);
 
                 await auditService.logAction(db, {
                     userId: user_id,
-                    action: 'SUBSCRIPTION_RENEWED',
+                    action: event === 'subscription.activated' ? 'SUBSCRIPTION_ACTIVATED' : 'SUBSCRIPTION_RENEWED',
                     entityType: 'subscription',
                     entityId: sub_id,
                     ipAddress: request.ip
                 });
-
-                request.log.info(`[BillingWebhook] Extended subscription for user ${user_id} (Sub: ${sub_id})`);
-
+                
+                request.log.info(`[BillingWebhook] Subscription ${event} for user ${user_id} (Sub: ${sub_id})`);
             }
         }
 
         // ── 3. Handle Subscription Cancellations/Failures ──────────────────────
-        else if (event === 'subscription.cancelled' || event === 'subscription.halted') {
+        else if (['subscription.cancelled', 'subscription.halted', 'subscription.expired'].includes(event)) {
             const { id: sub_id, notes } = payload.subscription.entity;
             const user_id = notes?.user_id;
 
             if (user_id) {
-                // Immediate downgrade or mark for expiry (depending on business logic)
-                // For now, we clear the expiry to force a downgrade on next check
                 await db.query(
-                    'UPDATE users SET tier = \'free\', plan_expiry = NOW(), subscription_id = NULL WHERE id = $1',
-                    [user_id]
+                    'UPDATE users SET tier = \'free\', subscription_status = $1, updated_at = NOW() WHERE id = $2',
+                    [event.split('.')[1], user_id]
                 );
 
                 await auditService.logAction(db, {
                     userId: user_id,
-                    action: 'SUBSCRIPTION_CANCELLED',
+                    action: 'SUBSCRIPTION_DOWNGRADED',
                     entityType: 'subscription',
                     entityId: sub_id,
-                    newValue: { event },
+                    newValue: { reason: event },
                     ipAddress: request.ip
                 });
 
                 request.log.info(`[BillingWebhook] Downgraded user ${user_id} due to ${event}`);
-
             }
         }
+
+        // MARK AS PROCESSED (FINAL STEP FOR IDEMPOTENCY)
+        await db.query('INSERT INTO processed_webhooks (event_id) VALUES ($1)', [eventId]);
+
     } catch (err) {
         request.log.error(`[BillingWebhook] Critical error processing ${event}: ${err.message}`);
         return reply.code(500).send({ message: 'Internal processing error' });

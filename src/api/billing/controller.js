@@ -56,19 +56,60 @@ const createOrder = async (request, reply) => {
     }
 };
 
+const createSubscription = async (request, reply) => {
+    try {
+        const { planId } = request.body;
+        const plan = PLAN_TIERS[planId];
+        
+        if (!plan || !plan.razorpayPlanId) {
+            return reply.code(400).send({ message: 'Invalid subscription plan selected or plan ID missing.' });
+        }
+
+        const options = {
+            plan_id: plan.razorpayPlanId,
+            customer_notify: 1,
+            total_count: 120, // 10 years
+            notes: {
+                user_id: request.user.id,
+                plan_id: planId
+            }
+        };
+
+        const subscription = await razorpay.subscriptions.create(options);
+
+        // PERSISTENCE: Save subscription reference to transactions
+        await request.server.db.query(
+            'INSERT INTO transactions (user_id, subscription_id, plan_id, amount, status) VALUES ($1, $2, $3, $4, $5)',
+            [request.user.id, subscription.id, planId, plan.priceUSD * 100, 'pending']
+        );
+
+        return reply.send({
+            id: subscription.id,
+            key_id: process.env.RAZORPAY_KEY_ID
+        });
+    } catch (error) {
+        request.log.error('Razorpay Create Subscription Error:', error);
+        return reply.code(500).send({ message: 'Failed to initialize subscription gateway.' });
+    }
+};
+
 const verifyPayment = async (request, reply) => {
     try {
-        const { razorpay_order_id, razorpay_payment_id, razorpay_signature, planId } = request.body;
+        const { razorpay_order_id, razorpay_subscription_id, razorpay_payment_id, razorpay_signature, planId } = request.body;
         
-        if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature || !planId) {
+        if ((!razorpay_order_id && !razorpay_subscription_id) || !razorpay_payment_id || !razorpay_signature || !planId) {
              return reply.code(400).send({ message: 'Missing payment verification parameters.' });
         }
 
         // Verify Signature
         const secret = process.env.RAZORPAY_KEY_SECRET;
+        const data = razorpay_subscription_id 
+            ? `${razorpay_payment_id}|${razorpay_subscription_id}` 
+            : `${razorpay_order_id}|${razorpay_payment_id}`;
+
         const generated_signature = crypto
             .createHmac('sha256', secret)
-            .update(`${razorpay_order_id}|${razorpay_payment_id}`)
+            .update(data)
             .digest('hex');
 
         if (generated_signature !== razorpay_signature) {
@@ -78,9 +119,14 @@ const verifyPayment = async (request, reply) => {
         const db = request.server.db;
 
         // ANTI-TAMPERING: Fetch original plan from DB, do not trust request.body.planId
-        const txRes = await db.query('SELECT plan_id, status FROM transactions WHERE order_id = $1', [razorpay_order_id]);
+        const txQuery = razorpay_subscription_id 
+            ? 'SELECT plan_id, status FROM transactions WHERE subscription_id = $1'
+            : 'SELECT plan_id, status FROM transactions WHERE order_id = $1';
+        const txId = razorpay_subscription_id || razorpay_order_id;
+
+        const txRes = await db.query(txQuery, [txId]);
         if (txRes.rows.length === 0) {
-            return reply.code(404).send({ message: 'Order reference not found in system.' });
+            return reply.code(404).send({ message: 'Transaction reference not found in system.' });
         }
         
         const transaction = txRes.rows[0];
@@ -90,17 +136,26 @@ const verifyPayment = async (request, reply) => {
 
         const verifiedPlanId = transaction.plan_id;
 
-        // Update user's tier
-        await db.query(`
-            UPDATE users 
-            SET tier = $1, updated_at = NOW()
-            WHERE id = $2
-        `, [verifiedPlanId, request.user.id]);
+        // Update user's tier and subscription info
+        if (razorpay_subscription_id) {
+            await db.query(`
+                UPDATE users 
+                SET tier = $1, subscription_id = $2, subscription_status = 'active', updated_at = NOW()
+                WHERE id = $3
+            `, [verifiedPlanId, razorpay_subscription_id, request.user.id]);
+        } else {
+            await db.query(`
+                UPDATE users 
+                SET tier = $1, updated_at = NOW()
+                WHERE id = $2
+            `, [verifiedPlanId, request.user.id]);
+        }
 
         // Mark transaction as paid (IDEMPOTENCY)
         await db.query(
-            'UPDATE transactions SET payment_id = $1, status = $2, updated_at = NOW() WHERE order_id = $3',
-            [razorpay_payment_id, 'paid', razorpay_order_id]
+            `UPDATE transactions SET payment_id = $1, status = $2, updated_at = NOW() 
+             WHERE ${razorpay_subscription_id ? 'subscription_id' : 'order_id'} = $3`,
+            [razorpay_payment_id, 'paid', txId]
         );
 
         return reply.send({
@@ -124,6 +179,7 @@ const getPlans = async (request, reply) => {
 
 module.exports = {
     createOrder,
+    createSubscription,
     verifyPayment,
     getPlans
 };
