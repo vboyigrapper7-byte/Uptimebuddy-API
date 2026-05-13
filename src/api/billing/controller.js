@@ -189,8 +189,16 @@ const verifyPayment = async (request, reply) => {
             tier: verifiedPlanId
         });
     } catch (error) {
-         request.log.error('Razorpay Verify Error:', error);
-         return reply.code(500).send({ message: 'Failed to verify payment.' });
+         request.log.error('Razorpay Verify Error Detail:', {
+             message: error.message,
+             stack: error.stack,
+             userId: request.user.id,
+             body: request.body
+         });
+         return reply.code(500).send({ 
+             message: 'Failed to verify payment.',
+             detail: error.message 
+         });
     }
 };
 
