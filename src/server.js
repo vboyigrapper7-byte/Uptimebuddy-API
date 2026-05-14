@@ -67,6 +67,11 @@ const buildServer = async () => {
         await pool.query(`ALTER TABLE incidents ADD COLUMN IF NOT EXISTS agent_id INT`);
         await pool.query(`ALTER TABLE agents ADD COLUMN IF NOT EXISTS agent_type VARCHAR(50) DEFAULT 'node'`);
         
+        // Auto-patch blogs table for SEO fields
+        await pool.query(`ALTER TABLE blogs ADD COLUMN IF NOT EXISTS meta_title VARCHAR(255)`);
+        await pool.query(`ALTER TABLE blogs ADD COLUMN IF NOT EXISTS meta_description TEXT`);
+        await pool.query(`ALTER TABLE blogs ADD COLUMN IF NOT EXISTS keywords TEXT`);
+        
         // Auto-patch missing tables for older databases
         await pool.query(`CREATE TABLE IF NOT EXISTS monitor_stats (monitor_id INT PRIMARY KEY REFERENCES monitors(id) ON DELETE CASCADE, uptime_24h NUMERIC(5,2) DEFAULT 100.00, avg_latency_24h INTEGER DEFAULT 0, last_updated_at TIMESTAMP DEFAULT NOW())`);
         

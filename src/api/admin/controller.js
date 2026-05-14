@@ -416,21 +416,21 @@ const getRevenueAnalytics = async (request, reply) => {
         return reply.send({
             mrr,
             mrrByTier,
-            totalRevenue: parseInt(stats.total_revenue) / 100, // Cents to USD
-            monthlyRevenue: parseInt(stats.monthly_revenue) / 100,
+            totalRevenue: parseInt(stats.total_revenue || 0) / 100, // Cents to USD
+            monthlyRevenue: parseInt(stats.monthly_revenue || 0) / 100,
             transactionHealth: {
-                total: parseInt(stats.total_tx),
-                paid: parseInt(stats.paid_count),
-                failed: parseInt(stats.failed_count),
+                total: parseInt(stats.total_tx || 0),
+                paid: parseInt(stats.paid_count || 0),
+                failed: parseInt(stats.failed_count || 0),
                 successRate: stats.total_tx > 0 ? (parseInt(stats.paid_count) / parseInt(stats.total_tx)) * 100 : 0
             },
             revenueTrend: trendRes.rows.map(r => ({
                 date: r.date,
-                revenue: parseInt(r.daily_revenue) / 100
+                revenue: parseInt(r.daily_revenue || 0) / 100
             })),
             recentTransactions: recentRes.rows.map(r => ({
                 ...r,
-                amount: parseInt(r.amount) / 100
+                amount: parseInt(r.amount || 0) / 100
             }))
         });
     } catch (err) {
@@ -474,12 +474,24 @@ const getBlogs = async (request, reply) => {
 const createBlog = async (request, reply) => {
     try {
         const db = request.server.db;
-        const { slug, title, excerpt, content, category, cover_image, author_name, author_role, author_image } = request.body;
+        const { 
+            slug, title, excerpt, content, category, cover_image, 
+            author_name, author_role, author_image,
+            meta_title, meta_description, keywords 
+        } = request.body;
         
         await db.query(`
-            INSERT INTO blogs (slug, title, excerpt, content, category, cover_image, author_name, author_role, author_image)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-        `, [slug, title, excerpt, content, category, cover_image, author_name, author_role, author_image]);
+            INSERT INTO blogs (
+                slug, title, excerpt, content, category, cover_image, 
+                author_name, author_role, author_image,
+                meta_title, meta_description, keywords
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        `, [
+            slug, title, excerpt, content, category, cover_image, 
+            author_name, author_role, author_image,
+            meta_title, meta_description, keywords
+        ]);
         
         return reply.send({ success: true, message: 'Blog created successfully' });
     } catch (err) {
@@ -492,13 +504,24 @@ const updateBlog = async (request, reply) => {
     try {
         const db = request.server.db;
         const { id } = request.params;
-        const { title, excerpt, content, category, cover_image, author_name, author_role, author_image } = request.body;
+        const { 
+            slug, title, excerpt, content, category, cover_image, 
+            author_name, author_role, author_image,
+            meta_title, meta_description, keywords 
+        } = request.body;
         
         await db.query(`
             UPDATE blogs 
-            SET title=$1, excerpt=$2, content=$3, category=$4, cover_image=$5, author_name=$6, author_role=$7, author_image=$8
-            WHERE id=$9
-        `, [title, excerpt, content, category, cover_image, author_name, author_role, author_image, id]);
+            SET slug=$1, title=$2, excerpt=$3, content=$4, category=$5, cover_image=$6, 
+                author_name=$7, author_role=$8, author_image=$9,
+                meta_title=$10, meta_description=$11, keywords=$12
+            WHERE id=$13
+        `, [
+            slug, title, excerpt, content, category, cover_image, 
+            author_name, author_role, author_image,
+            meta_title, meta_description, keywords, 
+            id
+        ]);
         
         return reply.send({ success: true, message: 'Blog updated successfully' });
     } catch (err) {

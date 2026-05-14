@@ -38,6 +38,11 @@ const getBlogs = async (request, reply) => {
                 image: blog.author_image
             },
             coverImage: blog.cover_image,
+            meta: {
+                title: blog.meta_title,
+                description: blog.meta_description,
+                keywords: blog.keywords
+            },
             faqs: [] // Or parse from DB if you add JSON support
         }));
 
