@@ -72,6 +72,9 @@ const buildServer = async () => {
         await pool.query(`ALTER TABLE blogs ADD COLUMN IF NOT EXISTS meta_description TEXT`);
         await pool.query(`ALTER TABLE blogs ADD COLUMN IF NOT EXISTS keywords TEXT`);
         
+        // Update existing blogs to use the new logo instead of the generic pravatar
+        await pool.query(`UPDATE blogs SET author_image = 'https://monitorhubs.com/new_logo.png' WHERE author_image = 'https://i.pravatar.cc/150?u=monitorhub'`);
+        
         // Auto-patch missing tables for older databases
         await pool.query(`CREATE TABLE IF NOT EXISTS monitor_stats (monitor_id INT PRIMARY KEY REFERENCES monitors(id) ON DELETE CASCADE, uptime_24h NUMERIC(5,2) DEFAULT 100.00, avg_latency_24h INTEGER DEFAULT 0, last_updated_at TIMESTAMP DEFAULT NOW())`);
         
