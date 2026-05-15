@@ -27,7 +27,7 @@ const getBlogs = async (request, reply) => {
         const blogs = res.rows.map(blog => ({
             slug: blog.slug,
             title: blog.title,
-            date: blog.published_at.toISOString(),
+            date: blog.published_at instanceof Date ? blog.published_at.toISOString() : new Date(blog.published_at).toISOString(),
             category: blog.category,
             excerpt: blog.excerpt,
             content: blog.content,
