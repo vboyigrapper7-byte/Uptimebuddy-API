@@ -9,18 +9,18 @@ const auditService = require('../../core/admin/auditService');
 
 const login = async (request, reply) => {
     const { password } = request.body;
-    
+
     if (password !== ADMIN_PASSWORD) {
         return reply.status(401).send({ error: 'Invalid admin credentials' });
     }
-    
+
     // Issue a JWT token valid for 12 hours
-    const token = await reply.jwtSign({ 
-        isAdmin: true, 
+    const token = await reply.jwtSign({
+        isAdmin: true,
         email: ADMIN_PASSWORD, // Using the email/identifier from config
         role: 'superadmin'
-    }, { 
-        expiresIn: '12h' 
+    }, {
+        expiresIn: '12h'
     });
 
     return reply.send({ success: true, token });
@@ -39,23 +39,23 @@ const logout = async (request, reply) => {
 const getOverview = async (request, reply) => {
     try {
         const db = request.server.db;
-        
+
         // Users stats
         const usersRes = await db.query('SELECT COUNT(*) as total FROM users');
         const totalUsers = parseInt(usersRes.rows[0].total, 10);
-        
+
         // Plans distribution
         const plansRes = await db.query('SELECT tier, COUNT(*) as count FROM users GROUP BY tier');
         const plans = plansRes.rows;
-        
+
         // Monitors stats
         const uptimeMonitorsRes = await db.query("SELECT COUNT(*) as total FROM monitors WHERE category = 'uptime' OR category IS NULL");
         const apiMonitorsRes = await db.query("SELECT COUNT(*) as total FROM monitors WHERE category = 'api'");
         const serverMonitorsRes = await db.query('SELECT COUNT(*) as total FROM agents');
-        
+
         // Incidents/Alerts stats
         const incidentsRes = await db.query('SELECT COUNT(*) as total FROM incidents WHERE resolved_at IS NULL');
-        
+
         return reply.send({
             success: true,
             stats: {
@@ -82,23 +82,23 @@ const getUsers = async (request, reply) => {
         const limit = parseInt(request.query.limit) || 50;
         const offset = (page - 1) * limit;
         const search = request.query.search || '';
-        
+
         let query = 'SELECT id, email, name, role, tier, created_at, plan_expiry FROM users';
         let countQuery = 'SELECT COUNT(*) as total FROM users';
         let params = [];
-        
+
         if (search) {
             query += ' WHERE email ILIKE $1 OR name ILIKE $1';
             countQuery += ' WHERE email ILIKE $1 OR name ILIKE $1';
             params.push(`%${search}%`);
         }
-        
+
         query += ` ORDER BY created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
         const dataParams = [...params, limit, offset];
-        
+
         const countRes = await db.query(countQuery, params);
         const usersRes = await db.query(query, dataParams);
-        
+
         // Get monitor counts for these users
         const users = usersRes.rows;
         for (let user of users) {
@@ -106,7 +106,7 @@ const getUsers = async (request, reply) => {
             const aCount = await db.query('SELECT COUNT(*) as total FROM agents WHERE user_id = $1', [user.id]);
             user.monitorCount = parseInt(mCount.rows[0].total, 10) + parseInt(aCount.rows[0].total, 10);
         }
-        
+
         return reply.send({
             success: true,
             users,
@@ -124,15 +124,15 @@ const getUserDetails = async (request, reply) => {
     try {
         const db = request.server.db;
         const { id } = request.params;
-        
+
         const userRes = await db.query('SELECT id, email, name, role, tier, created_at, plan_expiry, status_slug FROM users WHERE id = $1', [id]);
         if (userRes.rows.length === 0) return reply.status(404).send({ error: 'User not found' });
-        
+
         const user = userRes.rows[0];
-        
+
         const mRes = await db.query('SELECT id, name, type, category, status, target, created_at FROM monitors WHERE user_id = $1', [id]);
         const aRes = await db.query('SELECT id, name, status, hostname, public_ip, created_at FROM agents WHERE user_id = $1', [id]);
-        
+
         return reply.send({
             success: true,
             user,
@@ -150,7 +150,7 @@ const updateUser = async (request, reply) => {
         const db = request.server.db;
         const { id } = request.params;
         const { tier, role } = request.body;
-        
+
         const oldUserRes = await db.query('SELECT tier, role FROM users WHERE id = $1', [id]);
         const oldUser = oldUserRes.rows[0];
 
@@ -171,7 +171,7 @@ const updateUser = async (request, reply) => {
             userAgent: request.headers['user-agent']
         });
 
-        
+
         return reply.send({ success: true, message: 'User updated successfully' });
     } catch (err) {
         request.log.error('Admin Update User Error:', err);
@@ -183,13 +183,13 @@ const deleteUser = async (request, reply) => {
     try {
         const db = request.server.db;
         const { id } = request.params;
-        
+
         const userRes = await db.query('SELECT email FROM users WHERE id = $1', [id]);
         const userEmail = userRes.rows[0]?.email;
 
         // Due to foreign keys with CASCADE, deleting a user deletes their monitors, alerts, etc.
         await db.query('DELETE FROM users WHERE id = $1', [id]);
-        
+
         // Audit Log
         await auditService.logAction(db, {
             adminId: request.user?.id,
@@ -201,7 +201,7 @@ const deleteUser = async (request, reply) => {
             userAgent: request.headers['user-agent']
         });
 
-        
+
         return reply.send({ success: true, message: 'User deleted successfully' });
     } catch (err) {
         request.log.error('Admin Delete User Error:', err);
@@ -261,7 +261,7 @@ const getMonitors = async (request, reply) => {
         const limit = parseInt(request.query.limit) || 50;
         const offset = (page - 1) * limit;
         const search = request.query.search || '';
-        
+
         let query = `
             SELECT m.id, m.name, m.type, m.category, m.status, m.target, m.created_at, u.email as user_email 
             FROM monitors m
@@ -273,19 +273,19 @@ const getMonitors = async (request, reply) => {
             JOIN users u ON m.user_id = u.id
         `;
         let params = [];
-        
+
         if (search) {
             query += ' WHERE m.name ILIKE $1 OR m.target ILIKE $1 OR u.email ILIKE $1';
             countQuery += ' WHERE m.name ILIKE $1 OR m.target ILIKE $1 OR u.email ILIKE $1';
             params.push(`%${search}%`);
         }
-        
+
         query += ` ORDER BY m.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
         const dataParams = [...params, limit, offset];
-        
+
         const countRes = await db.query(countQuery, params);
         const monitorsRes = await db.query(query, dataParams);
-        
+
         return reply.send({
             success: true,
             monitors: monitorsRes.rows,
@@ -305,7 +305,7 @@ const getAgents = async (request, reply) => {
         const page = parseInt(request.query.page) || 1;
         const limit = parseInt(request.query.limit) || 50;
         const offset = (page - 1) * limit;
-        
+
         const query = `
             SELECT a.id, a.name, a.status, a.last_seen, u.email as user_email 
             FROM agents a
@@ -313,10 +313,10 @@ const getAgents = async (request, reply) => {
             ORDER BY a.id DESC LIMIT $1 OFFSET $2
         `;
         const countQuery = 'SELECT COUNT(*) as total FROM agents';
-        
+
         const countRes = await db.query(countQuery);
         const agentsRes = await db.query(query, [limit, offset]);
-        
+
         return reply.send({
             success: true,
             agents: agentsRes.rows,
@@ -474,12 +474,12 @@ const getBlogs = async (request, reply) => {
 const createBlog = async (request, reply) => {
     try {
         const db = request.server.db;
-        const { 
-            slug, title, excerpt, content, category, cover_image, 
+        const {
+            slug, title, excerpt, content, category, cover_image,
             author_name, author_role, author_image,
-            meta_title, meta_description, keywords 
+            meta_title, meta_description, keywords
         } = request.body;
-        
+
         await db.query(`
             INSERT INTO blogs (
                 slug, title, excerpt, content, category, cover_image, 
@@ -488,11 +488,11 @@ const createBlog = async (request, reply) => {
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         `, [
-            slug, title, excerpt, content, category, cover_image, 
+            slug, title, excerpt, content, category, cover_image,
             author_name, author_role, author_image,
             meta_title, meta_description, keywords
         ]);
-        
+
         return reply.send({ success: true, message: 'Blog created successfully' });
     } catch (err) {
         request.log.error('Admin Create Blog Error:', err);
@@ -504,12 +504,12 @@ const updateBlog = async (request, reply) => {
     try {
         const db = request.server.db;
         const { id } = request.params;
-        const { 
-            slug, title, excerpt, content, category, cover_image, 
+        const {
+            slug, title, excerpt, content, category, cover_image,
             author_name, author_role, author_image,
-            meta_title, meta_description, keywords 
+            meta_title, meta_description, keywords
         } = request.body;
-        
+
         await db.query(`
             UPDATE blogs 
             SET slug=$1, title=$2, excerpt=$3, content=$4, category=$5, cover_image=$6, 
@@ -517,12 +517,12 @@ const updateBlog = async (request, reply) => {
                 meta_title=$10, meta_description=$11, keywords=$12
             WHERE id=$13
         `, [
-            slug, title, excerpt, content, category, cover_image, 
+            slug, title, excerpt, content, category, cover_image,
             author_name, author_role, author_image,
-            meta_title, meta_description, keywords, 
+            meta_title, meta_description, keywords,
             id
         ]);
-        
+
         return reply.send({ success: true, message: 'Blog updated successfully' });
     } catch (err) {
         request.log.error('Admin Update Blog Error:', err);

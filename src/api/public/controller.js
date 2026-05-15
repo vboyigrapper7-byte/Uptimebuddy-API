@@ -22,7 +22,7 @@ const getBlogs = async (request, reply) => {
     try {
         const db = request.server.db;
         const res = await db.query('SELECT * FROM blogs ORDER BY published_at DESC');
-        
+
         // Format to match the static MDX format
         const blogs = res.rows.map(blog => ({
             slug: blog.slug,
