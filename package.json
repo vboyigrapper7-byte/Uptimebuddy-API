@@ -44,6 +44,7 @@
     "razorpay": "^2.9.6",
     "resend": "^3.5.0",
     "tcp-ping": "^0.1.1",
+    "whois-json": "^2.0.4",
     "winston": "^3.19.0",
     "zod": "^3.23.0"
   },
