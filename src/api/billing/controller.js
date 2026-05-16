@@ -4,8 +4,8 @@ const { PLAN_TIERS } = require('../../core/billing/tiers');
 const pool = require('../../core/db/pool');
 
 const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET,
+  key_id: process.env.RAZORPAY_KEY_ID || 'rzp_test_dummykey',
+  key_secret: process.env.RAZORPAY_KEY_SECRET || 'dummyprivatesecret',
 });
 
 // Fixed USD Pricing (rounded, accepts payment in INR or USD based on payer location)
