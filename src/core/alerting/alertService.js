@@ -28,15 +28,13 @@ class AlertService {
         if (!botToken || !chatId) return;
 
         try {
-            const statusText = newStatus === 'warning' ? 'DEGRADED (Slow)' : (isDown ? 'DOWN' : 'RECOVERED');
-            const emoji = newStatus === 'warning' ? '⚠️' : (isDown ? '🚨' : '✅');
-            const timestamp = new Date().toLocaleString('en-US', { timeZone: 'UTC' }) + ' UTC';
-
-            const message = `*${emoji} ${newStatus === 'warning' ? 'Service Degradation' : (isDown ? 'Server Down' : 'Server Recovered')}*\n` +
+            const dashUrl = process.env.BACKEND_URL ? `[View Dashboard](${process.env.BACKEND_URL}/dashboard)` : '';
+            const message = `*${emoji} ${newStatus === 'warning' ? 'Service Warning' : (isDown ? 'Monitor Down' : 'Monitor Recovered')}*\n` +
                           `🌐 *Monitor:* ${target}\n` +
                           `📊 *Status:* ${statusText}\n` +
                           `⏰ *Time:* ${timestamp}\n` +
-                          (errorMessage ? `❌ *Error:* \`${errorMessage}\`` : '');
+                          (errorMessage ? `❌ *Error:* \`${errorMessage}\`\n` : '') +
+                          `${dashUrl}`;
 
             let attempts = 0;
             while (attempts < 3) {
@@ -45,7 +43,8 @@ class AlertService {
                     await axios.post(`https://api.telegram.org/bot${botToken}/sendMessage`, {
                         chat_id: chatId,
                         text: message,
-                        parse_mode: 'Markdown'
+                        parse_mode: 'Markdown',
+                        disable_web_page_preview: true
                     }, { timeout: 8000 });
                     console.log(`[AlertService] Telegram dispatch success for ${target} (Attempt ${attempts})`);
                     break;
@@ -85,22 +84,39 @@ class AlertService {
         const { target, previousStatus, newStatus, errorMessage, timestamp } = payload;
         const isDown = newStatus === 'down';
         const isWarning = newStatus === 'warning';
+        const statusEmoji = isDown ? '🚨' : (isWarning ? '⚠️' : '✅');
+        const headerText = isDown ? 'CRITICAL: Monitor Down' : (isWarning ? 'WARNING: Performance Issue' : 'RECOVERY: Service Back Online');
         
-        let color = '#10b981'; // green
-        if (isDown) color = '#ef4444'; // red
-        if (isWarning) color = '#f59e0b'; // orange
-
         return {
-            text: `${isDown ? '🚨' : (isWarning ? '⚠️' : '✅')} *${isDown ? 'ALERT' : (isWarning ? 'DEGRADATION' : 'RECOVERY')}*`,
-            attachments: [{
-                color: color,
-                fields: [
-                    { title: 'Monitor',   value: target,       short: false },
-                    { title: 'Transition', value: `${previousStatus.toUpperCase()} → ${newStatus.toUpperCase()}`, short: true },
-                    { title: 'Time',       value: timestamp,   short: true },
-                    ...(errorMessage ? [{ title: 'Error', value: errorMessage, short: false }] : []),
-                ],
-            }]
+            blocks: [
+                {
+                    type: "header",
+                    text: { type: "plain_text", text: `${statusEmoji} ${headerText}` }
+                },
+                {
+                    type: "section",
+                    fields: [
+                        { type: "mrkdwn", text: `*Monitor:*\n${target}` },
+                        { type: "mrkdwn", text: `*Status:*\n${newStatus.toUpperCase()}` }
+                    ]
+                },
+                ...(errorMessage ? [{
+                    type: "section",
+                    text: { type: "mrkdwn", text: `*Error Detail:*\n\`${errorMessage}\`` }
+                }] : []),
+                {
+                    type: "context",
+                    elements: [{ type: "mrkdwn", text: `*Time:* ${timestamp} UTC | *Monitor Hub*` }]
+                },
+                {
+                    type: "actions",
+                    elements: [{
+                        type: "button",
+                        text: { type: "plain_text", text: "View Dashboard" },
+                        url: `${process.env.BACKEND_URL || 'https://monitorhubs.com'}/dashboard`
+                    }]
+                }
+            ]
         };
     }
 
@@ -119,14 +135,13 @@ class AlertService {
         return {
             embeds: [{
                 title: `${isDown ? '🚨 ALERT — Service Down' : (isWarning ? '⚠️ WARNING — Service Degraded' : '✅ RECOVERY — Service Restored')}`,
+                description: `**Monitor:** ${target}\n**Status:** ${newStatus.toUpperCase()}\n**Time:** ${timestamp}`,
                 color: color,
                 fields: [
-                    { name: 'Monitor',    value: target,       inline: false },
-                    { name: 'Status',     value: `${previousStatus.toUpperCase()} → ${newStatus.toUpperCase()}`, inline: true },
-                    { name: 'Time (UTC)', value: timestamp,    inline: true },
-                    ...(errorMessage ? [{ name: 'Error', value: errorMessage, inline: false }] : []),
+                    ...(errorMessage ? [{ name: 'Error Detail', value: `\`\`\`${errorMessage}\`\`\``, inline: false }] : []),
                 ],
-                footer: { text: 'Monitor Hub Monitoring' }
+                footer: { text: 'Monitor Hub Real-time Telemetry' },
+                timestamp: new Date().toISOString()
             }]
         };
     }

@@ -27,10 +27,18 @@ async function getUserUsage(db, userId) {
     );
 
     const row = res.rows[0];
+
+    // Fetch reports count (last 30 days)
+    const reportRes = await db.query(
+        "SELECT COUNT(*) as count FROM reports WHERE user_id = $1 AND created_at > NOW() - INTERVAL '30 days'",
+        [userId]
+    );
+
     return {
         uptime: parseInt(row.uptime || 0, 10),
         api: parseInt(row.api || 0, 10),
         server: parseInt(row.server || 0, 10),
+        reports: parseInt(reportRes.rows[0].count || 0, 10),
         recycleBin: 0
     };
 }

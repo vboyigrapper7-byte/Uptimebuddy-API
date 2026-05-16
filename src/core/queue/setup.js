@@ -53,8 +53,9 @@ const retentionQueue = new Queue('retention-tasks', { connection: redisConnectio
 const statsQueue = new Queue('stats-tasks', { connection: redisConnection, defaultJobOptions: jobOptions });
 const reminderQueue = new Queue('reminder-checks', { connection: redisConnection, defaultJobOptions: jobOptions });
 const agentQueue = new Queue('agent-tasks', { connection: redisConnection, defaultJobOptions: jobOptions });
-
 const archiveQueue = new Queue('archive-tasks', { connection: redisConnection, defaultJobOptions: jobOptions });
+const expiryQueue    = new Queue('expiry-checks',    { connection: redisConnection, defaultJobOptions: jobOptions });
+const reportQueue    = new Queue('report-tasks',    { connection: redisConnection, defaultJobOptions: jobOptions });
 
 module.exports = {
     redisConnection,
@@ -66,5 +67,7 @@ module.exports = {
     statsQueue,
     reminderQueue,
     agentQueue,
-    archiveQueue
+    archiveQueue,
+    expiryQueue,
+    reportQueue
 };

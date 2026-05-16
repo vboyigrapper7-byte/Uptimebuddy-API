@@ -13,9 +13,11 @@ require('./statsWorker');
 require('./reminderWorker');
 require('./agentWorker');
 require('./archiveWorker');
+require('./expiryWorker');
+require('./reportWorker');
 
 const { syncMonitors } = require('../core/queue/scheduler');
-const { retentionQueue, statsQueue, reminderQueue, agentQueue } = require('../core/queue/setup');
+const { retentionQueue, statsQueue, reminderQueue, agentQueue, expiryQueue } = require('../core/queue/setup');
 
 console.log('--- All Workers Initialized ---');
 
@@ -63,6 +65,16 @@ agentQueue.add(
         jobId: 'system-agent-health-job'
     }
 ).then(() => console.log('[Worker] Periodic agent health check job scheduled.'));
+
+// 6. Schedule Daily Expiry Checks (SSL/Domain) - Runs once a day
+expiryQueue.add(
+    'daily-global-expiry-check',
+    {},
+    {
+        repeat: { cron: '0 0 * * *' }, // Midnight every day
+        jobId: 'system-expiry-check-job'
+    }
+).then(() => console.log('[Worker] Periodic expiry check job scheduled.'));
 
 // 5. SELF-HEALING: Periodic Sync (Runs every hour)
 // This ensures that if Redis is ever wiped/restarted, the monitors are re-queued automatically.

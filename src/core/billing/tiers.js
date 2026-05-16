@@ -12,7 +12,8 @@ const PLAN_TIERS = {
         limits: {
             uptime: 5,
             api: 2,
-            server: 1
+            server: 1,
+            reports: 2
         },
         minInterval: 300, // 5 Minutes
         retentionDays: 1, // 24 Hours
@@ -29,7 +30,8 @@ const PLAN_TIERS = {
         limits: {
             uptime: 25,
             api: 10,
-            server: 3
+            server: 3,
+            reports: 10
         },
         minInterval: 60, // 1 Minute
         retentionDays: 7,
@@ -46,7 +48,8 @@ const PLAN_TIERS = {
         limits: {
             uptime: 100,
             api: 50,
-            server: 10
+            server: 10,
+            reports: 50
         },
         minInterval: 30, // 30 Seconds
         retentionDays: 30,
@@ -63,7 +66,8 @@ const PLAN_TIERS = {
         limits: {
             uptime: 500,
             api: 250,
-            server: 50
+            server: 50,
+            reports: 500
         },
         minInterval: 30, // 30 Seconds
         retentionDays: 365, // 1 Year
