@@ -67,7 +67,7 @@ const getReports = async (request, reply) => {
                     a.name as agent_name
              FROM reports r 
              LEFT JOIN monitors m ON r.monitor_id = m.id 
-             LEFT JOIN agents a ON (r.config->>'agent_id')::int = a.id
+             LEFT JOIN agents a ON r.config->>'agent_id' = a.id::text
              WHERE r.user_id = $1 
              ORDER BY r.created_at DESC`,
             [userId]
