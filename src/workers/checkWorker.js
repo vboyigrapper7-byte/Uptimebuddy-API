@@ -131,6 +131,19 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
             const validation = validateResponse(res, { keyword, assertion_config, expected_status });
             status = validation.status;
             errorMessage = validation.errorMessage;
+
+            // Professionally expose assertion result metadata in the diagnostic log
+            if (type === 'keyword' && status === 'up') {
+                if (assertion_config?.json_path) {
+                    errorMessage = `Assertion passed: Extracted "${validation.extractedValue}" from "${assertion_config.json_path}"`;
+                } else if (assertion_config?.regex_pattern) {
+                    errorMessage = `Assertion passed: Regex match confirmed`;
+                } else if (keyword) {
+                    errorMessage = `Assertion passed: Keyword "${keyword}" found`;
+                } else {
+                    errorMessage = `Assertion passed: HTTP ${res.status} is within expected range`;
+                }
+            }
         }
         // ── TCP Port / Ping ─────────────────────────────────────────────
         else if (type === 'port' || type === 'ping') {
@@ -305,6 +318,7 @@ function isStatusExpected(status, expectedString) {
 function validateResponse(res, config) {
     const { keyword, assertion_config, expected_status } = config;
     const ac = assertion_config || {};
+    let extractedValue = null;
 
     // 1. Status Code Check
     if (!isStatusExpected(res.status, expected_status)) {
@@ -323,8 +337,9 @@ function validateResponse(res, config) {
     if (ac.json_path && ac.json_value !== undefined) {
         try {
             const matches = jp.query(res.data, ac.json_path);
+            extractedValue = matches.length > 0 ? matches[0] : null;
             if (matches.length === 0 || String(matches[0]) !== String(ac.json_value)) {
-                return { status: 'down', errorMessage: `JSONPath "${ac.json_path}" mismatch: got ${matches[0]}` };
+                return { status: 'down', errorMessage: `JSONPath "${ac.json_path}" mismatch: got ${extractedValue}`, extractedValue };
             }
         } catch (e) {
             return { status: 'down', errorMessage: `JSONPath Query Error: ${e.message}` };
@@ -336,15 +351,17 @@ function validateResponse(res, config) {
         try {
             const regex = new RegExp(ac.regex_pattern);
             const bodyText = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+            const match = bodyText.match(regex);
+            extractedValue = match ? match[0] : null;
             if (!regex.test(bodyText)) {
-                return { status: 'down', errorMessage: `Regex pattern mismatch` };
+                return { status: 'down', errorMessage: `Regex pattern mismatch`, extractedValue };
             }
         } catch (e) {
             return { status: 'down', errorMessage: `Invalid Regex Pattern: ${e.message}` };
         }
     }
 
-    return { status: 'up', errorMessage: null };
+    return { status: 'up', errorMessage: null, extractedValue };
 }
 
 checkWorker.on('completed', (job) => {
