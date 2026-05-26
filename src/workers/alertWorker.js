@@ -133,6 +133,19 @@ const alertWorker = new Worker('alert-webhooks', async (job) => {
     // ── 2. Dispatch System-wide Alerts (Internal Ops) ───────────────────
     await alertService.dispatch(job.data);
 
+    // Log system-wide telegram dispatch if configured
+    if (alertService.telegramToken && alertService.telegramChatId) {
+        try {
+            await pool.query(
+                `INSERT INTO alert_logs (user_id, monitor_id, alert_type, status, provider)
+                 VALUES ($1, $2, $3, $4, $5)`,
+                [userId, job.data.isAgent ? null : monitorId, newStatus, 'success', 'system-telegram']
+            );
+        } catch (logErr) {
+            logger.error(`[AlertWorker] Failed to log system telegram: ${logErr.message}`);
+        }
+    }
+
     // ── 3. Dispatch Per-user Webhooks (Slack, Discord, Custom) ────────────────
     if (!webhooksEnabled) {
         logger.info(`[AlertWorker] Webhooks disabled for user ${userId} — skipping`);
@@ -189,9 +202,22 @@ const alertWorker = new Worker('alert-webhooks', async (job) => {
                 continue;
             } else if (wh.provider === 'email') {
                 const emails = wh.url.split(',').map(e => e.trim()).filter(e => e.length > 0);
-                for (const email of emails) {
-                    await alertService.sendEmail(job.data, email);
+                let success = false;
+                let lastError = null;
+                try {
+                    for (const email of emails) {
+                        await alertService.sendEmail(job.data, email);
+                    }
+                    success = true;
+                } catch (err) {
+                    lastError = err.message;
+                    logger.error(`[AlertWorker] Email webhook failed: ${err.message}`);
                 }
+                await pool.query(
+                    `INSERT INTO alert_logs (user_id, monitor_id, alert_type, status, error_message, provider)
+                     VALUES ($1, $2, $3, $4, $5, $6)`,
+                    [userId, job.data.isAgent ? null : monitorId, newStatus, success ? 'success' : 'failed', success ? null : lastError, 'email']
+                );
                 continue;
             } else if (wh.provider === 'generic') {
                 payload = {
