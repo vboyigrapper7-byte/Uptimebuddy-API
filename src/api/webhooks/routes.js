@@ -36,6 +36,23 @@ async function webhookRoutes(fastify, options) {
             return reply.status(400).send({ error: `Unsupported provider. Use: ${ALLOWED_PROVIDERS.join(', ')}` });
         }
 
+        // Plan-based alert channel enforcement
+        const PLAN_ALLOWED_PROVIDERS = {
+            free:      ['telegram'],
+            starter:   ['telegram', 'email'],
+            pro:       ['telegram', 'email', 'slack', 'discord'],
+            business:  ['telegram', 'email', 'slack', 'discord'],
+            pro_trial: ['telegram', 'email', 'slack', 'discord'],
+        };
+        const userTier = request.user.tier || 'free';
+        const allowedForPlan = PLAN_ALLOWED_PROVIDERS[userTier] || PLAN_ALLOWED_PROVIDERS.free;
+        if (!allowedForPlan.includes(provider)) {
+            return reply.status(403).send({
+                error: `Your ${userTier} plan does not include ${provider} alerts. Please upgrade to access this channel.`,
+                upgradeRequired: true
+            });
+        }
+
         // URL validation + SSRF guard (Exempt Telegram/Email as they use non-URL formats)
         if (provider !== 'telegram' && provider !== 'email') {
             try {

@@ -3,7 +3,7 @@
  */
 
 const controller = require('./controller');
-const { requireAuth, requireRole } = require('./middleware');
+const { requireAuth, requireRole, requirePlan } = require('./middleware');
 
 async function authRoutes(fastify, options) {
     
@@ -45,7 +45,7 @@ async function authRoutes(fastify, options) {
         });
 
         // API Key Management
-        protectedScope.post('/api-key', controller.createApiKey);
+        protectedScope.post('/api-key', { preHandler: [requirePlan('developer_api')] }, controller.createApiKey);
 
         // Admin-only Example
         protectedScope.get('/admin-test', { preHandler: [requireRole('admin')] }, async () => {

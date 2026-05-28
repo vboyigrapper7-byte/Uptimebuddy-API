@@ -54,6 +54,12 @@ class PlanService {
                 return tier.id === 'business';
             case 'status_pages':
                 return ['pro', 'business'].includes(tier.id);
+            case 'incident_history':
+                return ['starter', 'pro', 'business', 'pro_trial'].includes(tier.id);
+            case 'developer_api':
+                return ['pro', 'business', 'pro_trial'].includes(tier.id);
+            case 'data_archival':
+                return ['pro', 'business', 'pro_trial'].includes(tier.id);
             default:
                 return false;
         }
