@@ -53,7 +53,7 @@ class PlanService {
             case 'audit_logs':
                 return tier.id === 'business';
             case 'status_pages':
-                return ['pro', 'business'].includes(tier.id);
+                return ['starter', 'pro', 'business', 'pro_trial'].includes(tier.id);
             case 'incident_history':
                 return ['starter', 'pro', 'business', 'pro_trial'].includes(tier.id);
             case 'developer_api':

@@ -50,7 +50,7 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
     const monitorRes = await pool.query(
         `SELECT m.*, u.tier, u.plan_expiry,
                 s.on_down, s.on_up, s.on_warning, s.cooldown_mins, s.threshold_retries,
-                (SELECT count(*) FROM monitors WHERE user_id = m.user_id) as user_monitor_count
+                (SELECT count(*) FROM monitors WHERE user_id = m.user_id AND category = m.category) as category_monitor_count
          FROM monitors m
          JOIN users u ON m.user_id = u.id
          LEFT JOIN alert_settings s ON m.user_id = s.user_id
@@ -65,21 +65,21 @@ const checkWorker = new Worker('monitor-checks', async (job) => {
 
     const monitor = monitorRes.rows[0];
     const { 
-        target, type, keyword, status: prev_status, user_id, method, headers, body, 
+        target, type, category, keyword, status: prev_status, user_id, method, headers, body, 
         timeout_ms, max_retries, expected_status, threshold_ms, region, assertion_config, 
-        tier, plan_expiry, user_monitor_count,
+        tier, plan_expiry, category_monitor_count,
         on_down, on_up, on_warning, cooldown_mins, alerts_enabled
     } = monitor;
 
     // ── 1. Monitor Bypass Guard (Plan Enforcement) ─────────────────────────
     const tierConfig = planService.getEffectiveTier({ tier, plan_expiry });
-    const limit = tierConfig.limits.uptime || 5;
+    const limit = tierConfig.limits[category] || 5;
 
-    if (user_monitor_count > limit) {
+    if (category_monitor_count > limit) {
         // Find which monitors are "In-Budget" (simplistic: oldest ones)
         const budgetRes = await pool.query(
-            'SELECT id FROM monitors WHERE user_id = $1 ORDER BY created_at ASC LIMIT $2',
-            [user_id, limit]
+            'SELECT id FROM monitors WHERE user_id = $1 AND category = $2 ORDER BY created_at ASC LIMIT $3',
+            [user_id, category, limit]
         );
         const allowedIds = budgetRes.rows.map(r => r.id);
         if (!allowedIds.includes(monitorId)) {
