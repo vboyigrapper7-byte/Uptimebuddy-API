@@ -5,23 +5,32 @@ const whois = require('whois-json');
 const pool = require('../core/db/pool');
 const logger = require('../core/utils/logger');
 const { workerRedisConnection, alertQueue } = require('../core/queue/setup');
+const planService = require('../core/billing/planService');
 
-const EXPIRY_THRESHOLD_DAYS = 14;
+// Alert at 30, 14, 7, and 1 day(s) before expiry — matches marketing promises
+const EXPIRY_ALERT_DAYS = [30, 14, 7, 1];
 
 const expiryWorker = new Worker('expiry-checks', async (job) => {
     logger.info('[ExpiryWorker] Starting global expiry checks...');
 
     try {
-        // Fetch all HTTPS monitors and monitors that might need domain checks
+        // Fetch all non-paused monitors with their user's tier for plan gating
         const monitorsRes = await pool.query(
-            'SELECT id, name, target, type, user_id FROM monitors WHERE status != $1',
+            `SELECT m.id, m.name, m.target, m.type, m.user_id, u.tier, u.plan_expiry
+             FROM monitors m
+             JOIN users u ON u.id = m.user_id
+             WHERE m.status != $1`,
             ['paused']
         );
 
         for (const monitor of monitorsRes.rows) {
             try {
                 if (monitor.type === 'https' || monitor.type === 'http') {
-                    await checkSSLExpiry(monitor);
+                    // SSL monitoring is a paid feature — skip for free-tier users
+                    const user = { id: monitor.user_id, tier: monitor.tier, plan_expiry: monitor.plan_expiry };
+                    if (planService.canUseFeature(user, 'ssl_monitoring')) {
+                        await checkSSLExpiry(monitor);
+                    }
                 }
                 await checkDomainExpiry(monitor);
             } catch (err) {
@@ -48,26 +57,51 @@ async function checkSSLExpiry(monitor) {
             const port = url.port || 443;
             const hostname = url.hostname;
 
-            const socket = tls.connect(port, hostname, { servername: hostname }, () => {
-                const cert = socket.getPeerCertificate();
-                if (cert && cert.valid_to) {
-                    const expiryDate = new Date(cert.valid_to);
-                    updateMonitorExpiry(monitor.id, 'ssl', expiryDate);
-                    
-                    // Trigger alert if expiring soon
-                    checkAndAlert(monitor, 'SSL', expiryDate);
+            const socket = tls.connect(port, hostname, { servername: hostname, rejectUnauthorized: false }, () => {
+                try {
+                    const cert = socket.getPeerCertificate(true);
+                    const authorized = socket.authorized;
+
+                    if (cert && cert.valid_to) {
+                        const expiryDate = new Date(cert.valid_to);
+
+                        // Extract comprehensive certificate details
+                        const sslDetails = {
+                            ssl_expiry: expiryDate,
+                            ssl_valid_from: cert.valid_from ? new Date(cert.valid_from) : null,
+                            ssl_issuer: formatCertField(cert.issuer),
+                            ssl_subject: formatCertField(cert.subject),
+                            ssl_fingerprint: cert.fingerprint256 || cert.fingerprint || null,
+                            ssl_sans: extractSANs(cert.subjectaltname),
+                            ssl_protocol: socket.getProtocol ? socket.getProtocol() : null,
+                            ssl_cipher: socket.getCipher ? socket.getCipher().name : null,
+                            ssl_is_valid: authorized && expiryDate > new Date(),
+                            ssl_error: authorized ? null : (socket.authorizationError || 'Certificate validation failed'),
+                        };
+
+                        updateMonitorSSLDetails(monitor.id, sslDetails);
+
+                        // Trigger alert if expiring soon
+                        checkAndAlert(monitor, 'SSL', expiryDate);
+                    }
+                } catch (parseErr) {
+                    logger.warn(`[ExpiryWorker] SSL parse error for ${hostname}: ${parseErr.message}`);
                 }
+
                 socket.end();
                 resolve();
             });
 
             socket.on('error', (err) => {
                 logger.warn(`[ExpiryWorker] SSL check failed for ${hostname}: ${err.message}`);
+                // Record the SSL error so the dashboard can display it
+                updateMonitorSSLError(monitor.id, err.message);
                 socket.destroy();
                 resolve();
             });
 
             socket.setTimeout(10000, () => {
+                updateMonitorSSLError(monitor.id, 'SSL connection timed out (10s)');
                 socket.destroy();
                 resolve();
             });
@@ -75,6 +109,37 @@ async function checkSSLExpiry(monitor) {
             resolve();
         }
     });
+}
+
+/**
+ * Format issuer/subject object into a readable string.
+ * e.g. { O: "Let's Encrypt", CN: "R3" } → "CN=R3, O=Let's Encrypt"
+ */
+function formatCertField(field) {
+    if (!field) return null;
+    if (typeof field === 'string') return field;
+    const parts = [];
+    if (field.CN) parts.push(`CN=${field.CN}`);
+    if (field.O)  parts.push(`O=${field.O}`);
+    if (field.OU) parts.push(`OU=${field.OU}`);
+    if (field.C)  parts.push(`C=${field.C}`);
+    if (field.ST) parts.push(`ST=${field.ST}`);
+    if (field.L)  parts.push(`L=${field.L}`);
+    return parts.length > 0 ? parts.join(', ') : JSON.stringify(field);
+}
+
+/**
+ * Extract Subject Alternative Names from the subjectaltname string.
+ * Input:  "DNS:example.com, DNS:*.example.com, DNS:www.example.com"
+ * Output: JSON string array: '["example.com","*.example.com","www.example.com"]'
+ */
+function extractSANs(subjectaltname) {
+    if (!subjectaltname) return null;
+    const sans = subjectaltname
+        .split(',')
+        .map(s => s.trim().replace(/^DNS:/i, ''))
+        .filter(Boolean);
+    return JSON.stringify(sans);
 }
 
 async function checkDomainExpiry(monitor) {
@@ -100,6 +165,36 @@ async function checkDomainExpiry(monitor) {
     }
 }
 
+async function updateMonitorSSLDetails(monitorId, details) {
+    try {
+        await pool.query(
+            `UPDATE monitors SET 
+                ssl_expiry = $1, ssl_valid_from = $2, ssl_issuer = $3, ssl_subject = $4,
+                ssl_fingerprint = $5, ssl_sans = $6, ssl_protocol = $7, ssl_cipher = $8,
+                ssl_is_valid = $9, ssl_error = $10, last_ssl_check = NOW()
+             WHERE id = $11`,
+            [
+                details.ssl_expiry, details.ssl_valid_from, details.ssl_issuer, details.ssl_subject,
+                details.ssl_fingerprint, details.ssl_sans, details.ssl_protocol, details.ssl_cipher,
+                details.ssl_is_valid, details.ssl_error, monitorId
+            ]
+        );
+    } catch (err) {
+        logger.error(`[ExpiryWorker] Failed to update SSL details for monitor ${monitorId}: ${err.message}`);
+    }
+}
+
+async function updateMonitorSSLError(monitorId, errorMessage) {
+    try {
+        await pool.query(
+            `UPDATE monitors SET ssl_is_valid = false, ssl_error = $1, last_ssl_check = NOW() WHERE id = $2`,
+            [errorMessage, monitorId]
+        );
+    } catch (err) {
+        logger.error(`[ExpiryWorker] Failed to update SSL error for monitor ${monitorId}: ${err.message}`);
+    }
+}
+
 async function updateMonitorExpiry(monitorId, type, expiryDate) {
     const column = type === 'ssl' ? 'ssl_expiry' : 'domain_expiry';
     const checkColumn = type === 'ssl' ? 'last_ssl_check' : 'last_domain_check';
@@ -112,22 +207,30 @@ async function updateMonitorExpiry(monitorId, type, expiryDate) {
 
 async function checkAndAlert(monitor, label, expiryDate) {
     const daysRemaining = Math.floor((expiryDate - new Date()) / (1000 * 60 * 60 * 24));
-    
-    if (daysRemaining <= EXPIRY_THRESHOLD_DAYS && daysRemaining >= 0) {
-        logger.info(`[ExpiryWorker] Dispatching ${label} expiry alert for ${monitor.name} (${daysRemaining} days remaining)`);
-        
-        await alertQueue.add(
-            `expiry-alert-${monitor.id}-${label.toLowerCase()}`,
-            {
-                monitorId: monitor.id,
-                target: monitor.target,
-                previousStatus: 'up',
-                newStatus: 'warning',
-                errorMessage: `${label} Certificate expiring in ${daysRemaining} days (Expiry: ${expiryDate.toDateString()})`,
-                timestamp: new Date().toISOString()
-            },
-            { removeOnComplete: true }
-        );
+
+    // Find the appropriate alert threshold
+    for (const threshold of EXPIRY_ALERT_DAYS) {
+        if (daysRemaining <= threshold && daysRemaining >= 0) {
+            logger.info(`[ExpiryWorker] Dispatching ${label} expiry alert for ${monitor.name} (${daysRemaining} days remaining, threshold: ${threshold}d)`);
+            
+            await alertQueue.add(
+                `expiry-alert-${monitor.id}-${label.toLowerCase()}-${threshold}d`,
+                {
+                    monitorId: monitor.id,
+                    target: monitor.target,
+                    previousStatus: 'up',
+                    newStatus: 'warning',
+                    errorMessage: `${label} Certificate expiring in ${daysRemaining} day${daysRemaining !== 1 ? 's' : ''} (Expiry: ${expiryDate.toDateString()})`,
+                    timestamp: new Date().toISOString()
+                },
+                { 
+                    removeOnComplete: true,
+                    // Deduplicate: only fire once per threshold per day
+                    jobId: `expiry-${monitor.id}-${label.toLowerCase()}-${threshold}d-${new Date().toISOString().split('T')[0]}`
+                }
+            );
+            break; // Only send the most urgent alert level
+        }
     }
 }
 

@@ -2,7 +2,9 @@ const { monitorQueue } = require('../../core/queue/setup');
 const { scheduleMonitor, unscheduleMonitor } = require('../../core/queue/scheduler');
 const { z } = require('zod');
 const axios = require('axios');
+const tls = require('tls');
 const usageService = require('../../core/auth/usageService');
+const planService = require('../../core/billing/planService');
 const { getSafeAxiosConfig } = require('../../core/utils/ssrf');
 
 // ── SSRF blocklist — private/loopback IP ranges ───────────────────────────
@@ -472,4 +474,223 @@ const toggleMonitorStatus = async (request, reply) => {
     }
 };
 
-module.exports = { createMonitor, getMonitors, updateMonitor, deleteMonitor, getMonitorMetrics, getMonitorLogs, getIncidents, testMonitor, toggleMonitorStatus };
+// ── SSL Certificate Details ───────────────────────────────────────────────
+const getSSLDetails = async (request, reply) => {
+    const { id } = request.params;
+    const userId = request.user.id;
+
+    // Plan gating: SSL monitoring is a paid feature
+    if (!planService.canUseFeature(request.user, 'ssl_monitoring')) {
+        return reply.code(403).send({
+            error: 'SSL Monitoring is available on Starter, Pro, and Business plans.',
+            upgradeRequired: true,
+            billingUrl: '/dashboard/billing'
+        });
+    }
+
+    try {
+        const result = await request.server.db.query(
+            `SELECT id, name, target, type, status,
+                    ssl_expiry, ssl_valid_from, ssl_issuer, ssl_subject,
+                    ssl_fingerprint, ssl_sans, ssl_protocol, ssl_cipher,
+                    ssl_is_valid, ssl_error, last_ssl_check,
+                    domain_expiry, last_domain_check
+             FROM monitors
+             WHERE id = $1 AND user_id = $2`,
+            [id, userId]
+        );
+
+        if (result.rows.length === 0) {
+            return reply.code(404).send({ error: 'Monitor not found' });
+        }
+
+        const monitor = result.rows[0];
+
+        // Calculate days remaining
+        let daysRemaining = null;
+        let domainDaysRemaining = null;
+        if (monitor.ssl_expiry) {
+            daysRemaining = Math.floor((new Date(monitor.ssl_expiry) - new Date()) / (1000 * 60 * 60 * 24));
+        }
+        if (monitor.domain_expiry) {
+            domainDaysRemaining = Math.floor((new Date(monitor.domain_expiry) - new Date()) / (1000 * 60 * 60 * 24));
+        }
+
+        // Parse SANs from JSON string
+        let sans = [];
+        if (monitor.ssl_sans) {
+            try { sans = JSON.parse(monitor.ssl_sans); } catch (e) { sans = []; }
+        }
+
+        return reply.send({
+            monitor_id: monitor.id,
+            monitor_name: monitor.name,
+            target: monitor.target,
+            certificate: {
+                is_valid: monitor.ssl_is_valid,
+                error: monitor.ssl_error,
+                issuer: monitor.ssl_issuer,
+                subject: monitor.ssl_subject,
+                valid_from: monitor.ssl_valid_from,
+                valid_to: monitor.ssl_expiry,
+                days_remaining: daysRemaining,
+                fingerprint: monitor.ssl_fingerprint,
+                sans: sans,
+                protocol: monitor.ssl_protocol,
+                cipher: monitor.ssl_cipher,
+            },
+            domain: {
+                expiry: monitor.domain_expiry,
+                days_remaining: domainDaysRemaining,
+            },
+            last_checked: monitor.last_ssl_check,
+        });
+    } catch (error) {
+        request.log.error(error, 'getSSLDetails error');
+        return reply.code(500).send({ error: 'Failed to fetch SSL details' });
+    }
+};
+
+// ── On-Demand SSL Check ───────────────────────────────────────────────────
+const triggerSSLCheck = async (request, reply) => {
+    const { id } = request.params;
+    const userId = request.user.id;
+
+    // Plan gating: SSL monitoring is a paid feature
+    if (!planService.canUseFeature(request.user, 'ssl_monitoring')) {
+        return reply.code(403).send({
+            error: 'SSL Monitoring is available on Starter, Pro, and Business plans.',
+            upgradeRequired: true,
+            billingUrl: '/dashboard/billing'
+        });
+    }
+
+    try {
+        const verify = await request.server.db.query(
+            'SELECT id, name, target, type FROM monitors WHERE id = $1 AND user_id = $2',
+            [id, userId]
+        );
+        if (verify.rows.length === 0) {
+            return reply.code(404).send({ error: 'Monitor not found' });
+        }
+
+        const monitor = verify.rows[0];
+        if (!monitor.target.startsWith('http')) {
+            return reply.code(400).send({ error: 'Monitor target must be an HTTP/HTTPS URL for SSL checks' });
+        }
+
+        const url = new URL(monitor.target);
+        const hostname = url.hostname;
+        const port = url.port || 443;
+
+        // Perform immediate SSL check
+        const sslResult = await new Promise((resolve) => {
+            try {
+                const socket = tls.connect(port, hostname, { servername: hostname, rejectUnauthorized: false }, () => {
+                    try {
+                        const cert = socket.getPeerCertificate(true);
+                        const authorized = socket.authorized;
+
+                        if (cert && cert.valid_to) {
+                            const expiryDate = new Date(cert.valid_to);
+                            const validFrom = cert.valid_from ? new Date(cert.valid_from) : null;
+
+                            // Format issuer/subject
+                            const formatField = (f) => {
+                                if (!f) return null;
+                                if (typeof f === 'string') return f;
+                                const parts = [];
+                                if (f.CN) parts.push(`CN=${f.CN}`);
+                                if (f.O) parts.push(`O=${f.O}`);
+                                if (f.OU) parts.push(`OU=${f.OU}`);
+                                if (f.C) parts.push(`C=${f.C}`);
+                                return parts.length > 0 ? parts.join(', ') : JSON.stringify(f);
+                            };
+
+                            // Extract SANs
+                            let sans = [];
+                            if (cert.subjectaltname) {
+                                sans = cert.subjectaltname.split(',').map(s => s.trim().replace(/^DNS:/i, '')).filter(Boolean);
+                            }
+
+                            const details = {
+                                ssl_expiry: expiryDate,
+                                ssl_valid_from: validFrom,
+                                ssl_issuer: formatField(cert.issuer),
+                                ssl_subject: formatField(cert.subject),
+                                ssl_fingerprint: cert.fingerprint256 || cert.fingerprint || null,
+                                ssl_sans: JSON.stringify(sans),
+                                ssl_protocol: socket.getProtocol ? socket.getProtocol() : null,
+                                ssl_cipher: socket.getCipher ? socket.getCipher().name : null,
+                                ssl_is_valid: authorized && expiryDate > new Date(),
+                                ssl_error: authorized ? null : (socket.authorizationError || 'Certificate validation failed'),
+                            };
+
+                            // Update DB
+                            request.server.db.query(
+                                `UPDATE monitors SET 
+                                    ssl_expiry = $1, ssl_valid_from = $2, ssl_issuer = $3, ssl_subject = $4,
+                                    ssl_fingerprint = $5, ssl_sans = $6, ssl_protocol = $7, ssl_cipher = $8,
+                                    ssl_is_valid = $9, ssl_error = $10, last_ssl_check = NOW()
+                                 WHERE id = $11`,
+                                [
+                                    details.ssl_expiry, details.ssl_valid_from, details.ssl_issuer, details.ssl_subject,
+                                    details.ssl_fingerprint, details.ssl_sans, details.ssl_protocol, details.ssl_cipher,
+                                    details.ssl_is_valid, details.ssl_error, monitor.id
+                                ]
+                            );
+
+                            const daysRemaining = Math.floor((expiryDate - new Date()) / (1000 * 60 * 60 * 24));
+
+                            resolve({
+                                success: true,
+                                certificate: {
+                                    is_valid: details.ssl_is_valid,
+                                    error: details.ssl_error,
+                                    issuer: details.ssl_issuer,
+                                    subject: details.ssl_subject,
+                                    valid_from: details.ssl_valid_from,
+                                    valid_to: details.ssl_expiry,
+                                    days_remaining: daysRemaining,
+                                    fingerprint: details.ssl_fingerprint,
+                                    sans: sans,
+                                    protocol: details.ssl_protocol,
+                                    cipher: details.ssl_cipher,
+                                },
+                                checked_at: new Date().toISOString()
+                            });
+                        } else {
+                            resolve({ success: false, error: 'No certificate found' });
+                        }
+                    } catch (parseErr) {
+                        resolve({ success: false, error: `Certificate parse error: ${parseErr.message}` });
+                    }
+                    socket.end();
+                });
+
+                socket.on('error', (err) => {
+                    request.server.db.query(
+                        `UPDATE monitors SET ssl_is_valid = false, ssl_error = $1, last_ssl_check = NOW() WHERE id = $2`,
+                        [err.message, monitor.id]
+                    );
+                    socket.destroy();
+                    resolve({ success: false, error: `SSL connection failed: ${err.message}` });
+                });
+
+                socket.setTimeout(10000, () => {
+                    socket.destroy();
+                    resolve({ success: false, error: 'SSL connection timed out (10s)' });
+                });
+            } catch (e) {
+                resolve({ success: false, error: e.message });
+            }
+        });
+
+        return reply.send(sslResult);
+    } catch (error) {
+        request.log.error(error, 'triggerSSLCheck error');
+        return reply.code(500).send({ error: 'Failed to perform SSL check' });
+    }
+};
+
+module.exports = { createMonitor, getMonitors, updateMonitor, deleteMonitor, getMonitorMetrics, getMonitorLogs, getIncidents, testMonitor, toggleMonitorStatus, getSSLDetails, triggerSSLCheck };

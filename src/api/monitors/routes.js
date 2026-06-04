@@ -1,4 +1,4 @@
-const { createMonitor, getMonitors, updateMonitor, deleteMonitor, getMonitorMetrics, getMonitorLogs, getIncidents, testMonitor, toggleMonitorStatus } = require('./controller');
+const { createMonitor, getMonitors, updateMonitor, deleteMonitor, getMonitorMetrics, getMonitorLogs, getIncidents, testMonitor, toggleMonitorStatus, getSSLDetails, triggerSSLCheck } = require('./controller');
 
 async function monitorRoutes(fastify, options) {
     const { requireAuth } = require('../auth/middleware');
@@ -20,6 +20,10 @@ async function monitorRoutes(fastify, options) {
     fastify.get('/:id/metrics',  getMonitorMetrics);
     fastify.get('/incidents',    getIncidents);
     fastify.get('/:id/logs',     getMonitorLogs);
+    fastify.get('/:id/ssl',      getSSLDetails);
+    fastify.post('/:id/ssl/check', {
+        config: { rateLimit: { max: 3, timeWindow: '1 minute' } }
+    }, triggerSSLCheck);
 }
 
 module.exports = monitorRoutes;

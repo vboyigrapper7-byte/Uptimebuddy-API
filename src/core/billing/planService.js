@@ -60,6 +60,8 @@ class PlanService {
                 return ['pro', 'business', 'pro_trial'].includes(tier.id);
             case 'data_archival':
                 return ['pro', 'business', 'pro_trial'].includes(tier.id);
+            case 'ssl_monitoring':
+                return ['starter', 'pro', 'business', 'pro_trial'].includes(tier.id);
             default:
                 return false;
         }

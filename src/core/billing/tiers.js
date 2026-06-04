@@ -19,7 +19,8 @@ const PLAN_TIERS = {
         retentionDays: 1, // 24 Hours
         features: {
             advancedApi: false,
-            prioritySupport: false
+            prioritySupport: false,
+            sslMonitoring: false
         }
     },
     starter: {
@@ -37,7 +38,8 @@ const PLAN_TIERS = {
         retentionDays: 7,
         features: {
             advancedApi: true,
-            prioritySupport: false
+            prioritySupport: false,
+            sslMonitoring: true
         }
     },
     pro: {
@@ -55,7 +57,8 @@ const PLAN_TIERS = {
         retentionDays: 30,
         features: {
             advancedApi: true,
-            prioritySupport: true
+            prioritySupport: true,
+            sslMonitoring: true
         }
     },
     business: {
@@ -74,7 +77,8 @@ const PLAN_TIERS = {
         features: {
             advancedApi: true,
             prioritySupport: true,
-            dedicatedAccountManager: true
+            dedicatedAccountManager: true,
+            sslMonitoring: true
         }
     }
 };
