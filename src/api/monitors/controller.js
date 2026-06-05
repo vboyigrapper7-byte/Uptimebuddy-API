@@ -119,6 +119,13 @@ const createMonitor = async (request, reply) => {
         } catch (queueError) {
             request.log.error(queueError, `Queue failed for monitor ${monitor.id}`);
         }
+
+        // Perform initial SSL check asynchronously in the background for paid tiers
+        if ((monitor.type === 'http' || monitor.type === 'https') && planService.canUseFeature(request.user, 'ssl_monitoring')) {
+            performSSLCheck(request.server.db, monitor).catch(err => {
+                request.log.error(err, `Background initial SSL check failed for monitor ${monitor.id}`);
+            });
+        }
         
         return reply.code(201).send(monitor);
     } catch (error) {
@@ -551,6 +558,119 @@ const getSSLDetails = async (request, reply) => {
     }
 };
 
+// ── SSL Check Helper Function ─────────────────────────────────────────────
+const performSSLCheck = (db, monitor) => {
+    return new Promise((resolve) => {
+        if (!monitor.target || !monitor.target.startsWith('http')) {
+            return resolve({ success: false, error: 'Target must use HTTP or HTTPS protocol' });
+        }
+        try {
+            const url = new URL(monitor.target);
+            const hostname = url.hostname;
+            const port = url.port || 443;
+
+            const socket = tls.connect(port, hostname, { servername: hostname, rejectUnauthorized: false }, () => {
+                try {
+                    const cert = socket.getPeerCertificate(true);
+                    const authorized = socket.authorized;
+
+                    if (cert && cert.valid_to) {
+                        const expiryDate = new Date(cert.valid_to);
+                        const validFrom = cert.valid_from ? new Date(cert.valid_from) : null;
+
+                        const formatField = (f) => {
+                            if (!f) return null;
+                            if (typeof f === 'string') return f;
+                            const parts = [];
+                            if (f.CN) parts.push(`CN=${f.CN}`);
+                            if (f.O) parts.push(`O=${f.O}`);
+                            if (f.OU) parts.push(`OU=${f.OU}`);
+                            if (f.C) parts.push(`C=${f.C}`);
+                            return parts.length > 0 ? parts.join(', ') : JSON.stringify(f);
+                        };
+
+                        let sans = [];
+                        if (cert.subjectaltname) {
+                            sans = cert.subjectaltname.split(',').map(s => s.trim().replace(/^DNS:/i, '')).filter(Boolean);
+                        }
+
+                        const details = {
+                            ssl_expiry: expiryDate,
+                            ssl_valid_from: validFrom,
+                            ssl_issuer: formatField(cert.issuer),
+                            ssl_subject: formatField(cert.subject),
+                            ssl_fingerprint: cert.fingerprint256 || cert.fingerprint || null,
+                            ssl_sans: JSON.stringify(sans),
+                            ssl_protocol: socket.getProtocol ? socket.getProtocol() : null,
+                            ssl_cipher: socket.getCipher ? socket.getCipher().name : null,
+                            ssl_is_valid: authorized && expiryDate > new Date(),
+                            ssl_error: authorized ? null : (socket.authorizationError || 'Certificate validation failed'),
+                        };
+
+                        db.query(
+                            `UPDATE monitors SET 
+                                ssl_expiry = $1, ssl_valid_from = $2, ssl_issuer = $3, ssl_subject = $4,
+                                ssl_fingerprint = $5, ssl_sans = $6, ssl_protocol = $7, ssl_cipher = $8,
+                                ssl_is_valid = $9, ssl_error = $10, last_ssl_check = NOW()
+                             WHERE id = $11`,
+                            [
+                                details.ssl_expiry, details.ssl_valid_from, details.ssl_issuer, details.ssl_subject,
+                                details.ssl_fingerprint, details.ssl_sans, details.ssl_protocol, details.ssl_cipher,
+                                details.ssl_is_valid, details.ssl_error, monitor.id
+                            ]
+                        ).catch(err => {
+                            console.error('[SSL Check] DB write error:', err.message);
+                        });
+
+                        const daysRemaining = Math.floor((expiryDate - new Date()) / (1000 * 60 * 60 * 24));
+
+                        resolve({
+                            success: true,
+                            certificate: {
+                                is_valid: details.ssl_is_valid,
+                                error: details.ssl_error,
+                                issuer: details.ssl_issuer,
+                                subject: details.ssl_subject,
+                                valid_from: details.ssl_valid_from,
+                                valid_to: details.ssl_expiry,
+                                days_remaining: daysRemaining,
+                                fingerprint: details.ssl_fingerprint,
+                                sans: sans,
+                                protocol: details.ssl_protocol,
+                                cipher: details.ssl_cipher,
+                            },
+                            checked_at: new Date().toISOString()
+                        });
+                    } else {
+                        resolve({ success: false, error: 'No certificate found' });
+                    }
+                } catch (parseErr) {
+                    resolve({ success: false, error: `Certificate parse error: ${parseErr.message}` });
+                }
+                socket.end();
+            });
+
+            socket.on('error', (err) => {
+                db.query(
+                    `UPDATE monitors SET ssl_is_valid = false, ssl_error = $1, last_ssl_check = NOW() WHERE id = $2`,
+                    [err.message, monitor.id]
+                ).catch(dbErr => {
+                    console.error('[SSL Check] DB error write error:', dbErr.message);
+                });
+                socket.destroy();
+                resolve({ success: false, error: `SSL connection failed: ${err.message}` });
+            });
+
+            socket.setTimeout(10000, () => {
+                socket.destroy();
+                resolve({ success: false, error: 'SSL connection timed out (10s)' });
+            });
+        } catch (e) {
+            resolve({ success: false, error: e.message });
+        }
+    });
+};
+
 // ── On-Demand SSL Check ───────────────────────────────────────────────────
 const triggerSSLCheck = async (request, reply) => {
     const { id } = request.params;
@@ -579,113 +699,7 @@ const triggerSSLCheck = async (request, reply) => {
             return reply.code(400).send({ error: 'Monitor target must be an HTTP/HTTPS URL for SSL checks' });
         }
 
-        const url = new URL(monitor.target);
-        const hostname = url.hostname;
-        const port = url.port || 443;
-
-        // Perform immediate SSL check
-        const sslResult = await new Promise((resolve) => {
-            try {
-                const socket = tls.connect(port, hostname, { servername: hostname, rejectUnauthorized: false }, () => {
-                    try {
-                        const cert = socket.getPeerCertificate(true);
-                        const authorized = socket.authorized;
-
-                        if (cert && cert.valid_to) {
-                            const expiryDate = new Date(cert.valid_to);
-                            const validFrom = cert.valid_from ? new Date(cert.valid_from) : null;
-
-                            // Format issuer/subject
-                            const formatField = (f) => {
-                                if (!f) return null;
-                                if (typeof f === 'string') return f;
-                                const parts = [];
-                                if (f.CN) parts.push(`CN=${f.CN}`);
-                                if (f.O) parts.push(`O=${f.O}`);
-                                if (f.OU) parts.push(`OU=${f.OU}`);
-                                if (f.C) parts.push(`C=${f.C}`);
-                                return parts.length > 0 ? parts.join(', ') : JSON.stringify(f);
-                            };
-
-                            // Extract SANs
-                            let sans = [];
-                            if (cert.subjectaltname) {
-                                sans = cert.subjectaltname.split(',').map(s => s.trim().replace(/^DNS:/i, '')).filter(Boolean);
-                            }
-
-                            const details = {
-                                ssl_expiry: expiryDate,
-                                ssl_valid_from: validFrom,
-                                ssl_issuer: formatField(cert.issuer),
-                                ssl_subject: formatField(cert.subject),
-                                ssl_fingerprint: cert.fingerprint256 || cert.fingerprint || null,
-                                ssl_sans: JSON.stringify(sans),
-                                ssl_protocol: socket.getProtocol ? socket.getProtocol() : null,
-                                ssl_cipher: socket.getCipher ? socket.getCipher().name : null,
-                                ssl_is_valid: authorized && expiryDate > new Date(),
-                                ssl_error: authorized ? null : (socket.authorizationError || 'Certificate validation failed'),
-                            };
-
-                            // Update DB
-                            request.server.db.query(
-                                `UPDATE monitors SET 
-                                    ssl_expiry = $1, ssl_valid_from = $2, ssl_issuer = $3, ssl_subject = $4,
-                                    ssl_fingerprint = $5, ssl_sans = $6, ssl_protocol = $7, ssl_cipher = $8,
-                                    ssl_is_valid = $9, ssl_error = $10, last_ssl_check = NOW()
-                                 WHERE id = $11`,
-                                [
-                                    details.ssl_expiry, details.ssl_valid_from, details.ssl_issuer, details.ssl_subject,
-                                    details.ssl_fingerprint, details.ssl_sans, details.ssl_protocol, details.ssl_cipher,
-                                    details.ssl_is_valid, details.ssl_error, monitor.id
-                                ]
-                            );
-
-                            const daysRemaining = Math.floor((expiryDate - new Date()) / (1000 * 60 * 60 * 24));
-
-                            resolve({
-                                success: true,
-                                certificate: {
-                                    is_valid: details.ssl_is_valid,
-                                    error: details.ssl_error,
-                                    issuer: details.ssl_issuer,
-                                    subject: details.ssl_subject,
-                                    valid_from: details.ssl_valid_from,
-                                    valid_to: details.ssl_expiry,
-                                    days_remaining: daysRemaining,
-                                    fingerprint: details.ssl_fingerprint,
-                                    sans: sans,
-                                    protocol: details.ssl_protocol,
-                                    cipher: details.ssl_cipher,
-                                },
-                                checked_at: new Date().toISOString()
-                            });
-                        } else {
-                            resolve({ success: false, error: 'No certificate found' });
-                        }
-                    } catch (parseErr) {
-                        resolve({ success: false, error: `Certificate parse error: ${parseErr.message}` });
-                    }
-                    socket.end();
-                });
-
-                socket.on('error', (err) => {
-                    request.server.db.query(
-                        `UPDATE monitors SET ssl_is_valid = false, ssl_error = $1, last_ssl_check = NOW() WHERE id = $2`,
-                        [err.message, monitor.id]
-                    );
-                    socket.destroy();
-                    resolve({ success: false, error: `SSL connection failed: ${err.message}` });
-                });
-
-                socket.setTimeout(10000, () => {
-                    socket.destroy();
-                    resolve({ success: false, error: 'SSL connection timed out (10s)' });
-                });
-            } catch (e) {
-                resolve({ success: false, error: e.message });
-            }
-        });
-
+        const sslResult = await performSSLCheck(request.server.db, monitor);
         return reply.send(sslResult);
     } catch (error) {
         request.log.error(error, 'triggerSSLCheck error');
