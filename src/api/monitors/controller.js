@@ -5,24 +5,50 @@ const axios = require('axios');
 const tls = require('tls');
 const usageService = require('../../core/auth/usageService');
 const planService = require('../../core/billing/planService');
-const { getSafeAxiosConfig } = require('../../core/utils/ssrf');
+const dns = require('dns').promises;
+const { getSafeAxiosConfig, isPrivateIp, safeLookup } = require('../../core/utils/ssrf');
 
 // ── SSRF blocklist — private/loopback IP ranges ───────────────────────────
 const PRIVATE_IP_RE = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|169\.254\.|::1|0\.0\.0\.0)/i;
 const ALLOWED_TYPES = ['http', 'https', 'keyword', 'port', 'ping'];
 
-function validateTarget(type, target) {
+async function validateTarget(type, target) {
     if (['http', 'https', 'keyword'].includes(type)) {
         let parsed;
         try { parsed = new URL(target); } catch { return 'Invalid URL format'; }
         if (!['http:', 'https:'].includes(parsed.protocol)) return 'URL must use http or https';
-        if (PRIVATE_IP_RE.test(parsed.hostname)) return 'Private or loopback network targets are not permitted';
+        
+        const hostname = parsed.hostname;
+        if (isPrivateIp(hostname)) return 'Private or loopback network targets are not permitted';
+        
+        try {
+            const addresses = await dns.lookup(hostname, { all: true });
+            for (const addr of addresses) {
+                if (isPrivateIp(addr.address)) {
+                    return 'Private or loopback network targets are not permitted';
+                }
+            }
+        } catch (e) {
+            // Let it pass lookup failure, check will fail naturally
+        }
     } else if (['port', 'ping'].includes(type)) {
+        let host = target;
         if (target.includes(':')) {
-            const [host, portStr] = target.split(':');
+            const [hostPart, portStr] = target.split(':');
+            host = hostPart;
             const port = parseInt(portStr, 10);
-            if (PRIVATE_IP_RE.test(host)) return 'Private or loopback network targets are not permitted';
             if (isNaN(port) || port < 1 || port > 65535) return 'Invalid port number (1–65535)';
+        }
+        if (isPrivateIp(host)) return 'Private or loopback network targets are not permitted';
+        try {
+            const addresses = await dns.lookup(host, { all: true });
+            for (const addr of addresses) {
+                if (isPrivateIp(addr.address)) {
+                    return 'Private or loopback network targets are not permitted';
+                }
+            }
+        } catch (e) {
+            // Let it pass
         }
     }
     return null; // valid
@@ -89,7 +115,7 @@ const createMonitor = async (request, reply) => {
     // Enforce tier-specific interval minimums
     const effectiveInterval = usageService.getEffectiveInterval(request.user, interval_seconds);
 
-    const ssrfError = validateTarget(type, target);
+    const ssrfError = await validateTarget(type, target);
     if (ssrfError) return reply.code(400).send({ error: ssrfError });
 
     try {
@@ -172,6 +198,16 @@ const updateMonitor = async (request, reply) => {
 
     try {
         const { name, target, keyword, interval_seconds, method, headers, body, timeout_ms, max_retries, expected_status, threshold_ms, region, priority, assertion_config } = parsed.data;
+        
+        // Fetch the monitor first to verify ownership and get its type
+        const verify = await request.server.db.query('SELECT type FROM monitors WHERE id = $1 AND user_id = $2', [id, userId]);
+        if (verify.rows.length === 0) return reply.code(404).send({ error: 'Monitor not found' });
+        const monitorType = verify.rows[0].type;
+
+        if (target) {
+            const ssrfError = await validateTarget(monitorType, target);
+            if (ssrfError) return reply.code(400).send({ error: ssrfError });
+        }
         
         let dbHeaders = undefined;
         if (headers !== undefined) {
@@ -356,7 +392,7 @@ const testMonitor = async (request, reply) => {
     const { target, type, method, headers, body } = request.body;
     if (!target) return reply.code(400).send({ error: 'Target URL is required' });
     
-    const ssrfError = validateTarget(type || 'http', target);
+    const ssrfError = await validateTarget(type || 'http', target);
     if (ssrfError) return reply.code(400).send({ error: ssrfError });
     
     const startTime = Date.now();
@@ -517,10 +553,12 @@ const getSSLDetails = async (request, reply) => {
         let daysRemaining = null;
         let domainDaysRemaining = null;
         if (monitor.ssl_expiry) {
-            daysRemaining = Math.floor((new Date(monitor.ssl_expiry) - new Date()) / (1000 * 60 * 60 * 24));
+            const diffMs = new Date(monitor.ssl_expiry).getTime() - Date.now();
+            daysRemaining = diffMs > 0 ? Math.ceil(diffMs / (1000 * 60 * 60 * 24)) : Math.floor(diffMs / (1000 * 60 * 60 * 24));
         }
         if (monitor.domain_expiry) {
-            domainDaysRemaining = Math.floor((new Date(monitor.domain_expiry) - new Date()) / (1000 * 60 * 60 * 24));
+            const diffMs = new Date(monitor.domain_expiry).getTime() - Date.now();
+            domainDaysRemaining = diffMs > 0 ? Math.ceil(diffMs / (1000 * 60 * 60 * 24)) : Math.floor(diffMs / (1000 * 60 * 60 * 24));
         }
 
         // Parse SANs from JSON string
@@ -569,7 +607,7 @@ const performSSLCheck = (db, monitor) => {
             const hostname = url.hostname;
             const port = url.port || 443;
 
-            const socket = tls.connect(port, hostname, { servername: hostname, rejectUnauthorized: false }, () => {
+            const socket = tls.connect(port, hostname, { servername: hostname, rejectUnauthorized: false, lookup: safeLookup }, () => {
                 try {
                     const cert = socket.getPeerCertificate(true);
                     const authorized = socket.authorized;
@@ -622,7 +660,8 @@ const performSSLCheck = (db, monitor) => {
                             console.error('[SSL Check] DB write error:', err.message);
                         });
 
-                        const daysRemaining = Math.floor((expiryDate - new Date()) / (1000 * 60 * 60 * 24));
+                        const diffMs = expiryDate.getTime() - Date.now();
+                        const daysRemaining = diffMs > 0 ? Math.ceil(diffMs / (1000 * 60 * 60 * 24)) : Math.floor(diffMs / (1000 * 60 * 60 * 24));
 
                         resolve({
                             success: true,

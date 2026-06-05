@@ -4,7 +4,12 @@
  * This ensures the entire backend shares a single connection pool.
  */
 require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env') });
-const { Pool } = require('pg');
+const { Pool, types } = require('pg');
+
+// Force PostgreSQL TIMESTAMP (without timezone, OID 1114) to be parsed as UTC
+types.setTypeParser(1114, (stringValue) => {
+    return new Date(stringValue + 'Z');
+});
 
 if (!process.env.DATABASE_URL) {
     console.error('[DB Pool] CRITICAL ERROR: DATABASE_URL environment variable is MISSING.');

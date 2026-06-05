@@ -6,9 +6,10 @@ const pool = require('../core/db/pool');
 const logger = require('../core/utils/logger');
 const { workerRedisConnection, alertQueue } = require('../core/queue/setup');
 const planService = require('../core/billing/planService');
+const { safeLookup } = require('../core/utils/ssrf');
 
-// Alert at 30, 14, 7, and 1 day(s) before expiry — matches marketing promises
-const EXPIRY_ALERT_DAYS = [30, 14, 7, 1];
+// Alert at 1, 7, 14, and 30 day(s) before expiry — prioritized ascendingly to evaluate most urgent first
+const EXPIRY_ALERT_DAYS = [1, 7, 14, 30];
 
 const expiryWorker = new Worker('expiry-checks', async (job) => {
     logger.info('[ExpiryWorker] Starting global expiry checks...');
@@ -57,7 +58,7 @@ async function checkSSLExpiry(monitor) {
             const port = url.port || 443;
             const hostname = url.hostname;
 
-            const socket = tls.connect(port, hostname, { servername: hostname, rejectUnauthorized: false }, () => {
+            const socket = tls.connect(port, hostname, { servername: hostname, rejectUnauthorized: false, lookup: safeLookup }, () => {
                 try {
                     const cert = socket.getPeerCertificate(true);
                     const authorized = socket.authorized;
@@ -206,7 +207,8 @@ async function updateMonitorExpiry(monitorId, type, expiryDate) {
 }
 
 async function checkAndAlert(monitor, label, expiryDate) {
-    const daysRemaining = Math.floor((expiryDate - new Date()) / (1000 * 60 * 60 * 24));
+    const diffMs = expiryDate.getTime() - Date.now();
+    const daysRemaining = diffMs > 0 ? Math.ceil(diffMs / (1000 * 60 * 60 * 24)) : Math.floor(diffMs / (1000 * 60 * 60 * 24));
 
     // Find the appropriate alert threshold
     for (const threshold of EXPIRY_ALERT_DAYS) {
