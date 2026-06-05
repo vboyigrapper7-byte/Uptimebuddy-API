@@ -174,6 +174,14 @@ const buildServer = async () => {
     const { makeRedisConnection } = require('./core/queue/setup');
     const subscriber = makeRedisConnection();
 
+    server.addHook('onClose', async (instance) => {
+        try {
+            await subscriber.quit();
+        } catch (err) {
+            logger.error(`[Server] Error closing Redis subscriber: ${err.message}`);
+        }
+    });
+
     subscriber.subscribe('agent-updates', (err) => {
         if (err) logger.error(`[Redis PubSub] Subscription error: ${err.message}`);
     });

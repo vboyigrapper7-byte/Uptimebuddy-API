@@ -45,7 +45,7 @@ const PLAN_TIERS = {
     pro: {
         id: 'pro',
         name: 'Pro',
-        priceUSD: 24, // $24/month
+        priceUSD: 49, // $49/month
         razorpayPlanId: process.env.RAZORPAY_PLAN_PRO, // plan_xxx
         limits: {
             uptime: 100,
@@ -64,7 +64,7 @@ const PLAN_TIERS = {
     business: {
         id: 'business',
         name: 'Business',
-        priceUSD: 84, // $84/month
+        priceUSD: 199, // $199/month
         razorpayPlanId: process.env.RAZORPAY_PLAN_BUSINESS, // plan_xxx
         limits: {
             uptime: 500,

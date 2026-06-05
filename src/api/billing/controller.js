@@ -12,8 +12,8 @@ const razorpay = new Razorpay({
 const USD_PRICES = {
     free: 0,
     starter: 10,
-    pro: 24,
-    business: 84
+    pro: 49,
+    business: 199
 };
 
 const createOrder = async (request, reply) => {

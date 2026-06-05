@@ -12,10 +12,16 @@ if (!process.env.REDIS_URL) {
  * - Worker (blocking BRPOP listener)
  * Using the same connection for both can cause subtle issues.
  */
-const makeRedisConnection = () => new Redis(process.env.REDIS_URL || 'redis://localhost:6379', {
-    maxRetriesPerRequest: null,
-    enableReadyCheck: false,
-});
+const makeRedisConnection = () => {
+    const options = {
+        maxRetriesPerRequest: null,
+        enableReadyCheck: false,
+    };
+    if (process.env.NODE_ENV === 'test') {
+        options.retryStrategy = () => null;
+    }
+    return new Redis(process.env.REDIS_URL || 'redis://localhost:6379', options);
+};
 
 // Connection used by Queue producers (server.js, controllers)
 const redisConnection = makeRedisConnection();
