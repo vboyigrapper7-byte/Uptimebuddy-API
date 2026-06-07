@@ -44,6 +44,14 @@ class StorageProvider {
     async verify(fileId) {
         throw new Error('Method not implemented.');
     }
+
+    /**
+     * Test connection to the storage provider
+     * @returns {Promise<boolean>}
+     */
+    async testConnection() {
+        throw new Error('Method not implemented.');
+    }
 }
 
 module.exports = StorageProvider;

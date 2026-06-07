@@ -79,4 +79,49 @@ const getReports = async (request, reply) => {
     }
 };
 
-module.exports = { requestReport, getReports };
+const deleteReport = async (request, reply) => {
+    const reportId = parseInt(request.params.id, 10);
+    const userId = request.user.id;
+
+    if (isNaN(reportId)) {
+        return reply.code(400).send({ error: 'Invalid report ID' });
+    }
+
+    try {
+        const reportRes = await request.server.db.query(
+            'SELECT * FROM reports WHERE id = $1 AND user_id = $2',
+            [reportId, userId]
+        );
+        if (reportRes.rows.length === 0) {
+            return reply.code(404).send({ error: 'Report not found' });
+        }
+
+        const report = reportRes.rows[0];
+
+        // Delete from database
+        await request.server.db.query(
+            'DELETE FROM reports WHERE id = $1 AND user_id = $2',
+            [reportId, userId]
+        );
+
+        // Delete physical file if it exists
+        if (report.url) {
+            const path = require('path');
+            const fs = require('fs');
+            const filename = path.basename(report.url);
+            const filePath = path.resolve(__dirname, '../../../public/reports', filename);
+            if (fs.existsSync(filePath)) {
+                fs.unlink(filePath, (err) => {
+                    if (err) request.log.error(err, 'Failed to delete report file');
+                });
+            }
+        }
+
+        return reply.send({ success: true, message: 'Report deleted successfully' });
+    } catch (err) {
+        request.log.error(err, 'deleteReport error');
+        return reply.code(500).send({ error: 'Failed to delete report' });
+    }
+};
+
+module.exports = { requestReport, getReports, deleteReport };

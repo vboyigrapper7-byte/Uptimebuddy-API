@@ -1,4 +1,4 @@
-const { getSettings, updateSettings, getHistory, downloadArchive, triggerManualArchive } = require('./controllers/archiveController');
+const { getSettings, updateSettings, getHistory, downloadArchive, triggerManualArchive, testArchiveConnection } = require('./controllers/archiveController');
 const { requireAuth, requirePlan } = require('../auth/middleware');
 
 async function archiveRoutes(fastify, options) {
@@ -8,6 +8,7 @@ async function archiveRoutes(fastify, options) {
 
     fastify.get('/settings', getSettings);
     fastify.put('/settings', updateSettings);
+    fastify.post('/test', testArchiveConnection);
     fastify.get('/history', getHistory);
     fastify.get('/:id/download', downloadArchive);
     fastify.post('/manual', triggerManualArchive);

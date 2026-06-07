@@ -78,6 +78,18 @@ class OneDriveProvider extends StorageProvider {
             return false;
         }
     }
+
+    async testConnection() {
+        await axios.get(
+            'https://graph.microsoft.com/v1.0/me/drive',
+            {
+                headers: {
+                    'Authorization': `Bearer ${this.accessToken}`
+                }
+            }
+        );
+        return true;
+    }
 }
 
 module.exports = OneDriveProvider;

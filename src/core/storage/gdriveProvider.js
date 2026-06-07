@@ -79,6 +79,15 @@ class GDriveProvider extends StorageProvider {
             return false;
         }
     }
+
+    async testConnection() {
+        await axios.get('https://www.googleapis.com/drive/v3/files?pageSize=1', {
+            headers: {
+                'Authorization': `Bearer ${this.accessToken}`
+            }
+        });
+        return true;
+    }
 }
 
 module.exports = GDriveProvider;

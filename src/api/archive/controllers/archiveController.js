@@ -24,7 +24,17 @@ async function getSettings(req, reply) {
     const settings = res.rows[0];
     delete settings.user_id;
     
-    // Don't send credentials back, just indicate if they exist
+    // Decrypt and return credentials so the client can edit them
+    if (settings.credentials_encrypted) {
+        try {
+            settings.credentials = JSON.parse(decryptString(settings.credentials_encrypted));
+        } catch (err) {
+            settings.credentials = null;
+        }
+    } else {
+        settings.credentials = null;
+    }
+    
     settings.has_credentials = !!settings.credentials_encrypted;
     delete settings.credentials_encrypted;
     delete settings.encryption_key_encrypted;
@@ -188,10 +198,43 @@ async function triggerManualArchive(req, reply) {
     return reply.send({ success: true, message: 'Archival queued successfully', archiveId: archRes.rows[0].id });
 }
 
+/**
+ * Test storage provider connection
+ */
+async function testArchiveConnection(req, reply) {
+    const userId = req.user.id;
+    let { provider, credentials } = req.body;
+
+    try {
+        if (!credentials || Object.keys(credentials).length === 0) {
+            const settingsRes = await pool.query('SELECT credentials_encrypted FROM archive_settings WHERE user_id = $1', [userId]);
+            if (settingsRes.rowCount > 0 && settingsRes.rows[0].credentials_encrypted) {
+                const decStr = decryptString(settingsRes.rows[0].credentials_encrypted);
+                credentials = JSON.parse(decStr);
+            } else {
+                return reply.status(400).send({ error: 'No credentials provided or saved' });
+            }
+        }
+
+        const tempEncrypted = encryptString(JSON.stringify(credentials));
+        const storageProvider = ProviderFactory.createProvider(provider, tempEncrypted);
+        
+        await storageProvider.testConnection();
+        return reply.send({ success: true, message: 'Connection tested successfully!' });
+    } catch (err) {
+        req.log.error(`[Archive Test] Connection test failed: ${err.message}`);
+        return reply.status(400).send({ 
+            error: true, 
+            message: `Connection test failed: ${err.response?.data?.error?.message || err.message}` 
+        });
+    }
+}
+
 module.exports = {
     getSettings,
     updateSettings,
     getHistory,
     downloadArchive,
-    triggerManualArchive
+    triggerManualArchive,
+    testArchiveConnection
 };

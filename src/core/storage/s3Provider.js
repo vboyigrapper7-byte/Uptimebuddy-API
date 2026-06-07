@@ -1,4 +1,4 @@
-const { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, ListObjectsV2Command } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const StorageProvider = require('./storageProvider');
 
@@ -71,6 +71,15 @@ class S3Provider extends StorageProvider {
         } catch (error) {
             return false;
         }
+    }
+
+    async testConnection() {
+        const command = new ListObjectsV2Command({
+            Bucket: this.bucket,
+            MaxKeys: 1
+        });
+        await this.client.send(command);
+        return true;
     }
 }
 

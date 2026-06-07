@@ -81,6 +81,20 @@ class DropboxProvider extends StorageProvider {
             return false;
         }
     }
+
+    async testConnection() {
+        await axios.post(
+            'https://api.dropboxapi.com/2/files/list_folder',
+            { path: '', limit: 1 },
+            {
+                headers: {
+                    'Authorization': `Bearer ${this.accessToken}`,
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
+        return true;
+    }
 }
 
 module.exports = DropboxProvider;

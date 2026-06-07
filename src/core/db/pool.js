@@ -3,7 +3,7 @@
  * Import this module everywhere instead of creating new Pool() instances.
  * This ensures the entire backend shares a single connection pool.
  */
-require('dotenv').config({ path: require('path').resolve(__dirname, '../../.env') });
+require('dotenv').config({ path: require('path').resolve(__dirname, '../../../.env') });
 const { Pool, types } = require('pg');
 
 // Force PostgreSQL TIMESTAMP (without timezone, OID 1114) to be parsed as UTC

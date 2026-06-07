@@ -53,7 +53,7 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://monitorhubs.com';
 const buildServer = async () => {
     // ── Pre-boot Initialization ───────────────────────────────────────────
     // Must happen FIRST so variables like 'pool' are available to decorators
-    const { authRoutes, agentRoutes, monitorRoutes, webhookRoutes, publicRoutes, billingRoutes, teamRoutes, auditRoutes, alertRoutes, adminRoutes, archiveRoutes, reportRoutes, pool } = getRoutesAndServices();
+    const { authRoutes, agentRoutes, monitorRoutes, webhookRoutes, publicRoutes, billingRoutes, teamRoutes, auditRoutes, alertRoutes, adminRoutes, archiveRoutes, reportRoutes, pool, statsWorker } = getRoutesAndServices();
 
     // ── Database Initialization (Metrics Index & Agent Distribution) ────
     try {
@@ -177,8 +177,11 @@ const buildServer = async () => {
     server.addHook('onClose', async (instance) => {
         try {
             await subscriber.quit();
+            if (statsWorker && typeof statsWorker.close === 'function') {
+                await statsWorker.close();
+            }
         } catch (err) {
-            logger.error(`[Server] Error closing Redis subscriber: ${err.message}`);
+            logger.error(`[Server] Error closing Redis subscriber or worker: ${err.message}`);
         }
     });
 
@@ -232,6 +235,34 @@ const buildServer = async () => {
 
     server.get('/', async () => ({ status: 'ok', service: 'monitorhub-api' }));
 
+    // Securely serve generated PDF reports
+    server.get('/public/reports/:filename', async (request, reply) => {
+        const { filename } = request.params;
+
+        // Input validation: enforce report filename format
+        if (!/^[a-zA-Z0-9_\-\.]+\.pdf$/.test(filename)) {
+            return reply.code(400).send({ error: 'Invalid filename format' });
+        }
+
+        const reportsDir = path.resolve(__dirname, '../public/reports');
+        const filePath = path.resolve(reportsDir, filename);
+
+        // Prevent directory traversal
+        if (!filePath.startsWith(reportsDir)) {
+            return reply.code(403).send({ error: 'Access denied' });
+        }
+
+        if (!fs.existsSync(filePath)) {
+            return reply.code(404).send({ error: 'Report not found' });
+        }
+
+        reply.type('application/pdf');
+        reply.header('Content-Disposition', `inline; filename="${filename}"`);
+
+        const stream = fs.createReadStream(filePath);
+        return reply.send(stream);
+    });
+
     // ── Routes ────────────────────────────────────────────────────────────
     server.register(authRoutes, { prefix: '/api/v1/auth' });
     server.register(agentRoutes, { prefix: '/api/v1/agents' });
@@ -248,7 +279,7 @@ const buildServer = async () => {
 
     // ── Post-boot Initialization ─────────────────────────────────────────
     // Sync monitors with queue after server starts (non-blocking)
-    const { scheduler, statsWorker } = getRoutesAndServices();
+    const { scheduler } = getRoutesAndServices();
     scheduler.syncMonitors().catch(err => logger.error(`[Startup] syncMonitors failed: ${err.message}`));
     statsWorker.computeMonitorStats().catch(err => logger.error(`[Startup] computeMonitorStats failed: ${err.message}`));
 
